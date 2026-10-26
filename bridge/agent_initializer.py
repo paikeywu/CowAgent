@@ -877,8 +877,14 @@ class AgentInitializer:
             )
             self._sync_memory(memory_manager, session_id)
 
+            # The search tool needs to know who it is searching FOR: a
+            # scope='user' memory is filtered on the user id, so a search
+            # without one can never return it. The identity is taken from the
+            # ambient runtime context (the message router binds it there) and
+            # falls back to the session's own id, which is the user id on the
+            # channels that have one.
             memory_tools = [
-                MemorySearchTool(memory_manager),
+                MemorySearchTool(memory_manager, user_id=self._resolve_user_id(session_id)),
                 MemoryGetTool(memory_manager)
             ]
             
@@ -889,6 +895,34 @@ class AgentInitializer:
             logger.warning(f"[AgentInitializer] Memory system not available: {e}")
         
         return memory_manager, memory_tools
+
+    def _resolve_user_id(self, session_id: Optional[str] = None) -> Optional[str]:
+        """The end user this session speaks for, or None when there is none.
+
+        Two sources, in order:
+
+        1. The ambient runtime identity. The message router binds it
+           (``identity_scope`` / ``use_identity``) for every inbound message,
+           and it carries ``user_id`` once tenancy provides one. This is the
+           authoritative source, because it follows the actual message.
+        2. The session id. On the channels that have one, the session IS the
+           user ("session_id: Session identifier (e.g., user_id)" —
+           ``agent_bridge.get_agent``), so it is the best available fallback
+           when no tenancy has bound a user.
+
+        None is a legitimate answer: on a single-user install with no
+        tenancy, there is no user to scope by, and shared memories stay
+        visible either way.
+        """
+        try:
+            from common.runtime_identity import current_identity
+
+            ambient = current_identity().user_id
+            if ambient:
+                return str(ambient)
+        except Exception:
+            pass
+        return session_id or None
 
     def _init_embedding_provider(self, memory_config, session_id: Optional[str] = None):
         """

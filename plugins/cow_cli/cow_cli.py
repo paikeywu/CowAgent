@@ -1629,6 +1629,38 @@ class CowCliPlugin(Plugin):
         else:
             lines.append(_t("  Provider : (未初始化, keyword-only)", "  Provider : (not initialized, keyword-only)"))
 
+        # The degradation is stated in the status output, not left to be
+        # inferred. A vector search that fell back to keyword-only looks
+        # identical to a working one from the outside — same tool, same
+        # results, smaller recall — so the mode has to be named.
+        full_status = memory_manager.get_status()
+        mode = full_status.get("search_mode", "")
+        if mode:
+            lines.append(f"  Mode     : {mode}")
+        # Who this search identity is. Retrieval visibility is defined
+        # relative to an identity; "anonymous" means shared-only and is a
+        # first-class answer, not an omission.
+        identity = full_status.get("identity") or "anonymous"
+        lines.append(_t(
+            f"  身份     : {identity}" + ("（仅可见 shared）" if identity == "anonymous" else ""),
+            f"  Identity : {identity}" + (" (shared only)" if identity == "anonymous" else ""),
+        ))
+        # Reranker reachability, not just configuration: a configured but
+        # down reranker reads "unreachable", and a down reranker also leaves
+        # a WARN in the log on every failed search.
+        rerank_status = full_status.get("rerank_status", "off")
+        lines.append(f"  Rerank   : {rerank_status}")
+        if "unreachable" in str(rerank_status):
+            lines.append(_t(
+                "  ⚠️ reranker 服务不可达：检索按未重排顺序返回（结果可用，排序质量降级）",
+                "  ⚠️ Reranker unreachable: results are returned in un-reranked order (usable, lower ranking quality)",
+            ))
+        if provider_obj is None and chunks > 0:
+            lines.append(_t(
+                "  ⚠️ 当前为纯关键词检索（向量检索未启用）：语义相近但字面不重合的内容不会被召回",
+                "  ⚠️ Keyword-only retrieval (vector search is off): content that is semantically close but does not share characters is not recalled",
+            ))
+
         # Health hints — only shown when the user has explicitly opted into
         # vector search via `embedding_provider`. Legacy users (no explicit
         # provider) are running in a "best-effort vectors" mode by design;

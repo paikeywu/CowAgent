@@ -203,9 +203,15 @@ class SQLiteVectorBackend(VectorBackend):
                 params.extend(scopes)
 
         user_id = metadata_filter.get("user_id")
-        if shared_visible_to_user and user_id:
-            clauses.append("(scope = 'shared' OR user_id = ?)")
-            params.append(user_id)
+        if shared_visible_to_user:
+            # The visibility predicate lives in exactly one place; this
+            # backend spells the columns bare (its queries are over the
+            # chunks table directly, unjoined).
+            from agent.memory.visibility import visibility_clause
+
+            clause, clause_params = visibility_clause(user_id)
+            clauses.append(clause)
+            params.extend(clause_params)
 
         for key, value in metadata_filter.items():
             if key == "scopes" or (

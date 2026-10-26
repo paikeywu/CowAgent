@@ -77,10 +77,15 @@ class MemorySearchTool(BaseTool):
             return ToolResult.fail("Error: query parameter is required")
         
         try:
-            # Run async search in sync context
+            # Run async search in sync context.
+            # The identity is resolved HERE, at call time, rather than captured
+            # at construction: the tool is built once per Agent session, but
+            # the user behind a session can change, and a captured identity
+            # would keep answering as the previous one.
+            user_id = self._resolve_user_id()
             results = asyncio.run(self.memory_manager.search(
                 query=query,
-                user_id=self.user_id,
+                user_id=user_id,
                 max_results=max_results,
                 min_score=min_score,
                 include_shared=True
@@ -114,6 +119,30 @@ class MemorySearchTool(BaseTool):
             
         except Exception as e:
             return ToolResult.fail(f"Error searching memory: {str(e)}")
+    
+    def _resolve_user_id(self) -> Optional[str]:
+        """The end user this search runs for, or None when there is no tenancy.
+
+        ``scope='user'`` rows are invisible without it: the storage layer
+        filters on ``scope = 'shared' OR user_id = ?``, so a search with no
+        identity can never return a user-scoped memory. The tool used to pass
+        no identity at all, which made every user-scoped memory unreachable.
+
+        The identity comes from the ambient runtime context first (that is
+        where the message router binds it), then from the value the
+        initializer passed in, and only then from the tool's own attribute.
+        None is a legitimate answer: without tenancy there is no user to
+        scope by, and shared memories stay visible either way.
+        """
+        try:
+            from common.runtime_identity import current_identity
+
+            ambient = current_identity().user_id
+            if ambient:
+                return str(ambient)
+        except Exception:
+            pass
+        return self.user_id or None
 
     def _knowledge_root_hint(self, results) -> Optional[str]:
         """Where the "knowledge/..." paths below actually live, when that is not

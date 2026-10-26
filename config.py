@@ -141,8 +141,10 @@ available_setting = {
     "embedding_model": "",     # leave empty to use the provider's default model
     "embedding_dimensions": 0, # leave empty/0 to use the provider's default dimension (1024 recommended for consistency)
     # Memory rerank config (optional, off by default)
-    "rerank_provider": "",  # leave empty to disable; "local" runs a cross-encoder via sentence-transformers (install it yourself)
+    "rerank_provider": "",  # leave empty to disable; "local" runs a cross-encoder via sentence-transformers (install it yourself); "http" calls a remote reranker service (see docker/reranker/)
     "rerank_model": "",     # leave empty to use the provider's default model (local: BAAI/bge-reranker-base)
+    "rerank_url": "",       # endpoint of the "http" provider (default http://127.0.0.1:9898)
+    "rerank_timeout": 30,   # seconds to wait for the "http" provider before falling back to un-reranked order
     # voice config
     "speech_recognition": True,  # whether to enable speech recognition
     "group_speech_recognition": False,  # whether to enable group speech recognition

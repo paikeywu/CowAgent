@@ -228,7 +228,10 @@ class MemoryFlushManager:
         today = datetime.now().strftime("%Y-%m-%d")
         
         if user_id:
-            user_dir = self.memory_dir / "users" / user_id
+            from agent.memory.identity_ns import user_dir_name
+            user_dir = self.memory_dir / "users" / user_dir_name(
+                user_id, workspace=self.workspace_dir
+            )
             if ensure_exists:
                 user_dir.mkdir(parents=True, exist_ok=True)
             today_file = user_dir / f"{today}.md"
@@ -244,7 +247,10 @@ class MemoryFlushManager:
     def get_main_memory_file(self, user_id: Optional[str] = None) -> Path:
         """Get main memory file path: MEMORY.md (workspace root)"""
         if user_id:
-            user_dir = self.memory_dir / "users" / user_id
+            from agent.memory.identity_ns import user_dir_name
+            user_dir = self.memory_dir / "users" / user_dir_name(
+                user_id, workspace=self.workspace_dir
+            )
             user_dir.mkdir(parents=True, exist_ok=True)
             return user_dir / "MEMORY.md"
         else:
@@ -937,7 +943,10 @@ def create_memory_files_if_needed(workspace_dir: Path, user_id: Optional[str] = 
     
     # Create main MEMORY.md in workspace root (always needed for bootstrap)
     if user_id:
-        user_dir = memory_dir / "users" / user_id
+        from agent.memory.identity_ns import user_dir_name
+        user_dir = memory_dir / "users" / user_dir_name(
+            user_id, workspace=workspace_dir
+        )
         user_dir.mkdir(parents=True, exist_ok=True)
         main_memory = user_dir / "MEMORY.md"
     else:
@@ -964,7 +973,10 @@ def ensure_daily_memory_file(workspace_dir: Path, user_id: Optional[str] = None)
     
     today = datetime.now().strftime("%Y-%m-%d")
     if user_id:
-        user_dir = memory_dir / "users" / user_id
+        from agent.memory.identity_ns import user_dir_name
+        user_dir = memory_dir / "users" / user_dir_name(
+            user_id, workspace=workspace_dir
+        )
         user_dir.mkdir(parents=True, exist_ok=True)
         today_memory = user_dir / f"{today}.md"
     else:

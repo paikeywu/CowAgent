@@ -60,6 +60,17 @@ def _index_rel_path(file_path: Path, roots: Sequence[Tuple[Path, str]]) -> Optio
     return None
 
 
+# The files at the workspace root that say who the Agent is and who the user
+# is. They were never indexed: sync() added only MEMORY.md explicitly, and
+# the two directory walks (memory/ and knowledge/) never reach the root. So
+# the identity of the person was in USER.md and could not be found by search —
+# "检索不到身份，检索就与身份无关".
+#
+# They are indexed under source "memory" and scope "shared": they are the
+# workspace's own documents, not a user's private memory.
+_ROOT_IDENTITY_FILES = ("MEMORY.md", "USER.md", "AGENT.md", "RULE.md")
+
+
 class MemoryManager:
     """
     Memory manager with hybrid search capabilities
@@ -103,8 +114,12 @@ class MemoryManager:
         self.embedding_provider = embedding_provider
         if self.embedding_provider is None:
             from common.log import logger
-            logger.info(
-                "[MemoryManager] No embedding provider; memory will use keyword search only"
+            # WARN, not INFO: a memory that can only do keyword search is a
+            # degraded memory, and a degradation that is never logged is
+            # indistinguishable from health ("静默降级比崩溃更危险").
+            logger.warning(
+                "[MemoryManager] No embedding provider; memory will use "
+                "keyword search only (semantic matches will not be found)"
             )
 
         # Cache for query embeddings (avoids redundant API calls within a session)
@@ -158,7 +173,20 @@ class MemoryManager:
         max_results = max_results or self.config.max_results
         # min_score=0 means "no threshold", so only None takes the default.
         min_score = self.config.min_score if min_score is None else min_score
-        
+
+        # An explicit user_id wins; otherwise follow the ambient runtime
+        # identity, so CLI / scheduler / sub-agent paths that never thread a
+        # user id still see exactly what their identity may see — no more,
+        # no less. None stays None: anonymous sees shared only.
+        if user_id is None:
+            try:
+                from common.runtime_identity import current_identity
+                ambient = current_identity().user_id
+                if ambient:
+                    user_id = str(ambient)
+            except Exception:
+                pass
+
         # Determine scopes
         scopes = []
         if include_shared:
@@ -268,7 +296,16 @@ class MemoryManager:
         if not path:
             content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()[:8]
             if user_id and scope == "user":
-                path = f"memory/users/{user_id}/memory_{content_hash}.md"
+                # The directory name is a filesystem-safe slug, never the raw
+                # id: ':' is drive syntax on Windows, and an unparseable
+                # directory name used to degrade every identity to 'a'.
+                # The LOGICAL id stays verbatim in the chunks.user_id column;
+                # users.json at the index root maps slug -> logical id.
+                from agent.memory.identity_ns import user_dir_name
+                dir_name = user_dir_name(
+                    user_id, workspace=self.config.get_workspace()
+                )
+                path = f"memory/users/{dir_name}/memory_{content_hash}.md"
             else:
                 path = f"memory/shared/memory_{content_hash}.md"
         
@@ -334,6 +371,7 @@ class MemoryManager:
         """
         memory_dir = self.config.get_memory_dir()
         workspace_dir = self.config.get_workspace()
+        from common.log import logger
 
         # Was the index empty before this sync? Only then can we be sure every
         # chunk came from the CURRENT chunking algorithm (a fresh index, or one
@@ -347,11 +385,28 @@ class MemoryManager:
 
         files_to_scan: List[tuple] = []  # (file_path, source, scope, user_id)
 
-        memory_file = Path(workspace_dir) / "MEMORY.md"
-        if memory_file.exists():
-            files_to_scan.append((memory_file, "memory", "shared", None))
+        # The workspace root holds the identity documents (USER.md says who
+        # the user is, AGENT.md who the Agent is, RULE.md how it behaves).
+        # The two directory walks below never reach the root, so without this
+        # they were invisible to search — "王静静是谁" could not be answered
+        # even though USER.md says exactly who she is.
+        for name in _ROOT_IDENTITY_FILES:
+            identity_file = Path(workspace_dir) / name
+            if identity_file.exists():
+                files_to_scan.append((identity_file, "memory", "shared", None))
 
         if memory_dir.exists():
+            from agent.memory.identity_ns import parse_user_dir_name
+
+            def _resolve_user_segment(raw_segment):
+                """Directory name -> LOGICAL user id via identity_ns
+                (user--<slug> -> users.json -> id; bare legacy names resolve
+                to themselves). An unresolvable segment raises: it must not
+                silently become an id."""
+                if raw_segment is None:
+                    return None
+                return parse_user_dir_name(raw_segment, workspace=workspace_dir)
+
             for file_path in memory_dir.rglob("*.md"):
                 rel_parts = file_path.relative_to(workspace_dir).parts
                 if any(part.startswith('.') for part in rel_parts):
@@ -362,21 +417,35 @@ class MemoryManager:
                 # that crowd out the authoritative entry in retrieval.
                 if "dreams" in rel_parts:
                     continue
-                if "daily" in rel_parts:
-                    if "users" in rel_parts or len(rel_parts) > 3:
-                        user_idx = rel_parts.index("daily") + 1
-                        user_id = rel_parts[user_idx] if user_idx < len(rel_parts) else None
+                try:
+                    if "users" in rel_parts:
+                        # memory/users/<id>/... wins over a "daily" segment:
+                        # in users/<id>/daily/<date>.md the part after
+                        # "daily" is the FILENAME, not the user.
+                        user_idx = rel_parts.index("users") + 1
+                        user_id = _resolve_user_segment(
+                            rel_parts[user_idx] if user_idx < len(rel_parts) else None
+                        )
                         scope = "user"
+                    elif "daily" in rel_parts:
+                        if len(rel_parts) > 3:
+                            user_idx = rel_parts.index("daily") + 1
+                            user_id = _resolve_user_segment(
+                                rel_parts[user_idx] if user_idx < len(rel_parts) else None
+                            )
+                            scope = "user"
+                        else:
+                            user_id = None
+                            scope = "shared"
                     else:
                         user_id = None
                         scope = "shared"
-                elif "users" in rel_parts:
-                    user_idx = rel_parts.index("users") + 1
-                    user_id = rel_parts[user_idx] if user_idx < len(rel_parts) else None
-                    scope = "user"
-                else:
-                    user_id = None
-                    scope = "shared"
+                except Exception as e:
+                    logger.warning(
+                        f"[MemoryManager] Skipping {file_path}: user "
+                        f"directory does not resolve ({e})"
+                    )
+                    continue
                 files_to_scan.append((file_path, "memory", scope, user_id))
 
         from common import state_dir
@@ -401,7 +470,6 @@ class MemoryManager:
         # where the class object is older than the method's source.
         pending: List[Dict[str, Any]] = []
         workspace_dir_path = self.config.get_workspace()
-        from common.log import logger
 
         # Roots a scanned file may legitimately sit under, most specific first,
         # each paired with the prefix its files are keyed under. Resolved once
@@ -622,19 +690,110 @@ class MemoryManager:
         return success
     
     def get_status(self) -> Dict[str, Any]:
-        """Get memory status"""
+        """Get memory status
+
+        The degradation is REPORTED, not merely implied. A vector search that
+        silently fell back to keyword-only looks exactly like a working
+        vector search from the outside — same tool, same results, smaller
+        recall. The one field that tells the two apart is ``search_mode``,
+        and it now says plainly which one is running and what was lost.
+        """
         stats = self.storage.get_stats()
+        vector_enabled = self.embedding_provider is not None
+        embedded = stats.get('embedded', 0)
+        chunks = stats['chunks']
+        if vector_enabled:
+            search_mode = 'hybrid (vector + keyword)'
+        else:
+            search_mode = 'keyword only (FTS5)'
+        # Named, not implied: "降级自曝必须覆盖正常路径" — a degraded index
+        # that reports the same fields as a healthy one has degraded into
+        # silence.
+        degraded = not vector_enabled and chunks > 0
+
+        # Who is asking: retrieval visibility is defined relative to an
+        # identity, so the status must say which one it is running under.
+        # "anonymous" is a first-class answer — it means shared-only.
+        identity_label = "anonymous"
+        try:
+            from common.runtime_identity import current_identity
+            ident = current_identity()
+            parts = []
+            if ident.agent_id:
+                parts.append(f"agent={ident.agent_id}")
+            if ident.user_id:
+                parts.append(f"user={ident.user_id}")
+            if parts:
+                identity_label = ", ".join(parts)
+        except Exception:
+            pass
+
+        rerank_status = self._reranker_status()
+
+        # Which knowledge root this Agent actually reads: its own knowledge/
+        # when present, otherwise the shared copy. Retrieval reports
+        # "knowledge/..." paths either way; this field says whose they are.
+        knowledge_root = 'unknown'
+        try:
+            import os as _os
+            from common import state_dir
+            root = _os.path.realpath(str(state_dir.knowledge_dir(base=self.config.get_workspace())))
+            own = _os.path.realpath(str(self.config.get_workspace() / 'knowledge'))
+            knowledge_root = 'own' if root == own else f'shared ({root})'
+        except Exception:
+            pass
+
         return {
             'chunks': stats['chunks'],
             'files': stats['files'],
             'workspace': str(self.config.get_workspace()),
             'dirty': self._dirty,
-            'embedding_enabled': self.embedding_provider is not None,
+            'identity': identity_label,
+            'knowledge_root': knowledge_root,
+            'embedding_enabled': vector_enabled,
             'embedding_provider': self.config.embedding_provider if self.embedding_provider else 'disabled',
             'embedding_model': self.config.embedding_model if self.embedding_provider else 'N/A',
-            'search_mode': 'hybrid (vector + keyword)' if self.embedding_provider else 'keyword only (FTS5)',
+            'embedded_chunks': embedded,
+            'search_mode': search_mode,
             'rerank_enabled': self.reranker is not None,
+            # Reachability, not just configuration: an HTTP reranker that is
+            # configured but down must read "unreachable", not "enabled".
+            'rerank_status': rerank_status,
+            # Why the vector channel is not running, in words. Empty when it
+            # IS running.
+            'degraded': degraded,
+            'degradation_reason': (
+                'vector search is disabled: retrieval is keyword-only '
+                '(FTS5 + LIKE), so semantic matches are not found'
+                if degraded else ''
+            ),
+            'embedding_coverage': (
+                round(embedded / chunks, 4) if chunks else 0.0
+            ),
         }
+
+    def _reranker_status(self) -> str:
+        """configured+reachable / configured+unreachable / local / off.
+
+        "Off" needs no probe. A local reranker loads its model on first use,
+        so there is nothing to ping; report it as configured. An HTTP
+        reranker is probed at its /health endpoint with a short timeout —
+        this is a status check, so it must stay cheap and must never raise.
+        """
+        reranker = self.reranker
+        if reranker is None:
+            return 'off'
+        base_url = getattr(reranker, 'base_url', None)
+        if not base_url:
+            return 'local (model loads on first use)'
+        try:
+            import requests
+            resp = requests.get(f"{base_url}/health", timeout=3)
+            if resp.ok:
+                return f'reachable ({base_url})'
+            return f'unreachable ({base_url} -> HTTP {resp.status_code})'
+        except Exception as e:
+            return f'unreachable ({base_url}: {type(e).__name__})'
     
     def mark_dirty(self):
         """Mark memory as dirty (needs sync)"""

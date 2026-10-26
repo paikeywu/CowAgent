@@ -20,6 +20,7 @@ from agent.memory.vector_backend import (
     VectorBackend,
     VectorRecord,
 )
+from agent.memory.visibility import visibility_clause
 
 try:
     import numpy as np
@@ -49,6 +50,158 @@ _CJK_RANGES = (
 _RE_CONTAINS_CJK   = re.compile(f'[{_CJK_RANGES}]')
 _RE_CJK_WORDS      = re.compile(f'[{_CJK_RANGES}]+')
 _RE_TRIGRAM_TOKENS = re.compile(rf'[{_CJK_RANGES}]+|[^\W{_CJK_RANGES}]+')
+
+
+# ---------------------------------------------------------------------------
+# Query segmentation
+# ---------------------------------------------------------------------------
+# Chinese has no spaces, so a CJK run used to become ONE token: "王静静是谁"
+# was matched as the literal five-character phrase, which only a page
+# containing that exact run could match, and a two-character query ("事件")
+# could not be indexed by the trigram tokenizer at all — it needs three.
+#
+# One segmenter serves both keyword paths (the trigram FTS5 stage and the LIKE
+# fallback), so the two cannot drift apart again: they used to disagree about
+# what a "word" is, and each was wrong in its own way.
+#
+# A CJK run becomes a group of alternatives (its sliding windows), and a
+# non-CJK word becomes a group of one. Groups are ANDed; the alternatives
+# inside a group are ORed. That keeps "中文教程 договор" meaning "both",
+# while letting "王静静是谁" match a page that contains "王静静".
+
+# Longest window first: a longer window is the more specific alternative, so
+# it is tried before the shorter substrings it already implies.
+_CJK_WINDOW_SIZES = (3, 2)
+
+# How much of a CJK run a chunk must cover before it counts as a match.
+#
+# The sliding windows mean a chunk can match a query with a fragment of it:
+# "学习" is a window of "深度学习入门". Without a threshold, updating a chunk
+# from "深度学习入门" to "强化学习进阶" would leave the old text findable,
+# because the two share the window "学习".
+#
+# Three characters is the natural threshold because it is the granularity the
+# trigram tokenizer itself indexes: a 3-character window is exactly what
+# FTS5 can match, so the threshold makes the two keyword paths agree. A run
+# shorter than three characters is a single word and must be matched whole.
+_MIN_MATCHED_CHARS = 3
+
+
+def _cjk_windows(run: str) -> List[str]:
+    """Sliding windows over one CJK run, deduplicated, longest first.
+
+    "王静静是谁" -> ["王静静", "静静是", "静是谁", "王静", "静静", "静是", "是谁"]
+
+    A two-character run yields its own two-character window ("事件"), which is
+    what makes short Chinese words reachable at all.
+    """
+    windows: List[str] = []
+    for size in _CJK_WINDOW_SIZES:
+        if len(run) < size:
+            continue
+        for i in range(len(run) - size + 1):
+            window = run[i:i + size]
+            if window not in windows:
+                windows.append(window)
+    return windows
+
+
+@dataclass(frozen=True)
+class QueryGroup:
+    """One unit of a query: a CJK run (any of its windows) or a whole word.
+
+    ``weight`` is the group's length in characters. It decides how much a
+    partial match counts against the group when the final score is averaged
+    over the groups, so a long question is not satisfied by one short word.
+    """
+    text: str
+    kind: str  # "cjk" | "word"
+    windows: Tuple[str, ...]
+
+    @property
+    def weight(self) -> float:
+        return float(len(self.text))
+
+
+def _query_groups(query: str) -> List[QueryGroup]:
+    """Split a query into the groups both keyword paths match against."""
+    groups: List[QueryGroup] = []
+    for run in _RE_CJK_WORDS.findall(query):
+        windows = _cjk_windows(run)
+        if windows:
+            groups.append(QueryGroup(text=run, kind="cjk", windows=tuple(windows)))
+    # The non-CJK part keeps its own rules: whole words of 3+ characters.
+    # Anything shorter is not worth a LIKE scan of the whole corpus.
+    word_text = _RE_CONTAINS_CJK.sub(' ', query)
+    for word in re.findall(r'\w+', word_text):
+        if len(word) >= 3:
+            groups.append(QueryGroup(text=word, kind="word", windows=(word,)))
+    return groups
+
+
+def _group_quality(group: QueryGroup, text: str) -> float:
+    """How well one group is covered by a piece of text, in [0, 1].
+
+    For a CJK run this is the fraction of the run's characters that are
+    covered by windows which actually occur in the text, discounted by how
+    long the longest matching window is: a page holding the whole phrase
+    deserves more than a page holding a two-character fragment of it.
+
+    A run shorter than three characters is matched WHOLE — a two-character
+    Chinese word ("事件") is a word, not a fragment of a longer one. A longer
+    run needs at least three matched characters, so a chunk that shares only
+    a common two-character fragment with the query ("学习" in "深度学习入门"
+    and "强化学习进阶") is not a match at all.
+    """
+    if group.kind == "word":
+        return 1.0 if group.text.lower() in text.lower() else 0.0
+
+    matched = [w for w in group.windows if w in text]
+    if not matched:
+        return 0.0
+    # Positions are taken inside the run, not inside the text: the same window
+    # can occur many times in a long chunk, and every occurrence would
+    # otherwise inflate the coverage past 1.
+    covered = set()
+    for window in matched:
+        start = group.text.find(window)
+        while start != -1:
+            covered.update(range(start, start + len(window)))
+            start = group.text.find(window, start + 1)
+    if len(group.text) > _MIN_MATCHED_CHARS and len(covered) < _MIN_MATCHED_CHARS:
+        # Only a fragment in common — not a match.
+        return 0.0
+    coverage = min(1.0, len(covered) / len(group.text))
+    longest = max(len(w) for w in matched)
+    return coverage * (0.6 + 0.4 * min(1.0, longest / 3.0))
+
+
+# A chunk that contains the query STRING verbatim has matched it trivially:
+# the query's characters are not special in that document, they are an
+# example of themselves — a probe table, a quoted question, a test corpus.
+# A chunk that matches the query's CONTENT while not containing the string is
+# evidence about the subject matter, which is what the search was for.
+#
+# So a verbatim mention is discounted relative to a subject match. The
+# discount is a factor, not a filter: a page that quotes the query is still
+# returned (it is about the query), it just does not outrank a page that is
+# about the thing the query names.
+#
+# It only changes the outcome when both kinds of match are present. When
+# every candidate contains the query string — a one-word query, say — the
+# factor is identical for all of them and the order is untouched.
+_VERBATIM_MENTION_FACTOR = 0.5
+
+
+def _verbatim_mention_factor(groups: List[QueryGroup], text: str) -> float:
+    """Discount for a chunk that contains the query string verbatim."""
+    lowered = text.lower()
+    for group in groups:
+        if group.kind == "word":
+            continue
+        if group.text.lower() in lowered:
+            return _VERBATIM_MENTION_FACTOR
+    return 1.0
 
 # sqlite3.OperationalError subclasses DatabaseError, so "database is locked",
 # "disk I/O error" and friends must be told apart from actual corruption before
@@ -963,31 +1116,18 @@ class MemoryStorage:
             return []
         
         scope_placeholders = ','.join('?' * len(scopes))
-        params = [fts_query] + scopes
-        
-        if user_id:
-            sql_query = f"""
-                SELECT chunks.*, bm25(chunks_fts) as rank
-                FROM chunks_fts
-                JOIN chunks ON chunks.rowid = chunks_fts.rowid
-                WHERE chunks_fts MATCH ? 
-                AND chunks.scope IN ({scope_placeholders})
-                AND (chunks.scope = 'shared' OR chunks.user_id = ?)
-                ORDER BY rank
-                LIMIT ?
-            """
-            params.extend([user_id, limit])
-        else:
-            sql_query = f"""
-                SELECT chunks.*, bm25(chunks_fts) as rank
-                FROM chunks_fts
-                JOIN chunks ON chunks.rowid = chunks_fts.rowid
-                WHERE chunks_fts MATCH ? 
-                AND chunks.scope IN ({scope_placeholders})
-                ORDER BY rank
-                LIMIT ?
-            """
-            params.append(limit)
+        vis_sql, vis_params = visibility_clause(user_id, "chunks.scope", "chunks.user_id")
+        sql_query = f"""
+            SELECT chunks.*, bm25(chunks_fts) as rank
+            FROM chunks_fts
+            JOIN chunks ON chunks.rowid = chunks_fts.rowid
+            WHERE chunks_fts MATCH ?
+            AND chunks.scope IN ({scope_placeholders})
+            AND {vis_sql}
+            ORDER BY rank
+            LIMIT ?
+        """
+        params = [fts_query] + list(scopes) + vis_params + [limit]
         
         try:
             rows = self.conn.execute(sql_query, params).fetchall()
@@ -1018,59 +1158,57 @@ class MemoryStorage:
         """LIKE-based search.
 
         Used as the keyword-search fallback when FTS5 is unavailable, fails,
-        or returns empty. Supports both CJK runs (1+ chars) and Unicode word
-        tokens (3+ chars) so it can serve as a true safety net for any query.
+        or returns empty. Uses the SAME segmenter as the trigram stage, so the
+        two paths cannot drift apart: a CJK run is matched by any of its
+        sliding windows, which is what makes two-character Chinese words
+        ("事件") reachable — the trigram tokenizer needs three characters and
+        therefore cannot serve them at all.
         """
-        # Keep CJK runs separate from adjacent words, as in the trigram query.
-        cjk_words = _RE_CJK_WORDS.findall(query)
-        word_text = _RE_CONTAINS_CJK.sub(' ', query)
-        words = cjk_words + [t for t in re.findall(r'\w+', word_text) if len(t) >= 3]
-        if not words:
+        groups = _query_groups(query)
+        if not groups:
             return []
 
         scope_placeholders = ','.join('?' * len(scopes))
 
-        # Build LIKE conditions for each word (case-insensitive for ASCII)
-        like_conditions = []
-        params = []
-        for word in words:
-            like_conditions.append("LOWER(text) LIKE ?")
-            params.append(f'%{word.lower()}%')
-        
-        where_clause = ' OR '.join(like_conditions)
+        def _build_where(active_groups):
+            """LIKE clause for the given groups: ANDed, alternatives ORed."""
+            group_clauses = []
+            params = []
+            for group in active_groups:
+                alternatives = []
+                for window in group.windows:
+                    alternatives.append("LOWER(text) LIKE ?")
+                    params.append(f'%{window.lower()}%')
+                group_clauses.append("(" + " OR ".join(alternatives) + ")")
+            return " AND ".join(group_clauses), params
+
+        where_clause, params = _build_where(groups)
         params.extend(scopes)
-        
-        if user_id:
-            sql_query = f"""
-                SELECT * FROM chunks
-                WHERE ({where_clause})
-                AND scope IN ({scope_placeholders})
-                AND (scope = 'shared' OR user_id = ?)
-                LIMIT ?
-            """
-            params.extend([user_id, limit])
-        else:
-            sql_query = f"""
-                SELECT * FROM chunks
-                WHERE ({where_clause})
-                AND scope IN ({scope_placeholders})
-                LIMIT ?
-            """
-            params.append(limit)
+        vis_sql, vis_params = visibility_clause(user_id)
+        params.extend(vis_params)
+        params.append(limit)
+        sql_query = f"""
+            SELECT * FROM chunks
+            WHERE ({where_clause})
+            AND scope IN ({scope_placeholders})
+            AND {vis_sql}
+            LIMIT ?
+        """
         
         try:
             rows = self.conn.execute(sql_query, params).fetchall()
             results = []
             for row in rows:
-                # Dynamic score: reward chunks that contain more of the query words.
-                # Use all tokens (CJK + ASCII) so pure-ASCII queries are not skipped.
-                # matched_count is always ≥1 because the WHERE clause uses OR, but
-                # guard defensively so unexpected zero-match rows are never surfaced.
+                # Score by how much of the query the chunk actually covers,
+                # not by how many tokens matched: the old count-based ladder
+                # gave one short match (0.45) and four short matches (0.85)
+                # nearly the same score, so a page quoting two words of a
+                # question outranked the page that answers it.
                 text_lower = row['text'].lower()
-                matched_count = sum(1 for w in words if w.lower() in text_lower)
-                if matched_count == 0:
+                quality = self._query_quality(groups, text_lower)
+                if quality <= 0:
                     continue
-                score = min(0.85, 0.3 + 0.15 * matched_count)
+                score = 0.3 + 0.55 * quality
                 results.append(SearchResult(
                     path=row['path'],
                     start_line=row['start_line'],
@@ -1080,12 +1218,105 @@ class MemoryStorage:
                     source=row['source'],
                     user_id=row['user_id']
                 ))
+
+            if not results and len(groups) > 1:
+                # The strict AND found nothing: the query asks for several
+                # things and no page carries all of them. Retry each group on
+                # its own and keep the best, rather than returning nothing.
+                # The relaxed hits are scored against the FULL group list, so
+                # a page matching only one part of a three-part question
+                # still scores lower than one matching more of it.
+                results = self._search_like_relaxed(
+                    groups, user_id, scopes, limit
+                )
+
             results.sort(key=lambda r: r.score, reverse=True)
             return results
         except Exception:
             from common.log import logger
             logger.warning("[MemoryStorage] _search_like failed, returning empty", exc_info=True)
             return []
+
+    def _search_like_relaxed(
+        self,
+        groups: List[QueryGroup],
+        user_id: Optional[str],
+        scopes: List[str],
+        limit: int
+    ) -> List[SearchResult]:
+        """Per-group LIKE search, used when the ANDed query matched nothing.
+
+        Each group is searched on its own and the hits are pooled. Scoring
+        still uses every group, so a relaxed hit that covers more of the
+        question outranks one that covers less — the relaxation widens the
+        candidate set, it does not flatten the ranking.
+        """
+        scope_placeholders = ','.join('?' * len(scopes))
+        seen = set()
+        results = []
+        for group in groups:
+            alternatives = []
+            params = []
+            for window in group.windows:
+                alternatives.append("LOWER(text) LIKE ?")
+                params.append(f'%{window.lower()}%')
+            where_clause = "(" + " OR ".join(alternatives) + ")"
+            vis_sql, vis_params = visibility_clause(user_id)
+            sql = f"""
+                SELECT * FROM chunks
+                WHERE {where_clause}
+                AND scope IN ({scope_placeholders})
+                AND {vis_sql}
+                LIMIT ?
+            """
+            params.extend(scopes)
+            params.extend(vis_params)
+            params.append(limit)
+            try:
+                rows = self.conn.execute(sql, params).fetchall()
+            except Exception:
+                continue
+            for row in rows:
+                key = (row['path'], row['start_line'], row['end_line'])
+                if key in seen:
+                    continue
+                seen.add(key)
+                text_lower = row['text'].lower()
+                quality = self._query_quality(groups, text_lower)
+                if quality <= 0:
+                    continue
+                results.append(SearchResult(
+                    path=row['path'],
+                    start_line=row['start_line'],
+                    end_line=row['end_line'],
+                    score=0.3 + 0.55 * quality,
+                    snippet=self._truncate_text(row['text'], 500),
+                    source=row['source'],
+                    user_id=row['user_id']
+                ))
+        return results
+
+    @staticmethod
+    def _query_quality(groups: List[QueryGroup], text: str) -> float:
+        """Weighted mean of how well each query group is covered by the text.
+
+        The weight is the group's length, so a five-character question is not
+        satisfied by a two-character fragment of itself. A chunk that merely
+        CONTAINS the query string is discounted: it matched the query as an
+        example of itself, not as subject matter.
+        """
+        if not groups:
+            return 0.0
+        total = 0.0
+        weight_sum = 0.0
+        for group in groups:
+            weight = group.weight
+            total += _group_quality(group, text) * weight
+            weight_sum += weight
+        if weight_sum <= 0:
+            return 0.0
+        quality = min(1.0, total / weight_sum)
+        return quality * _verbatim_mention_factor(groups, text)
 
     def delete_by_path(self, path: str):
         """Delete all chunks and file metadata for a path."""
@@ -1239,16 +1470,29 @@ class MemoryStorage:
     def _build_trigram_query(raw_query: str) -> Optional[str]:
         """
         Build FTS5 MATCH query for the trigram tokenizer.
-        Extracts CJK sequences (including single characters) and Unicode words,
-        joining them with AND so all terms must appear in the matched chunk.
+
+        Uses the shared segmenter, so this path and the LIKE fallback agree on
+        what a query means. A CJK run becomes the OR of its sliding windows
+        ("王静静是谁" -> "王静静" OR "静静是" OR ... OR "是谁"); the groups
+        themselves are ANDed, so a mixed query still means "both".
+
+        The trigram tokenizer only indexes three-character windows, so a
+        two-character alternative can never match on its own. It is kept in the
+        expression anyway: the OR costs nothing, and it keeps the expression a
+        faithful picture of the query. The two-character case is served by the
+        LIKE fallback, which does match on two characters.
         """
-        tokens = _RE_TRIGRAM_TOKENS.findall(raw_query)
-        tokens = [t for t in tokens if t]
-        if not tokens:
+        groups = _query_groups(raw_query)
+        if not groups:
             return None
         # Escape embedded double-quotes (FTS5 uses "" inside quoted phrases)
-        quoted = [f'"{t.replace(chr(34), chr(34)*2)}"' for t in tokens]
-        return ' AND '.join(quoted)
+        clauses = []
+        for group in groups:
+            alternatives = " OR ".join(
+                f'"{w.replace(chr(34), chr(34)*2)}"' for w in group.windows
+            )
+            clauses.append(f"({alternatives})")
+        return ' AND '.join(clauses)
 
     def _search_fts5_trigram(
         self,
@@ -1263,46 +1507,42 @@ class MemoryStorage:
             return []
 
         scope_placeholders = ','.join('?' * len(scopes))
-        params = [trigram_query] + list(scopes)
-
-        if user_id:
-            sql = f"""
-                SELECT chunks.*, bm25(chunks_fts_trigram) as rank
-                FROM chunks_fts_trigram
-                JOIN chunks ON chunks.rowid = chunks_fts_trigram.rowid
-                WHERE chunks_fts_trigram MATCH ?
-                AND chunks.scope IN ({scope_placeholders})
-                AND (chunks.scope = 'shared' OR chunks.user_id = ?)
-                ORDER BY rank
-                LIMIT ?
-            """
-            params.extend([user_id, limit])
-        else:
-            sql = f"""
-                SELECT chunks.*, bm25(chunks_fts_trigram) as rank
-                FROM chunks_fts_trigram
-                JOIN chunks ON chunks.rowid = chunks_fts_trigram.rowid
-                WHERE chunks_fts_trigram MATCH ?
-                AND chunks.scope IN ({scope_placeholders})
-                ORDER BY rank
-                LIMIT ?
-            """
-            params.append(limit)
+        vis_sql, vis_params = visibility_clause(user_id, "chunks.scope", "chunks.user_id")
+        sql = f"""
+            SELECT chunks.*, bm25(chunks_fts_trigram) as rank
+            FROM chunks_fts_trigram
+            JOIN chunks ON chunks.rowid = chunks_fts_trigram.rowid
+            WHERE chunks_fts_trigram MATCH ?
+            AND chunks.scope IN ({scope_placeholders})
+            AND {vis_sql}
+            ORDER BY rank
+            LIMIT ?
+        """
+        params = [trigram_query] + list(scopes) + vis_params + [limit]
 
         try:
             rows = self.conn.execute(sql, params).fetchall()
-            return [
-                SearchResult(
+            results = []
+            groups = _query_groups(query)
+            for row in rows:
+                score = self._bm25_rank_to_score(row['rank'])
+                # The same discount the LIKE path applies: a chunk that
+                # contains the query string verbatim matched it as an example
+                # of itself, not as subject matter. Applied here so the two
+                # keyword paths agree on the order.
+                text = row['text'] or ''
+                factor = _verbatim_mention_factor(groups, text)
+                results.append(SearchResult(
                     path=row['path'],
                     start_line=row['start_line'],
                     end_line=row['end_line'],
-                    score=self._bm25_rank_to_score(row['rank']),
-                    snippet=self._truncate_text(row['text'], 500),
+                    score=score * factor,
+                    snippet=self._truncate_text(text, 500),
                     source=row['source'],
                     user_id=row['user_id']
-                )
-                for row in rows
-            ]
+                ))
+            results.sort(key=lambda r: r.score, reverse=True)
+            return results
         except Exception:
             from common.log import logger
             logger.warning("[MemoryStorage] _search_fts5_trigram failed, returning empty", exc_info=True)

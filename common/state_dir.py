@@ -93,7 +93,14 @@ def user_root(identity: Optional[RuntimeIdentity] = None) -> Path:
     """
     ident = _resolve(identity)
     if ident.user_id:
-        return shared_root() / "users" / ident.user_id
+        # The directory name is a filesystem-safe slug, never the raw id:
+        # ':' is drive syntax on Windows, and a raw id with one makes the
+        # path unparseable. The slug -> logical id mapping lives in the
+        # shared root's memory index registry (users.json).
+        from agent.memory.identity_ns import user_dir_name
+        return shared_root() / "users" / user_dir_name(
+            ident.user_id, workspace=shared_root()
+        )
     return state_root(ident)
 
 

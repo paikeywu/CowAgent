@@ -47,6 +47,26 @@ class OpenAICompatibleBot:
             return True
         return False
 
+    @staticmethod
+    def _is_kimi_reasoning_model(model_name: str) -> bool:
+        """Whether the model is a Kimi reasoning model that only accepts
+        temperature=1 (or omits the parameter entirely).
+
+        Covers kimi-k3 and kimi-k2.7-code series when accessed via the
+        Kimi Coding Plan endpoint (api.kimi.com/coding). These models
+        reject any temperature other than 1.
+        """
+        if not model_name or not isinstance(model_name, str):
+            return False
+        name = model_name.lower()
+        if name.startswith("kimi-k3"):
+            return True
+        if name.startswith("kimi-k2.7-code"):
+            return True
+        if name == "kimi-for-coding":
+            return True
+        return False
+
     def get_api_config(self):
         """
         Get API configuration for this bot.
@@ -149,8 +169,10 @@ class OpenAICompatibleBot:
                 request_params["stream_options"] = {"include_usage": True}
             # GPT-5.x / o-series reasoning models only accept default
             # temperature/top_p and reject penalty params.
+            # Kimi K3 / K2.7-code models also reject non-default temperature.
             is_gpt5_reasoning = self._is_gpt5_reasoning_model(model_name)
-            if is_gpt5_reasoning:
+            is_kimi_reasoning = self._is_kimi_reasoning_model(model_name)
+            if is_gpt5_reasoning or is_kimi_reasoning:
                 for key in ("temperature", "top_p", "frequency_penalty", "presence_penalty"):
                     request_params.pop(key, None)
             
