@@ -305,7 +305,11 @@ def _guard_tools(
 _WATCH_SUBDIRS = ("MEMORY.md", "AGENT.md", "skills", "knowledge", "output")
 # Subpaths under memory/ to ignore: evolution's own bookkeeping + the nightly
 # dream diary, none of which count as a user-facing change signal.
-_MEMORY_IGNORE = (".evolution_backups", "dreams", "evolution")
+_MEMORY_IGNORE = (".evolution_backups", "dreams", "evolution", "shelf", "facts")
+# shelf/ and facts/ joined the ignore list with live-memory v2: shelf/ cards
+# are auto-regenerated projections (watching them would make every catalog
+# rebuild look like "the workspace changed"), and facts/ is the append-only
+# evidence room whose writes are a steady background stream, not a signal.
 # Files the skill subsystem maintains automatically (the enable/disable index).
 # Not an evolution result, so a rewrite must not count as a change signal.
 _WATCH_IGNORE_NAMES = ("skills_config.json",)

@@ -417,6 +417,14 @@ class MemoryManager:
                 # that crowd out the authoritative entry in retrieval.
                 if "dreams" in rel_parts:
                     continue
+                # Live-memory v2 layers: shelf/ is a REBUILDABLE projection
+                # (directory cards for humans) — indexing it would create a
+                # self-loop where search results are full of summaries of
+                # summaries. facts/ is the append-only evidence room (JSONL,
+                # never .md today); it is referenced by pointer, not indexed.
+                # markdown/ stays indexed on purpose: it IS the truth layer.
+                if "shelf" in rel_parts or "facts" in rel_parts:
+                    continue
                 try:
                     if "users" in rel_parts:
                         # memory/users/<id>/... wins over a "daily" segment:
