@@ -73,6 +73,13 @@ REASON_INDEX_ORPHAN = "gap-rule:index-orphan"
 # is what turns "it broke once" into "it is still broken" — a degradation
 # nobody can find is a degradation that stays.
 REASON_PROJECTION_DEGRADED = "gap-rule:release-projection-degraded"
+# P0-16 L-4: a READ EXIT failed closed. The projection marker above covers
+# the RETRIEVAL path (which goes through the projection refresh); the read
+# exits resolve the truth layer themselves and never touch that function,
+# so their refusals needed a marker of their own. Without this check the
+# marker was written by nobody who read it — the loudest possible
+# silence.
+REASON_READ_DEGRADED = "gap-rule:read-degraded"
 
 # Short machine codes carried on every violation (the shelf view needs a
 # stable code, not a sentence).
@@ -81,6 +88,7 @@ CODE_HISTORY = "history-rewritten"
 CODE_INDEX_EXCLUDED = "index-excluded-path"
 CODE_INDEX_ORPHAN = "index-orphan"
 CODE_PROJECTION_DEGRADED = "release-projection-degraded"
+CODE_READ_DEGRADED = "read-degraded"
 
 # Path segments the sync scan skips by policy (agent/memory/manager.py).
 # A chunk row under any of them is a policy violation, not a stale page.
@@ -180,6 +188,7 @@ class Inspector:
         self._check_naming(report)
         self._check_index_hygiene(report)
         self._check_projection_degraded(report)
+        self._check_read_degraded(report)
         if persist_snapshot:
             self._write_snapshot(snapshot)
         self._write_audit(report)
@@ -468,6 +477,44 @@ class Inspector:
             _SEV_HIGH, code=CODE_PROJECTION_DEGRADED,
             stage=payload.get("stage"), at=payload.get("at"),
             error=payload.get("error"))
+
+    # -- check 7: a read exit failed closed (P0-16 L-4) ----------------------
+
+    def _check_read_degraded(self, report: Dict[str, Any]) -> None:
+        """Report a READ EXIT that is failing closed.
+
+        The projection check above covers the retrieval path. The read
+        exits (memory_get, the facade's read, the web console's file
+        reader) resolve the truth layer themselves, so they refuse
+        service on their own — and, before P0-16 L-4, they refused
+        SILENTLY: no log line, no marker, nothing for the inspector to
+        find. The content was not leaked, but a privacy control that
+        breaks shut and says nothing can stay broken forever.
+
+        The marker is removed once the truth layer resolves again, so this
+        check goes green by itself after the cause is fixed. The
+        append-only history (``read_denied.jsonl``) is never removed —
+        the refusals happened.
+        """
+        from agent.memory.read_audit import read_denied_state
+
+        payload = read_denied_state(self.workspace_root)
+        if payload is None:
+            return
+        rel = (self.audit_dir / "read_denied.json").relative_to(
+            self.workspace_root).as_posix()
+        self._violation(
+            report, REASON_READ_DEGRADED, rel,
+            f"a read exit refused to serve (exit={payload.get('last_exit')!r}, "
+            f"at={payload.get('at')!r}, "
+            f"path={payload.get('last_path')!r}, "
+            f"error={payload.get('last_error')!r}); the read exits are "
+            f"failing closed until the truth layer resolves again",
+            _SEV_HIGH, code=CODE_READ_DEGRADED,
+            last_exit=payload.get("last_exit"),
+            last_path=payload.get("last_path"),
+            at=payload.get("at"),
+            error=payload.get("last_error"))
 
     # -- snapshots -------------------------------------------------------------
 

@@ -204,6 +204,7 @@ class SQLiteVectorBackend(VectorBackend):
 
         user_id = metadata_filter.get("user_id")
         identities = metadata_filter.get("identities")
+        owner_tokens = metadata_filter.get("owner_tokens")
         if shared_visible_to_user:
             # The visibility predicate lives in exactly one place; this
             # backend spells the columns bare (its queries are over the
@@ -211,14 +212,16 @@ class SQLiteVectorBackend(VectorBackend):
             from agent.memory.visibility import visibility_clause
 
             clause, clause_params = visibility_clause(user_id,
-                                                     identities=identities)
+                                                     identities=identities,
+                                                     owner_token_list=owner_tokens,
+                                                     sealed_owner_col="sealed_owner")
             clauses.append(clause)
             params.extend(clause_params)
 
         for key, value in metadata_filter.items():
             if key == "scopes" or (
                 key == "user_id" and shared_visible_to_user
-            ) or key == "identities" or value is None:
+            ) or key == "identities" or key == "owner_tokens" or value is None:
                 continue
             if key not in cls._FILTER_COLUMNS:
                 raise ValueError("Unsupported vector metadata filter: {}".format(key))

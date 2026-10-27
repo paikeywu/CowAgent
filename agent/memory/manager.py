@@ -6,7 +6,7 @@ Provides high-level interface for memory operations
 
 import json
 import os
-from typing import List, Optional, Dict, Any, Sequence, Tuple
+from typing import FrozenSet, List, Optional, Dict, Any, Sequence, Tuple
 from pathlib import Path
 import hashlib
 from datetime import datetime
@@ -25,10 +25,12 @@ from agent.memory.visibility import (
     VIS_OPEN,
     VIS_RELEASED,
     VIS_SEALED,
-    ambient_identities,
+    ambient_end_user_ids,
+    ambient_owner_tokens,
     classify_frontmatter,
     identity_tokens,
     owner_token,
+    owner_tokens,
 )
 
 
@@ -311,18 +313,39 @@ class MemoryManager:
         """
         return self._release_state.get()
 
-    def read_decision(self, rel_path: str) -> Tuple[str, str]:
-        """``(decision, reason)`` for a read exit, under the ambient identity.
+    def read_decision(self, rel_path: str) -> Tuple[str, str, FrozenSet[str]]:
+        """``(decision, reason, released_fact_ids)`` for a read exit.
+
+        The third element is the set of fact rows (the 感受 of released
+        elements) that the reading view must mask — P0-16 F-1. It travels
+        with the decision so a read exit cannot invent a masking rule of
+        its own.
 
         Raises when the truth layer cannot be resolved: an unknown release
         state must fail the read, not serve the content (P0-13 L-3).
+        P0-16 L-4: that refusal is LOUD — an ERROR log, an audit line and
+        a marker the inspector reports red.
         """
         cache = getattr(self, "_release_state", None)
         if cache is None:
-            return READ_ALLOW, ""
-        state = cache.get()
-        tokens = identity_tokens(None, ambient_identities())
-        return state.decide(rel_path, tokens)
+            return READ_ALLOW, "", frozenset()
+        from agent.memory.read_audit import (
+            clear_read_denied,
+            report_read_denied,
+        )
+        workspace = self.config.get_workspace()
+        try:
+            state = cache.get()
+        except Exception as e:
+            report_read_denied(workspace, "MemoryManager.read_decision",
+                               rel_path, e)
+            raise
+        # The truth layer resolves again → the degraded state is over.
+        clear_read_denied(workspace)
+        # The sealed branch is matched against the OWNER axis only
+        # (P0-16 L-5).
+        owners = owner_tokens(ambient_owner_tokens())
+        return state.decide(rel_path, owners)
 
     async def search(
         self,
@@ -362,18 +385,21 @@ class MemoryManager:
             except Exception:
                 pass
 
-        # P0-14 L-2: the caller's FULL token set. The end user and the
-        # agent are both identities the caller holds; the agent's token is
-        # the owner token a dark page is indexed under, so without it the
-        # agent could not read its own dark pages (06 §5.2).
-        identities = ambient_identities()
+        # P0-14 L-2 / P0-16 L-5: the caller's identities, kept on TWO axes.
+        # The end user is matched against ``user_id``; the agent is matched
+        # against ``sealed_owner`` (the owner token a dark page is indexed
+        # under). Mixing them into one token set is what let an end-user
+        # id that happened to equal ``agent--<some agent>`` read a dark
+        # page (P0-15 L-5).
+        identities = ambient_end_user_ids()
         tokens = identity_tokens(user_id, identities)
+        owners = owner_tokens(ambient_owner_tokens())
 
         # Determine scopes
         scopes = []
         if include_shared:
             scopes.append("shared")
-        if tokens:
+        if tokens or owners:
             # 'user' rows belong to an end user; 'sealed' rows are dark
             # pages, and only their owner's token can match them.
             scopes.append("user")
@@ -412,6 +438,7 @@ class MemoryManager:
                     user_id=user_id,
                     scopes=scopes,
                     identities=identities,
+                    owner_tokens=owners,
                     limit=max_results * 2  # Get more candidates for merging
                 )
                 logger.info(f"[MemoryManager] Vector search found {len(vector_results)} results for query: {query}")
@@ -426,6 +453,7 @@ class MemoryManager:
             user_id=user_id,
             scopes=scopes,
             identities=identities,
+            owner_tokens=owners,
             limit=max_results * 2
         )
         logger.info(f"[MemoryManager] Keyword search found {len(keyword_results)} results for query: {query}")
@@ -484,7 +512,24 @@ class MemoryManager:
         """
         if not content.strip():
             return
-        
+
+        # P0-16 L-5: an end-user id that claims the agent namespace is
+        # REJECTED ON WRITE. The two axes are separate namespaces
+        # (``chunks.user_id`` for end users, ``chunks.sealed_owner`` for
+        # agent owner tokens); an id shaped like an owner token would
+        # otherwise make a dark page readable by an end user. Accepting
+        # it quietly would leave the collision in the index for every
+        # later reader to trip over.
+        if user_id is not None:
+            from agent.memory.visibility import is_reserved_end_user_id
+
+            if is_reserved_end_user_id(user_id):
+                raise ValueError(
+                    f"user_id {user_id!r} claims the agent namespace "
+                    f"(prefix 'agent--'); the end-user axis and the agent "
+                    f"owner axis are separate — choose another id"
+                )
+
         # Generate path if not provided
         if not path:
             content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()[:8]
@@ -598,7 +643,18 @@ class MemoryManager:
                 silently become an id."""
                 if raw_segment is None:
                     return None
-                return parse_user_dir_name(raw_segment, workspace=workspace_dir)
+                logical = parse_user_dir_name(raw_segment, workspace=workspace_dir)
+                # P0-16 L-5: a legacy bare segment can still be spelled
+                # ``agent--<something>``. That is the agent namespace, and
+                # the end-user axis may not carry it — so the row is
+                # indexed as SHARED (no owner) rather than as a user row.
+                # Fail closed: an id we cannot place belongs to nobody.
+                if logical is not None:
+                    from agent.memory.visibility import is_reserved_end_user_id
+
+                    if is_reserved_end_user_id(logical):
+                        return None
+                return logical
 
             for file_path in memory_dir.rglob("*.md"):
                 rel_parts = file_path.relative_to(workspace_dir).parts
@@ -746,7 +802,13 @@ class MemoryManager:
                 continue
             if visibility == VIS_SEALED:
                 scope = SCOPE_SEALED
-                user_id = sealed_owner
+                # P0-16 L-5: the owner token does NOT go into the end-user
+                # axis. ``chunks.user_id`` holds END USER ids only; the
+                # owner of a dark page lives in ``chunks.sealed_owner``.
+                # Writing it into both columns is what let an end-user id
+                # shaped like an owner token read a dark page — the row
+                # matched on the axis that was never supposed to carry it.
+                user_id = None
             previous_hash = self.storage.get_file_hash(rel_path)
             if previous_hash == file_hash:
                 continue
@@ -764,6 +826,13 @@ class MemoryManager:
                 "source": source,
                 "scope": scope,
                 "user_id": user_id,
+                # P0-16 L-5 / B-2: the dark page's owner token travels on its
+                # OWN column. The `user_id` above keeps the legacy
+                # end-user/owner sharing for backwards compatibility, but
+                # the sealed branch of the predicate reads ONLY
+                # `sealed_owner` — so an end-user id that happens to look
+                # like an owner token cannot reach a dark page.
+                "sealed_owner": sealed_owner if visibility == VIS_SEALED else None,
                 "file_hash": file_hash,
                 "chunks": chunks,
                 "texts": [c.text for c in chunks],
@@ -908,6 +977,11 @@ class MemoryManager:
                     metadata=None,
                     element_released=element_released,
                     file_sealed=file_sealed,
+                    # P0-16 L-5 / B-2: the owner token of a dark page, on its
+                    # own column. Without this the column is always NULL and
+                    # the sealed branch of the predicate is always false —
+                    # which would hide every dark page from its own owner.
+                    sealed_owner=entry.get("sealed_owner"),
                 ))
             self.storage.save_chunks_batch(memory_chunks)
             stat = entry["file_path"].stat()

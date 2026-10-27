@@ -645,3 +645,166 @@ def test_wr14_chain_self_check_on_append(tmp_path):
     path.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
     violations = f.verify_facts_file("facts/2026-10-26/sess_deadbeef.jsonl")
     assert violations
+
+
+# --- P0-16 F-1: the evidence room's released rows are masked in the VIEW ---
+#
+# The evidence room is append-only: its rows are never rewritten and its hash
+# chain is never broken. But "released" must mean released on EVERY read
+# path — so a read of a facts file replaces the rows of released elements
+# with a fixed placeholder. The DISK does not move; the VIEW does.
+
+F1_SECRET = "我今天特别生气因为对方连续三次无视我的提醒这句话是绝密原话"
+
+
+def _f1_workspace(tmp_path):
+    cow, ws = make_cow(tmp_path)
+    f = facade_for(ws, cow)
+    body = ("# 事件\n\n今天发生了一件事。\n\n"
+            "## 感受\n\n" + F1_SECRET + "\n")
+    path = f.write_event("f1-e2e", "F-1 端到端事件", body)
+    return cow, ws, f, path
+
+
+def _f1_facts_file(ws):
+    facts = list((ws / "memory" / "facts").rglob("*.jsonl"))
+    assert facts, "no facts file was written"
+    return facts[0]
+
+
+def test_f1_a_released_element_masks_its_feeling_row_in_the_read_view(tmp_path):
+    """The web console's reader must NOT serve the released 原话."""
+    from agent.memory.service import MemoryService
+
+    cow, ws, f, path = _f1_workspace(tmp_path)
+    facts_file = _f1_facts_file(ws)
+    rel = path.relative_to(ws).as_posix()
+
+    # REVERSE CASE: before the release the row is served VERBATIM.
+    before = MemoryService(str(ws)).get_content(
+        facts_file.relative_to(ws).as_posix().replace("memory/", "", 1),
+        category="memory")["content"]
+    assert F1_SECRET in before, (
+        "the unreleased feeling row must be served as-is — a mask that "
+        "hides everything would pass a leak test")
+
+    ref = f.channel.register_consent(ACTOR, "self")
+    init = f.initiate_release(rel, consent_ref=ref)
+    assert init.get("executed") or f.confirm_release(init["token"])["executed"]
+
+    after = MemoryService(str(ws)).get_content(
+        facts_file.relative_to(ws).as_posix().replace("memory/", "", 1),
+        category="memory")["content"]
+    assert F1_SECRET not in after, "the released 原话 leaked through the console"
+    assert '"status": "released"' in after, "no placeholder line was rendered"
+    assert F1_SECRET[:3] not in after, "the placeholder leaks a fragment"
+
+
+def test_f1_a_released_element_masks_its_feeling_row_for_memory_get(tmp_path):
+    """The memory_get tool must NOT serve the released 原话 either."""
+    from pathlib import Path
+
+    from agent.tools.memory.memory_get import MemoryGetTool
+
+    cow, ws, f, path = _f1_workspace(tmp_path)
+    facts_file = _f1_facts_file(ws)
+    rel = path.relative_to(ws).as_posix()
+
+    ref = f.channel.register_consent(ACTOR, "self")
+    init = f.initiate_release(rel, consent_ref=ref)
+    assert init.get("executed") or f.confirm_release(init["token"])["executed"]
+
+    class _Cfg:
+        def get_workspace(self):
+            return Path(str(ws))
+
+    class _Mgr:
+        """A stub that consults the REAL truth layer — stubbing the decision
+        would make the test prove nothing about the masking."""
+
+        def __init__(self):
+            self.config = _Cfg()
+
+        def read_decision(self, rel_path):
+            from agent.memory.release_state import resolve
+            from agent.memory.visibility import (
+                ambient_owner_tokens,
+                owner_tokens,
+            )
+            state = resolve(str(ws))
+            return state.decide(rel_path,
+                                 owner_tokens(ambient_owner_tokens()))
+
+    res = MemoryGetTool(memory_manager=_Mgr()).execute(
+        {"path": facts_file.relative_to(ws).as_posix()})
+    assert getattr(res, "status", None) == "success", (
+        "memory_get failed: %r" % (getattr(res, "result", None),))
+    text = "".join(str(x) for x in (getattr(res, "result", None),
+                                     getattr(res, "display", None))
+                   if x is not None)
+    assert F1_SECRET not in text, "the released 原话 leaked through memory_get"
+    assert '"status": "released"' in text, "no placeholder line was rendered"
+
+
+def test_f1_a_masking_does_not_touch_the_disk(tmp_path):
+    """The disk keeps the 原话: bytes, line count and hash chain unchanged.
+
+    This is gate ② (事实层不可改写). A mask that rewrote the file would
+    pass the leak test and break the evidence room.
+    """
+    import hashlib
+
+    from agent.memory.release_state import resolve
+
+    cow, ws, f, path = _f1_workspace(tmp_path)
+    facts_file = _f1_facts_file(ws)
+    rel = path.relative_to(ws).as_posix()
+
+    before_bytes = facts_file.read_bytes()
+    before_sha = hashlib.sha256(before_bytes).hexdigest()
+    before_lines = len(before_bytes.decode("utf-8").splitlines())
+
+    ref = f.channel.register_consent(ACTOR, "self")
+    init = f.initiate_release(rel, consent_ref=ref)
+    assert init.get("executed") or f.confirm_release(init["token"])["executed"]
+
+    after_bytes = facts_file.read_bytes()
+    after_sha = hashlib.sha256(after_bytes).hexdigest()
+    after_lines = len(after_bytes.decode("utf-8").splitlines())
+    assert before_sha == after_sha, "the facts file's bytes changed"
+    assert before_bytes == after_bytes
+    assert before_lines == after_lines, "the facts file's line count changed"
+    assert F1_SECRET.encode("utf-8") in after_bytes, (
+        "the disk must keep the 原话 — only the view masks it")
+
+    # and the chain still verifies
+    assert not f.verify_facts_file(
+        facts_file.relative_to(ws).as_posix().replace("memory/", "", 1))
+
+    # the truth layer knows which row belongs to the released element
+    state = resolve(str(ws))
+    assert state.released_fact_ids, (
+        "the released element's feeling row id is NOT in the state — the "
+        "element->feeling mapping is broken")
+
+
+def test_f1_a_the_placeholder_leaks_nothing_about_the_original(tmp_path):
+    """No fragment of the 原话, no length, no count of what was withheld."""
+    from agent.memory.facts_mask import mask_facts_text
+    from agent.memory.facts_refs import feeling_element_id
+
+    eid = feeling_element_id(F1_SECRET)
+    row = {"run_id": "feeling:" + eid, "content": F1_SECRET, "seq": 1}
+    text = json.dumps(row, ensure_ascii=False) + "\n"
+
+    masked = mask_facts_text(text, [eid])
+    assert F1_SECRET not in masked
+    assert '"status": "released"' in masked
+    # no 3-character fragment of the original survives
+    for n in (3, 4, 5):
+        for i in range(len(F1_SECRET) - n + 1):
+            assert F1_SECRET[i:i + n] not in masked, (
+                "the placeholder leaks a %d-char fragment" % n)
+    # no count of what was withheld
+    assert "1" not in masked.split('"element_id"')[0]
+    assert "count" not in masked and "filtered" not in masked

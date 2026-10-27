@@ -76,14 +76,21 @@ class ReleaseState:
     ``sealed_paths``  — this path is a DARK PAGE (暗页). It stays in the
                     index; only the owner may read it.
     ``sealed_owner``  — path → owner token for the dark pages.
+    ``released_fact_ids`` — the fact-layer element ids (the 感受 rows of
+                    released elements) that must be MASKED in the reading
+                    view (P0-16 F-1). The rows themselves stay on disk —
+                    the evidence room is append-only — but no read exit
+                    may hand out their 原话.
 
-    Both sets hold INDEX KEYS: workspace-relative POSIX paths, exactly the
-    strings ``chunks.path`` carries.
+    The path sets hold INDEX KEYS: workspace-relative POSIX paths, exactly
+    the strings ``chunks.path`` carries. The fact ids are ELEMENT ids
+    (``f_*``), the same strings a released element's ``refs`` carries.
     """
 
     released_paths: FrozenSet[str] = frozenset()
     sealed_paths: FrozenSet[str] = frozenset()
     sealed_owner: Mapping[str, str] = field(default_factory=dict)
+    released_fact_ids: FrozenSet[str] = frozenset()
     signature: Tuple = ()
 
     def __hash__(self) -> int:
@@ -107,10 +114,12 @@ class ReleaseState:
         return (1 if self.element_released(path) else 0,
                 1 if self.file_sealed(path) else 0)
 
-    def decide(self, path: str, tokens) -> Tuple[str, str]:
-        """``(decision, reason)`` for a read exit — one derivation, no drift.
+    def decide(self, path: str, tokens) -> Tuple[str, str, FrozenSet[str]]:
+        """``(decision, reason, released_fact_ids)`` for a read exit.
 
-        ``READ_ALLOW`` / ``READ_RELEASED`` / ``READ_SEALED``.
+        One derivation, no drift. The third element is the set of fact
+        rows the reading view must mask (P0-16 F-1) — it travels WITH the
+        decision so a read exit cannot apply a rule of its own.
         """
         from agent.memory.visibility import decide_read
 
@@ -120,6 +129,7 @@ class ReleaseState:
             sealed_paths=self.sealed_paths,
             sealed_owner=self.sealed_owner,
             tokens=tokens,
+            released_fact_ids=self.released_fact_ids,
         )
 
 
@@ -213,6 +223,10 @@ def resolve(workspace_root: Path | str) -> ReleaseState:
     sealed: Set[str] = set()
     sealed_owner: Dict[str, str] = {}
     status_released: Set[str] = set()
+    # P0-16 F-1: the fact-layer element ids each truth file points at.
+    # A released element's 感受 rows live in the evidence room, and the
+    # element's own ``refs`` are the only pointer to them.
+    refs_of: Dict[str, List[str]] = {}
 
     for p in _iter_markdown(memory_root):
         key = _norm_key(p.relative_to(workspace).as_posix())
@@ -241,6 +255,9 @@ def resolve(workspace_root: Path | str) -> ReleaseState:
             sups = fm.get("supersedes")
             if isinstance(sups, list):
                 supersedes_of[eid] = [str(s) for s in sups if s]
+        refs = fm.get("refs")
+        if isinstance(refs, list):
+            refs_of[key] = [str(r) for r in refs if r]
         kind = classify_frontmatter(fm)
         if kind == VIS_RELEASED:
             if eid:
@@ -308,10 +325,20 @@ def resolve(workspace_root: Path | str) -> ReleaseState:
     sealed_owner = {k: v for k, v in sealed_owner.items()
                     if k in sealed_paths}
 
+    # P0-16 F-1: the fact rows of released elements. The released element's
+    # own front-matter names them (``refs`` → ``f_*`` ids, P0-1 §4.1); the
+    # rows themselves stay on disk (the evidence room is append-only), but
+    # a read exit must mask them in the view.
+    released_fact_ids: Set[str] = set()
+    for path in released_paths:
+        for ref in refs_of.get(path, ()):
+            released_fact_ids.add(ref)
+
     return ReleaseState(
         released_paths=frozenset(released_paths),
         sealed_paths=frozenset(sealed_paths),
         sealed_owner=sealed_owner,
+        released_fact_ids=frozenset(released_fact_ids),
         signature=tree_signature(workspace),
     )
 
@@ -348,6 +375,7 @@ class ReleaseStateCache:
                 released_paths=state.released_paths,
                 sealed_paths=state.sealed_paths,
                 sealed_owner=state.sealed_owner,
+                released_fact_ids=state.released_fact_ids,
                 signature=signature,
             )
         return self._state

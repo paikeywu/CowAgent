@@ -627,3 +627,220 @@ def test_generator_is_the_only_writer_of_shelf(ws, cow):
     stale.write_text("stale\n", encoding="utf-8", newline="\n")
     rebuild(ws)
     assert not stale.exists(), "陈旧投影页没有被清掉"
+
+
+# --- P0-16 B-1 / B-2 / L-5: the two identity axes --------------------------
+#
+# B-1: the retrieval functions must accept the owner axis (the in-flight
+#      change passed owner_tokens= but the storage signatures did not, so
+#      the whole retrieval path raised TypeError).
+# B-2: a dark page's chunk must actually carry its owner, and the owner must
+#      be able to read it.
+# L-5: the end-user axis and the agent-owner axis are SEPARATE columns.
+
+def _dark_page(ws, name, *, author=None, body="DARKSECRET"):
+    """A dark page (visibility: sealed), optionally with an owner."""
+    d = ws / "memory" / "markdown" / "events"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / name
+    fm = ["---", "layer: event", "type: conversation", "title: 暗页",
+          "tags: []", "subject: tester", "refs: []",
+          "occurred_at: 2026-10-27T00:00:00+08:00",
+          "recorded_at: 2026-10-27T00:00:00+08:00",
+          "status: active", "visibility: sealed"]
+    if author:
+        fm.append("author_viewpoint: %s" % author)
+    fm += ["version: 1", "---", "", body, ""]
+    p.write_text("\n".join(fm), encoding="utf-8", newline="\n")
+    return p
+
+
+def _white_page(ws, name, body="WHITESECRET"):
+    d = ws / "memory" / "markdown" / "events"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / name
+    p.write_text("---\nlayer: event\ntype: conversation\ntitle: 白页\n"
+                 "tags: []\nsubject: tester\nrefs: []\n"
+                 "occurred_at: 2026-10-27T00:00:00+08:00\n"
+                 "recorded_at: 2026-10-27T00:00:00+08:00\n"
+                 "status: active\nversion: 1\n---\n\n%s\n" % body,
+                 encoding="utf-8", newline="\n")
+    return p
+
+
+def _index(ws):
+    """Index the workspace and return (manager, sqlite connection)."""
+    import asyncio
+    import sqlite3
+
+    from agent.memory.config import MemoryConfig
+    from agent.memory.manager import MemoryManager
+
+    mgr = MemoryManager(config=MemoryConfig(workspace_root=str(ws)))
+    asyncio.run(mgr.sync())
+    conn = sqlite3.connect(str(mgr.config.get_db_path()))
+    conn.row_factory = sqlite3.Row
+    return mgr, conn
+
+
+def test_b1_a_the_retrieval_functions_accept_the_owner_axis(ws):
+    """B-1: search_vector / search_keyword must take owner_tokens.
+
+    The in-flight change passed owner_tokens= at the call site while the
+    storage signatures did not have it — so every retrieval raised
+    TypeError and the phase-1 acceptance dropped from 8/8 to 3/8.
+    """
+    import inspect
+
+    from agent.memory.storage import MemoryStorage
+
+    for name in ("search_vector", "search_keyword", "_search_fts5",
+                 "_search_like", "_search_like_relaxed",
+                 "_search_fts5_trigram"):
+        sig = inspect.signature(getattr(MemoryStorage, name))
+        assert "owner_tokens" in sig.parameters, (
+            "%s does not accept owner_tokens — the retrieval path raises "
+            "TypeError" % name)
+
+
+def test_b1_a_every_visibility_clause_call_passes_the_owner_axis(ws):
+    """B-1 (second layer): no call site may forget the owner axis.
+
+    A call site that omits owner_token_list= silently disables the dark
+    page rule — the dark page becomes visible to everybody, or (with the
+    column half-written) to nobody. Either way the bug is invisible.
+    """
+    import inspect
+    import pathlib
+
+    from agent.memory.visibility import visibility_clause
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    calls = []
+    for rel in ("agent/memory/storage.py", "agent/memory/vector_backend.py"):
+        src = (root / rel).read_text(encoding="utf-8")
+        for i, line in enumerate(src.splitlines(), 1):
+            if "visibility_clause(" in line and "def " not in line:
+                calls.append((rel, i, src.splitlines()[i - 1:]))
+    assert calls, "no visibility_clause call site found"
+    for rel, i, window in calls:
+        block = "\n".join(window)
+        assert "owner_token_list=" in block, (
+            "%s:%d calls visibility_clause without owner_token_list= — the "
+            "dark page rule does not apply there" % (rel, i))
+    # and the predicate really does have the parameter
+    assert "owner_token_list" in inspect.signature(
+        visibility_clause).parameters
+
+
+def test_b2_a_a_dark_page_carries_its_owner_and_the_owner_can_read_it(ws):
+    """B-2: sealed_owner is written, and the four faces agree."""
+    from agent.memory.visibility import SCOPE_SEALED, visibility_clause
+
+    _dark_page(ws, "darkpage--00112233.md", author="agent-alice")
+    _white_page(ws, "whitepage--00445566.md")
+    mgr, conn = _index(ws)
+    try:
+        row = conn.execute(
+            "SELECT scope, user_id, sealed_owner FROM chunks "
+            "WHERE path LIKE '%darkpage%'").fetchone()
+        assert row is not None, "the dark page was not indexed"
+        assert row["scope"] == SCOPE_SEALED
+        assert row["sealed_owner"] == "agent--agent-alice", (
+            "sealed_owner is %r — the dark page has no owner" %
+            (row["sealed_owner"],))
+
+        def visible(end_user, owner):
+            sql, params = visibility_clause(
+                end_user, "chunks.scope", "chunks.user_id",
+                "chunks.element_released", "chunks.file_sealed",
+                identities=[end_user] if end_user else None,
+                owner_token_list=[owner] if owner else None,
+                sealed_owner_col="chunks.sealed_owner")
+            q = ("SELECT path FROM chunks WHERE %s AND path LIKE ?"
+                 % sql)
+            return [r["path"] for r in conn.execute(
+                q, params + ["%darkpage%"])]
+
+        assert visible(None, "agent--agent-alice"), (
+            "the owner cannot read its own dark page")
+        assert not visible("user-bob", "agent--carol"), (
+            "a third party can read the dark page")
+        assert not visible(None, None), (
+            "an anonymous caller can read the dark page")
+    finally:
+        conn.close()
+
+
+def test_l5_a_the_two_axes_are_two_columns(ws):
+    """L-5: the owner token must not sit in the end-user axis."""
+    _dark_page(ws, "darkpage--00112233.md", author="agent-alice")
+    _white_page(ws, "whitepage--00445566.md")
+    mgr, conn = _index(ws)
+    try:
+        # the owner token lives in sealed_owner
+        rows = conn.execute(
+            "SELECT DISTINCT user_id, sealed_owner FROM chunks "
+            "WHERE scope='sealed'").fetchall()
+        assert rows
+        for r in rows:
+            assert (r["user_id"] or "") == "", (
+                "the end-user axis carries an owner token: %r" % r["user_id"])
+        # and NO row anywhere carries an owner token as its user_id
+        n = conn.execute(
+            "SELECT COUNT(*) c FROM chunks WHERE user_id LIKE 'agent--%'"
+        ).fetchone()["c"]
+        assert n == 0, "%d rows carry an owner token in the end-user axis" % n
+    finally:
+        conn.close()
+
+
+def test_l5_a_an_end_user_id_in_the_agent_namespace_is_refused_on_write(ws):
+    """L-5: 'agent--...' as an END USER id is rejected, not accepted."""
+    import asyncio
+
+    from agent.memory.visibility import is_reserved_end_user_id
+
+    assert is_reserved_end_user_id("agent--agent-alice")
+    assert not is_reserved_end_user_id("alice")
+    assert not is_reserved_end_user_id("")
+
+    _white_page(ws, "whitepage--00445566.md")
+    mgr, conn = _index(ws)
+    try:
+        with pytest.raises(ValueError):
+            asyncio.run(mgr.add_memory("some content",
+                                       user_id="agent--agent-alice",
+                                       scope="user"))
+        n = conn.execute(
+            "SELECT COUNT(*) c FROM chunks "
+            "WHERE user_id='agent--agent-alice'").fetchone()["c"]
+        assert n == 0, "the refused write still landed"
+    finally:
+        conn.close()
+
+
+def test_l5_a_a_dark_page_with_no_owner_is_visible_to_nobody(ws):
+    """A dark page whose owner cannot be determined belongs to nobody."""
+    from agent.memory.visibility import visibility_clause
+
+    _dark_page(ws, "noowner--00778899.md", author=None)
+    mgr, conn = _index(ws)
+    try:
+        row = conn.execute(
+            "SELECT scope, sealed_owner FROM chunks "
+            "WHERE path LIKE '%noowner%'").fetchone()
+        assert row is not None
+        assert row["sealed_owner"] in (None, "")
+        sql, params = visibility_clause(
+            "agent--agent-alice", "chunks.scope", "chunks.user_id",
+            "chunks.element_released", "chunks.file_sealed",
+            identities=["agent--agent-alice"],
+            owner_token_list=["agent--agent-alice"],
+            sealed_owner_col="chunks.sealed_owner")
+        got = [r["path"] for r in conn.execute(
+            "SELECT path FROM chunks WHERE %s AND path LIKE ?" % sql,
+            params + ["%noowner%"])]
+        assert not got, "a dark page with no owner is visible"
+    finally:
+        conn.close()

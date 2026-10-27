@@ -144,10 +144,17 @@ class MemoryService:
         # truth layer through it), so it asks the SAME judgement as
         # memory_get and the retrieval predicate. It used to serve any file
         # under memory/ verbatim.
-        self._assert_readable(path)
+        mask_ids = self._assert_readable(path)
 
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
+
+        # P0-16 F-1: a facts file carries the 感受 rows of released
+        # elements. The evidence room is append-only, so the rows stay on
+        # disk — but the reading view masks them.
+        from agent.memory.facts_mask import is_facts_path, mask_facts_text
+        if mask_ids and is_facts_path(self._to_rel(path)):
+            content = mask_facts_text(content, mask_ids)
 
         return {
             "filename": filename,
@@ -158,36 +165,55 @@ class MemoryService:
             "content": content,
         }
 
-    def _assert_readable(self, path: str) -> None:
+    def _assert_readable(self, path: str) -> frozenset:
         """Raise when the truth layer says this file must not be served.
 
         Only the truth layer (``memory/markdown/``) carries released and
         sealed elements; the daily files and MEMORY.md are the agent's own
-        working memory and are not part of this rule.
+        working memory and are not part of this rule. The EVIDENCE ROOM
+        (``memory/facts/``) is read too — it is not released as a file, but
+        the rows of released elements inside it must be masked (P0-16 F-1).
 
         P0-13 L-3: when the release state cannot be resolved, the read
         FAILS — an unknown state must not serve content.
+
+        P0-16 L-4: that refusal must be LOUD (ERROR log + audit line +
+        a marker the inspector reports red).
+
+        Returns the fact element ids the reading view must mask.
         """
         rel = self._to_rel(path)
-        if not rel.startswith("memory/markdown/"):
-            return
+        from agent.memory.facts_mask import is_facts_path
+        if not rel.startswith("memory/markdown/") and not is_facts_path(rel):
+            return frozenset()
+        from agent.memory.read_audit import (
+            clear_read_denied,
+            report_read_denied,
+        )
         from agent.memory.release_state import resolve
         from agent.memory.visibility import (
             READ_ALLOW,
-            ambient_identities,
-            identity_tokens,
+            ambient_owner_tokens,
+            owner_tokens,
         )
 
         try:
             state = resolve(self.workspace_root)
         except Exception as e:
+            report_read_denied(self.workspace_root, "MemoryService.get_content",
+                               rel, e)
             raise PermissionError(
                 f"the release state could not be resolved ({e}); refusing to "
                 f"serve the file (fail closed).") from e
-        tokens = identity_tokens(None, ambient_identities())
-        decision, _reason = state.decide(rel, tokens)
+        # The truth layer resolves again → the degraded state is over.
+        clear_read_denied(self.workspace_root)
+        # The sealed branch is matched against the OWNER axis only (P0-16
+        # L-5): a dark page is visible to the agent that wrote it, and the
+        # end-user axis is not consulted at all.
+        owners = owner_tokens(ambient_owner_tokens())
+        decision, _reason, mask = state.decide(rel, owners)
         if decision == READ_ALLOW:
-            return
+            return mask
         if decision == "released":
             raise PermissionError(
                 "[released] This memory was released; the released body is "

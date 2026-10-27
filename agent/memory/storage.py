@@ -281,6 +281,15 @@ class MemoryChunk:
     # one place that does.
     element_released: int = 0
     file_sealed: int = 0
+    # P0-16 L-5: the OWNER token of a dark page (``agent--<author>``).
+    #
+    # It has its OWN column because it is a different KIND of identity:
+    # ``user_id`` holds end-user ids, and the agent namespace must never
+    # be reachable through it — an end-user id that happens to equal an
+    # owner token (``agent--<some agent>``) would otherwise read the dark
+    # page (P0-15 L-5: the collision was reproducible). The sealed branch
+    # of the predicate reads THIS column and nothing else.
+    sealed_owner: Optional[str] = None
 
 
 @dataclass
@@ -562,7 +571,8 @@ class MemoryStorage:
                 created_at INTEGER DEFAULT (strftime('%s', 'now')),
                 updated_at INTEGER DEFAULT (strftime('%s', 'now')),
                 hit_count INTEGER NOT NULL DEFAULT 0,
-                last_hit_at INTEGER
+                last_hit_at INTEGER,
+                sealed_owner TEXT
             )
         """)
 
@@ -714,6 +724,14 @@ class MemoryStorage:
         if "file_sealed" not in cols:
             self.conn.execute(
                 "ALTER TABLE chunks ADD COLUMN file_sealed INTEGER NOT NULL DEFAULT 0"
+            )
+        if "sealed_owner" not in cols:
+            # P0-16 L-5: the owner token's own column. NULL means "no owner
+            # recorded" — which for a dark page means nobody may read it
+            # (fail closed), the same reading the old NULL ``user_id``
+            # gave.
+            self.conn.execute(
+                "ALTER TABLE chunks ADD COLUMN sealed_owner TEXT"
             )
 
     def _migrate_legacy_fts_triggers(self) -> bool:
@@ -910,8 +928,8 @@ class MemoryStorage:
                 INSERT INTO chunks
                 (id, user_id, scope, source, path, start_line, end_line,
                  text, embedding, hash, metadata, element_released,
-                 file_sealed, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                 file_sealed, sealed_owner, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
                 ON CONFLICT(id) DO UPDATE SET
                     user_id     = excluded.user_id,
                     scope       = excluded.scope,
@@ -925,6 +943,7 @@ class MemoryStorage:
                     metadata    = excluded.metadata,
                     element_released = excluded.element_released,
                     file_sealed      = excluded.file_sealed,
+                    sealed_owner     = excluded.sealed_owner,
                     updated_at  = strftime('%s', 'now')
             """
         else:
@@ -932,8 +951,8 @@ class MemoryStorage:
                 INSERT OR REPLACE INTO chunks
                 (id, user_id, scope, source, path, start_line, end_line,
                  text, embedding, hash, metadata, element_released,
-                 file_sealed, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                 file_sealed, sealed_owner, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
             """
         params = (
             chunk.id, chunk.user_id, chunk.scope, chunk.source, chunk.path,
@@ -943,6 +962,7 @@ class MemoryStorage:
             json.dumps(chunk.metadata) if chunk.metadata else None,
             int(chunk.element_released or 0),
             int(chunk.file_sealed or 0),
+            chunk.sealed_owner or None,
         )
         with self._lock:
             try:
@@ -963,8 +983,8 @@ class MemoryStorage:
                 INSERT INTO chunks
                 (id, user_id, scope, source, path, start_line, end_line,
                  text, embedding, hash, metadata, element_released,
-                 file_sealed, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                 file_sealed, sealed_owner, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
                 ON CONFLICT(id) DO UPDATE SET
                     user_id     = excluded.user_id,
                     scope       = excluded.scope,
@@ -978,6 +998,7 @@ class MemoryStorage:
                     metadata    = excluded.metadata,
                     element_released = excluded.element_released,
                     file_sealed      = excluded.file_sealed,
+                    sealed_owner     = excluded.sealed_owner,
                     updated_at  = strftime('%s', 'now')
             """
         else:
@@ -985,8 +1006,8 @@ class MemoryStorage:
                 INSERT OR REPLACE INTO chunks
                 (id, user_id, scope, source, path, start_line, end_line,
                  text, embedding, hash, metadata, element_released,
-                 file_sealed, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                 file_sealed, sealed_owner, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
             """
         params_list = [
             (
@@ -997,6 +1018,11 @@ class MemoryStorage:
                 json.dumps(c.metadata) if c.metadata else None,
                 int(c.element_released or 0),
                 int(c.file_sealed or 0),
+                # P0-16 L-5 / B-2: the dark page's owner token. The batch
+                # path is the one the SCAN uses, so leaving this column out
+                # here is what made every dark page ownerless — and an
+                # ownerless dark page is invisible to its own owner.
+                c.sealed_owner or None,
             )
             for c in chunks
         ]
@@ -1069,11 +1095,12 @@ class MemoryStorage:
         scopes: List[str] = None,
         limit: int = 10,
         identities: Optional[List[str]] = None,
+        owner_tokens: Optional[List[str]] = None,
     ) -> List[SearchResult]:
         """Search the configured vector backend."""
         if scopes is None:
             scopes = ["shared"]
-            if user_id or identities:
+            if user_id or identities or owner_tokens:
                 scopes.append("user")
                 scopes.append("sealed")
         metadata_filter = {"scopes": scopes}
@@ -1081,6 +1108,8 @@ class MemoryStorage:
             metadata_filter["user_id"] = user_id
         if identities:
             metadata_filter["identities"] = list(identities)
+        if owner_tokens:
+            metadata_filter["owner_tokens"] = list(owner_tokens)
         matches = self.vector_backend.search(
             query_embedding,
             limit=limit,
@@ -1106,6 +1135,7 @@ class MemoryStorage:
         scopes: List[str] = None,
         limit: int = 10,
         identities: Optional[List[str]] = None,
+        owner_tokens: Optional[List[str]] = None,
     ) -> List[SearchResult]:
         """
         Keyword search using FTS5 + LIKE fallback
@@ -1116,14 +1146,18 @@ class MemoryStorage:
         3. If FTS5 fails OR returns empty for non-CJK, also try LIKE so a
            broken FTS5 shadow table doesn't silently kill keyword search.
 
-        ``identities`` are the caller's other identity tokens (the ambient
-        agent id among them). They join the visibility predicate's identity
-        branch, so a dark page — indexed under its owner's agent token — is
-        visible to the agent that wrote it and to nobody else.
+        ``identities`` are the caller's other END USER identity tokens, and
+        ``owner_tokens`` are the caller's AGENT owner tokens (``agent--<id>``).
+        They are two separate axes and they reach two separate columns: the
+        end-user axis through ``user_id``, the owner axis through
+        ``sealed_owner`` (P0-16 L-5). A dark page — indexed under its
+        owner's agent token — is therefore visible to the agent that wrote
+        it and to nobody else, and an end-user id that happens to look
+        like an owner token cannot reach it.
         """
         if scopes is None:
             scopes = ["shared"]
-            if user_id or identities:
+            if user_id or identities or owner_tokens:
                 scopes.append("user")
                 scopes.append("sealed")
 
@@ -1139,7 +1173,7 @@ class MemoryStorage:
                 and MemoryStorage._build_fts_query(query)):
             fts1_attempted = True
             fts_results = self._search_fts5(query, user_id, scopes, limit,
-                                            identities)
+                                            identities, owner_tokens)
             if fts_results:
                 return fts_results
 
@@ -1150,7 +1184,7 @@ class MemoryStorage:
             MemoryStorage._contains_cjk(query) or fts1_attempted
         ):
             trigram_results = self._search_fts5_trigram(
-                query, user_id, scopes, limit, identities)
+                query, user_id, scopes, limit, identities, owner_tokens)
             if trigram_results:
                 return trigram_results
 
@@ -1159,7 +1193,8 @@ class MemoryStorage:
         if (not self.fts5_available
                 or MemoryStorage._contains_cjk(query)
                 or fts1_attempted):
-            return self._search_like(query, user_id, scopes, limit, identities)
+            return self._search_like(query, user_id, scopes, limit, identities,
+                                     owner_tokens)
 
         return []
     
@@ -1170,6 +1205,7 @@ class MemoryStorage:
         scopes: List[str],
         limit: int,
         identities: Optional[List[str]] = None,
+        owner_tokens: Optional[List[str]] = None,
     ) -> List[SearchResult]:
         """FTS5 full-text search"""
         fts_query = self._build_fts_query(query)
@@ -1180,7 +1216,9 @@ class MemoryStorage:
         vis_sql, vis_params = visibility_clause(
             user_id, "chunks.scope", "chunks.user_id",
             "chunks.element_released", "chunks.file_sealed",
-            identities=identities)
+            identities=identities,
+            owner_token_list=owner_tokens,
+            sealed_owner_col="chunks.sealed_owner")
         sql_query = f"""
             SELECT chunks.*, bm25(chunks_fts) as rank
             FROM chunks_fts
@@ -1270,6 +1308,7 @@ class MemoryStorage:
         scopes: List[str],
         limit: int,
         identities: Optional[List[str]] = None,
+        owner_tokens: Optional[List[str]] = None,
     ) -> List[SearchResult]:
         """LIKE-based search.
 
@@ -1300,7 +1339,10 @@ class MemoryStorage:
 
         where_clause, params = _build_where(groups)
         params.extend(scopes)
-        vis_sql, vis_params = visibility_clause(user_id, identities=identities)
+        vis_sql, vis_params = visibility_clause(user_id,
+                                                identities=identities,
+                                                owner_token_list=owner_tokens,
+                                                sealed_owner_col="chunks.sealed_owner")
         params.extend(vis_params)
         params.append(limit)
         sql_query = f"""
@@ -1360,6 +1402,7 @@ class MemoryStorage:
         scopes: List[str],
         limit: int,
         identities: Optional[List[str]] = None,
+        owner_tokens: Optional[List[str]] = None,
     ) -> List[SearchResult]:
         """Per-group LIKE search, used when the ANDed query matched nothing.
 
@@ -1379,7 +1422,9 @@ class MemoryStorage:
                 params.append(f'%{window.lower()}%')
             where_clause = "(" + " OR ".join(alternatives) + ")"
             vis_sql, vis_params = visibility_clause(user_id,
-                                                    identities=identities)
+                                                    identities=identities,
+                                                    owner_token_list=owner_tokens,
+                                                    sealed_owner_col="chunks.sealed_owner")
             sql = f"""
                 SELECT * FROM chunks
                 WHERE {where_clause}
@@ -1524,13 +1569,14 @@ class MemoryStorage:
         try:
             rows = self.conn.execute(
                 "SELECT DISTINCT path, element_released, file_sealed, scope, "
-                "user_id FROM chunks"
+                "user_id, sealed_owner FROM chunks"
             ).fetchall()
         except Exception:
             return 0
         owners = sealed_owner or {}
         updates = []
         scope_updates = []
+        owner_updates = []
         for row in rows:
             path = row["path"]
             want_released = 1 if path in released_paths else 0
@@ -1546,6 +1592,13 @@ class MemoryStorage:
                         row["scope"] != want_scope
                         or (row["user_id"] or "") != want_user):
                     scope_updates.append((want_scope, want_user, path))
+                # P0-16 L-5 / B-2: the owner token lives in its OWN column,
+                # and the projection must keep it in step — a dark page
+                # whose ``sealed_owner`` is stale (or NULL) is a dark page
+                # nobody can read, including its own owner.
+                want_owner = (owners.get(path) or "") if want_sealed else ""
+                if (row["sealed_owner"] or "") != want_owner:
+                    owner_updates.append((want_owner, path))
                 continue
             updates.append((want_released, want_sealed, path))
             want_scope, want_user = self._ownership_for(
@@ -1554,7 +1607,10 @@ class MemoryStorage:
                     row["scope"] != want_scope
                     or (row["user_id"] or "") != want_user):
                 scope_updates.append((want_scope, want_user, path))
-        if not updates and not scope_updates:
+            want_owner = (owners.get(path) or "") if want_sealed else ""
+            if (row["sealed_owner"] or "") != want_owner:
+                owner_updates.append((want_owner, path))
+        if not updates and not scope_updates and not owner_updates:
             return 0
         with self._lock:
             try:
@@ -1566,6 +1622,10 @@ class MemoryStorage:
                     self.conn.executemany(
                         "UPDATE chunks SET scope = ?, user_id = ? "
                         "WHERE path = ?", scope_updates)
+                if owner_updates:
+                    self.conn.executemany(
+                        "UPDATE chunks SET sealed_owner = ? "
+                        "WHERE path = ?", owner_updates)
                 self.conn.commit()
             except Exception:
                 self.conn.rollback()
@@ -1577,13 +1637,19 @@ class MemoryStorage:
                        owners: Dict[str, str]) -> Tuple[Optional[str], str]:
         """``(scope, user_id)`` a row must carry, or ``(None, "")`` to leave it.
 
-        A dark page carries its own scope and its owner's token. A page that
-        is NOT a dark page keeps whatever scope it had — the projection
-        must not rewrite the ownership of ordinary rows.
+        A dark page carries its own scope. Its OWNER does not go into the
+        end-user axis: ``chunks.user_id`` holds end-user ids only, and the
+        owner token lives in ``chunks.sealed_owner`` (P0-16 L-5). The
+        projection must not put the owner token back into ``user_id`` —
+        that is how an end-user id shaped like an owner token could read a
+        dark page.
+
+        A page that is NOT a dark page keeps whatever scope it had — the
+        projection must not rewrite the ownership of ordinary rows.
         """
         if not sealed:
             return None, ""
-        return SCOPE_SEALED, owners.get(path) or ""
+        return SCOPE_SEALED, ""
 
     def update_file_metadata(self, path: str, source: str, file_hash: str, mtime: int, size: int):
         """Update file metadata"""
@@ -1722,6 +1788,7 @@ class MemoryStorage:
         scopes: List[str],
         limit: int,
         identities: Optional[List[str]] = None,
+        owner_tokens: Optional[List[str]] = None,
     ) -> List[SearchResult]:
         """Trigram FTS5 search — handles CJK and mixed queries with BM25 ranking."""
         trigram_query = self._build_trigram_query(query)
@@ -1732,7 +1799,9 @@ class MemoryStorage:
         vis_sql, vis_params = visibility_clause(
             user_id, "chunks.scope", "chunks.user_id",
             "chunks.element_released", "chunks.file_sealed",
-            identities=identities)
+            identities=identities,
+            owner_token_list=owner_tokens,
+            sealed_owner_col="chunks.sealed_owner")
         sql = f"""
             SELECT chunks.*, bm25(chunks_fts_trigram) as rank
             FROM chunks_fts_trigram

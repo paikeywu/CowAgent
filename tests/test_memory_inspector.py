@@ -474,3 +474,103 @@ def test_index_hygiene_violations_reach_the_audit_trail(tmp_path):
              audit.read_text(encoding="utf-8").splitlines() if x.strip()]
     assert lines and lines[-1]["violation_count"] >= 1
 
+
+# --- P0-16 L-4: a fail-closed READ must be loud ---------------------------
+#
+# P0-15 L-4 found the read exits failing closed SILENTLY: the content was
+# correctly withheld, but nothing was logged, no marker was left, and the
+# inspector never turned red. These three tests pin the whole chain:
+# report → marker → inspector → recovery.
+
+
+def _read_degraded_violations(report):
+    return [v for v in report["violations"]
+            if v.get("code") == "read-degraded"]
+
+
+def test_l4_a_degraded_read_is_reported_red_by_the_inspector(tmp_path):
+    """The marker the read exits leave must turn the inspector RED."""
+    cow, ws = tmp_path, tmp_path / "agents" / ACTOR
+    (ws / "memory").mkdir(parents=True)
+    from agent.memory.read_audit import report_read_denied
+
+    # REVERSE CASE first: a workspace with no degraded read is green.
+    assert not _read_degraded_violations(Inspector(ws).inspect())
+
+    report_read_denied(ws, "test.read_exit", "memory/markdown/e.md",
+                        RuntimeError("truth layer unreadable"))
+    hits = _read_degraded_violations(Inspector(ws).inspect())
+    assert hits, "the inspector did NOT report the degraded read"
+    assert hits[0]["severity"] == "high"
+    assert hits[0]["last_exit"] == "test.read_exit"
+    assert hits[0]["last_path"] == "memory/markdown/e.md"
+
+
+def test_l4_a_degraded_read_logs_and_appends_to_the_audit_trail(tmp_path):
+    """① an ERROR log line and ② an appended audit line — both, not one."""
+    import logging
+
+    cow, ws = tmp_path, tmp_path / "agents" / ACTOR
+    (ws / "memory").mkdir(parents=True)
+    from agent.memory.read_audit import read_denied_log, report_read_denied
+    from common.log import logger
+
+    class _Cap(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    cap = _Cap()
+    logger.addHandler(cap)
+    try:
+        report_read_denied(ws, "test.read_exit", "memory/markdown/e.md",
+                            RuntimeError("truth layer unreadable"))
+    finally:
+        logger.removeHandler(cap)
+
+    errors = [r for r in cap.records if r.levelno >= logging.ERROR]
+    assert errors, "no ERROR log line was emitted"
+    assert "READ DENIED" in errors[0].getMessage()
+
+    logp = read_denied_log(ws)
+    assert logp.is_file(), "the audit jsonl was not written"
+    lines = [json.loads(x) for x in
+             logp.read_text(encoding="utf-8").splitlines() if x.strip()]
+    assert len(lines) == 1
+    assert lines[0]["exit"] == "test.read_exit"
+    assert lines[0]["path"] == "memory/markdown/e.md"
+    assert "unreadable" in lines[0]["error"]
+
+
+def test_l4_a_degraded_read_clears_when_the_truth_layer_resolves(tmp_path):
+    """Recovery: the marker goes, the inspector turns green, the HISTORY stays.
+
+    The jsonl is append-only: the refusals happened, and the record of them
+    must survive the recovery. Only the marker (the current state) is cleared.
+    """
+    cow, ws = tmp_path, tmp_path / "agents" / ACTOR
+    (ws / "memory").mkdir(parents=True)
+    from agent.memory.read_audit import (
+        clear_read_denied,
+        read_denied_log,
+        read_denied_marker,
+        report_read_denied,
+    )
+
+    report_read_denied(ws, "test.read_exit", "memory/markdown/e.md",
+                        RuntimeError("truth layer unreadable"))
+    assert read_denied_marker(ws).is_file()
+    assert _read_degraded_violations(Inspector(ws).inspect())
+
+    clear_read_denied(ws)
+    assert not read_denied_marker(ws).is_file(), "the marker was not cleared"
+    assert not _read_degraded_violations(Inspector(ws).inspect())
+
+    # the history survives
+    lines = [x for x in read_denied_log(ws).read_text(
+        encoding="utf-8").splitlines() if x.strip()]
+    assert len(lines) == 1, "the audit history was lost on recovery"
+

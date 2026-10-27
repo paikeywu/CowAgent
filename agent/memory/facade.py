@@ -1084,15 +1084,24 @@ class WriteFacade:
         try:
             state = self._state()
         except Exception as e:
+            from agent.memory.read_audit import report_read_denied
+            report_read_denied(self.workspace_root, "facade.read",
+                               self._state_key(relpath), e)
             raise FacadeError(
                 f"the release state could not be resolved ({e}); refusing to "
                 f"serve the file (fail closed).") from e
-        decision, _reason = state.decide(
+        decision, _reason, mask = state.decide(
             self._state_key(relpath), self._owner_tokens())
         if decision == READ_RELEASED:
             return {}, ""
         if decision == READ_SEALED:
             return {}, SEALED_PLACEHOLDER
+        # P0-16 F-1: the evidence room is append-only, so the 感受 rows of
+        # released elements are masked in the READING VIEW — the disk keeps
+        # the 原话 and the hash chain stays unbroken.
+        from agent.memory.facts_mask import is_facts_path, mask_facts_text
+        if mask and is_facts_path(self._state_key(relpath)):
+            body = mask_facts_text(body, mask)
         return fm, body
 
     # -- revise = new version, old bytes untouched (WR-11) ---------------------

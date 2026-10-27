@@ -26,11 +26,22 @@ THE RULES, in words (SEED 裁决 2026-10-27, P0-14):
    Its body is open to 本视角 (the authoring agent) and to 主人格 (whoever
    reads that agent's own memory), and closed to everybody else. A sealed
    file therefore still belongs in the index — it is indexed under its own
-   scope (``SCOPE_SEALED``) with the owner recorded in ``user_id``, so the
-   ordinary identity rule decides who may see it.
+   scope (``SCOPE_SEALED``) with the owner recorded in ``sealed_owner``, so
+   the ordinary identity rule decides who may see it.
 6. (P0-13 P-2, L-1) The file that IS a release — ``status=released`` or
    ``type=release`` — leaves the index entirely and is invisible on EVERY
    read exit, for every identity.
+7. (P0-16 F-1) A released element's FEELING rows live in the evidence room
+   (facts layer), and the evidence room is append-only: its rows are never
+   rewritten and its hash chain is never broken. But "released" must mean
+   released on EVERY read path — so a read of a facts file replaces the
+   rows of released elements with a fixed placeholder line. The mask lives
+   in the READ VIEW only; the disk keeps the 原话.
+8. (P0-16 L-5) The two identity axes are SEPARATE COLUMNS. ``user_id``
+   holds END USER ids only; the owner token of a dark page lives in its own
+   column (``sealed_owner``). The predicate's sealed branch reads that
+   column and NOTHING else, so an end-user id that happens to look like an
+   owner token can never read a dark page.
 
 The flags on a chunk row (``element_released`` / ``file_sealed``) are a
 PROJECTION of the truth layer: they are computed from the files on disk by
@@ -47,7 +58,7 @@ in that case; this module only carries the rules.
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, FrozenSet, Iterable, List, Optional, Sequence, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +136,24 @@ def agent_owner_token(agent_id: Optional[str]) -> Optional[str]:
     return AGENT_OWNER_PREFIX + agent_id
 
 
+def is_reserved_end_user_id(user_id: Optional[str]) -> bool:
+    """True when ``user_id`` claims the AGENT namespace.
+
+    P0-16 L-5: the end-user axis and the agent-owner axis are separate
+    namespaces, and an end-user id that STARTS with ``agent--`` would
+    otherwise be indistinguishable from an owner token. Such an id is
+    REJECTED ON WRITE — not silently accepted and not merely ignored at
+    read time, because accepting it means the collision is already in the
+    index and every later reader has to special-case it.
+
+    The check is on the PREFIX, not on a probability: the prefix is the
+    namespace marker, and a namespace marker is either there or not.
+    """
+    if not user_id or not isinstance(user_id, str):
+        return False
+    return user_id.strip().startswith(AGENT_OWNER_PREFIX)
+
+
 def owner_token(fm: Optional[Dict]) -> Optional[str]:
     """The owner token of a dark page, from its ``author_viewpoint``.
 
@@ -144,13 +173,17 @@ def owner_token(fm: Optional[Dict]) -> Optional[str]:
 
 def identity_tokens(user_id: Optional[str] = None,
                     identities: Optional[Iterable[str]] = None) -> List[str]:
-    """The distinct identity tokens a caller holds, in a stable order.
+    """The END USER ids a caller holds, in a stable order.
 
     ``user_id`` is the END USER (the legacy ``memory/users/<id>/`` axis);
-    ``identities`` carries the ambient runtime identities (the agent id
-    among them). A dark page's owner token lives in the agent namespace, so
-    the agent id has to be part of the caller's token set — otherwise the
-    agent could not read its own dark pages.
+    ``identities`` carries more end-user ids (the ambient runtime user id
+    among them).
+
+    P0-16 L-5: this is the END USER axis ONLY. The agent's owner token is
+    NOT mixed in here — it lives in the agent namespace and is matched
+    through its own column (``sealed_owner``). Mixing the two axes in one
+    token set is what let an end-user id that happened to equal
+    ``agent--<some agent>`` read a dark page.
 
     The list is de-duplicated but NOT sorted: the order is the caller's
     precedence (explicit user id first), and the SQL parameters follow it.
@@ -165,30 +198,69 @@ def identity_tokens(user_id: Optional[str] = None,
     return out
 
 
-def ambient_identities() -> List[str]:
-    """The identity tokens the ambient runtime context carries.
+def owner_tokens(tokens: Optional[Iterable[str]] = None) -> List[str]:
+    """The AGENT owner tokens a caller holds, in a stable order.
 
-    The end user (raw id) and the agent (in the OWNER namespace, because
-    that is the namespace a dark page's owner token lives in). Both are
-    identities the caller legitimately holds, so both belong in the token
-    set — and both are resolved HERE, at the edge, so no leaf module has
-    to re-derive them.
+    The owner token is the agent namespace's name for "this dark page is
+    mine" (``agent--<agent id>``). It is kept apart from the end-user
+    tokens all the way into the SQL predicate (P0-16 L-5).
     """
     out: List[str] = []
+    for candidate in list(tokens or []):
+        if candidate is None:
+            continue
+        token = str(candidate).strip()
+        if token and token not in out:
+            out.append(token)
+    return out
+
+
+def ambient_end_user_ids() -> List[str]:
+    """The END USER id the ambient runtime context carries (if any)."""
     try:
         from common.runtime_identity import current_identity
 
         identity = current_identity()
         if identity.user_id:
             token = str(identity.user_id).strip()
-            if token and token not in out:
-                out.append(token)
-        if identity.agent_id:
-            token = agent_owner_token(str(identity.agent_id).strip())
-            if token and token not in out:
-                out.append(token)
+            if token:
+                return [token]
     except Exception:
         pass
+    return []
+
+
+def ambient_owner_tokens() -> List[str]:
+    """The AGENT owner token the ambient runtime context carries (if any).
+
+    The agent is in the OWNER namespace, because that is the namespace a
+    dark page's owner token lives in. Resolved HERE, at the edge, so no
+    leaf module has to re-derive it.
+    """
+    try:
+        from common.runtime_identity import current_identity
+
+        identity = current_identity()
+        if identity.agent_id:
+            token = agent_owner_token(str(identity.agent_id).strip())
+            if token:
+                return [token]
+    except Exception:
+        pass
+    return []
+
+
+def ambient_identities() -> List[str]:
+    """Every identity token the ambient runtime context carries.
+
+    Both axes, in one list — for callers that only need "who am I". The
+    retrieval path does NOT use this: it keeps the two axes apart (P0-16
+    L-5) and hands each to its own branch of the predicate.
+    """
+    out: List[str] = []
+    for token in ambient_end_user_ids() + ambient_owner_tokens():
+        if token not in out:
+            out.append(token)
     return out
 
 
@@ -203,43 +275,67 @@ def visibility_clause(
     released_col: str = "element_released",
     sealed_col: str = "file_sealed",
     identities: Optional[Iterable[str]] = None,
+    owner_token_list: Optional[Iterable[str]] = None,
+    sealed_owner_col: str = "sealed_owner",
 ) -> Tuple[str, List[str]]:
     """Return ``(sql_fragment, params)`` for the one visibility predicate.
 
     The fragment is ANDed into the caller's WHERE clause; ``scope_col`` /
-    ``user_col`` / ``released_col`` / ``sealed_col`` exist so a query that
-    joins ``chunks`` can qualify the columns (``chunks.scope``) without
-    re-wording the rule.
+    ``user_col`` / ``released_col`` / ``sealed_col`` / ``sealed_owner_col``
+    exist so a query that joins ``chunks`` can qualify the columns
+    (``chunks.scope``) without re-wording the rule.
 
-    ``identities`` adds the caller's other identity tokens (the ambient
-    agent id among them) to the identity branch, so a dark page — whose
-    owner token is in the agent namespace — is visible to the agent that
-    wrote it and to nobody else.
+    ``identities`` carries the caller's other END USER ids (the ambient
+    user id among them) — the end-user axis.
+
+    ``owner_token_list`` carries the caller's AGENT owner tokens (the
+    ambient agent id among them, already in the ``agent--<id>`` form) — the
+    owner axis.
+
+    P0-16 L-5: the two axes are matched against two DIFFERENT columns. A
+    dark page is visible ONLY through ``sealed_owner`` (the owner axis);
+    an ordinary row is visible through ``user_id`` (the end-user axis). The
+    sealed branch never looks at ``user_id``, so an end-user id that
+    happens to equal an owner token cannot read a dark page — and an
+    owner token can never be mistaken for an end-user id.
     """
     tokens = identity_tokens(user_id, identities)
+    owners = owner_tokens(owner_token_list)
     # The public branch: a shared row with no owner that is not a dark
     # page. The sealed flag keeps a dark page out of it even if the row
     # was indexed with the wrong shape (a shared row that names an owner
     # is the mislabel shape, and a sealed one must never be public).
     public = (f"({scope_col} = 'shared' AND {user_col} IS NULL "
               f"AND COALESCE({sealed_col}, 0) = 0)")
+    params: List[str] = []
     # The owned branch: the caller's own rows, whatever scope they claim.
-    # This is also the branch that serves a dark page to its owner — the
-    # dark page carries the owner token in ``user_id`` under its own
-    # scope, so it matches here and matches nowhere else.
+    # A DARK PAGE is not in this branch — its owner lives in the agent
+    # namespace and is matched by the sealed branch below, so that the two
+    # axes can never be crossed (P0-16 L-5).
     if tokens:
         placeholders = ','.join('?' * len(tokens))
-        owned = f"({user_col} IN ({placeholders}))"
-        params: List[str] = list(tokens)
+        owned = (f"({user_col} IN ({placeholders}) "
+                 f"AND {scope_col} <> '{SCOPE_SEALED}')")
+        params.extend(tokens)
     else:
-        owned = "(0)"          # no identity: the caller owns nothing
-        params = []
+        owned = "(0)"          # no end-user identity: the caller owns nothing
+    # The sealed branch (L-5): a dark page is visible to its owner and to
+    # nobody else. The owner token lives in its OWN column, so the end
+    # user axis is not consulted at all.
+    if owners:
+        owner_placeholders = ','.join('?' * len(owners))
+        sealed_branch = (f"({scope_col} = '{SCOPE_SEALED}' AND "
+                         f"{sealed_owner_col} IN ({owner_placeholders}))")
+        params.extend(owners)
+    else:
+        sealed_branch = "(0)"  # no owner token: the caller owns no dark page
     # Rule 4: a released element leaves the result set for EVERY identity.
     # The flag is an integer (0/1); ``COALESCE`` keeps rows written by an
     # older build (NULL) visible rather than hiding the whole index until
     # the next sync stamps them.
     not_released = f"COALESCE({released_col}, 0) = 0"
-    return f"(({public} OR {owned}) AND {not_released})", params
+    return (f"(({public} OR {owned} OR {sealed_branch}) AND "
+            f"{not_released})"), params
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +371,8 @@ def decide_read(
     sealed_paths: Iterable[str],
     sealed_owner: Optional[Dict[str, str]] = None,
     tokens: Optional[Iterable[str]] = None,
-) -> Tuple[str, str]:
+    released_fact_ids: Optional[Iterable[str]] = None,
+) -> Tuple[str, str, FrozenSet[str]]:
     """Decide whether ``path`` may be read, and why not when it may not.
 
     The read exits (memory_get, the facade, the shelf, the console reader)
@@ -285,20 +382,28 @@ def decide_read(
     single derivation.
 
     Returns ``(READ_ALLOW, "")`` or ``(READ_RELEASED, reason)`` /
-    ``(READ_SEALED, reason)``. The reason is for the caller's own
-    diagnostics; it must never be echoed back to the caller together with
-    a count of what was withheld (G4-d: a count is a leak).
+    ``(READ_SEALED, reason)``, plus the THIRD element: the element ids of
+    the fact rows that belong to released elements and must therefore be
+    masked in the reading view (P0-16 F-1). The reason is for the
+    caller's own diagnostics; it must never be echoed back to the caller
+    together with a count of what was withheld (G4-d: a count is a leak).
+
+    The third element travels with the decision on purpose: the masking
+    rule is part of the SAME visibility judgement, so a read exit cannot
+    apply it with a rule of its own — it can only apply what this function
+    hands it.
     """
     released = frozenset(released_paths or ())
     sealed = frozenset(sealed_paths or ())
     owners = sealed_owner or {}
     held = set(tokens or ())
+    mask = frozenset(released_fact_ids or ())
 
     if path in released:
-        return READ_RELEASED, "released"
+        return READ_RELEASED, "released", mask
     if path in sealed:
         owner = owners.get(path)
         if owner and owner in held:
-            return READ_ALLOW, ""
-        return READ_SEALED, "sealed"
-    return READ_ALLOW, ""
+            return READ_ALLOW, "", mask
+        return READ_SEALED, "sealed", mask
+    return READ_ALLOW, "", mask

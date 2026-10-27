@@ -138,13 +138,24 @@ class MemoryGetTool(BaseTool):
             #
             # P0-13 L-3: if the truth layer cannot be resolved, the read
             # FAILS. An unknown release state must not serve content.
+            #
+            # P0-16 L-4: that failure must be LOUD — an ERROR log, an
+            # audit line and a marker the inspector reports red. A
+            # fail-closed read that says nothing can stay broken forever.
+            #
+            # P0-16 F-1: the decision also carries the fact rows that
+            # belong to released elements. Reading a facts file masks
+            # those rows in the VIEW — the disk keeps the 原话.
             key = self._visibility_key(file_path, workspace_dir,
                                        knowledge_root=knowledge_root)
+            mask_ids = frozenset()
             decide = getattr(self.memory_manager, "read_decision", None)
             if decide is not None:
                 try:
-                    decision, _reason = decide(key)
+                    decision, _reason, mask_ids = decide(key)
                 except Exception as e:
+                    from agent.memory.read_audit import report_read_denied
+                    report_read_denied(workspace_dir, "memory_get", key, e)
                     return ToolResult.fail(
                         f"Error: the release state could not be resolved "
                         f"({e}); refusing to serve the file (fail closed)."
@@ -157,6 +168,11 @@ class MemoryGetTool(BaseTool):
             # could be released, so there is nothing to judge.
 
             content = file_path.read_text(encoding='utf-8')
+            # P0-16 F-1: the evidence room is append-only, so its released
+            # rows are masked in the reading view, not on the disk.
+            from agent.memory.facts_mask import is_facts_path, mask_facts_text
+            if mask_ids and is_facts_path(key):
+                content = mask_facts_text(content, mask_ids)
             lines = content.split('\n')
             
             # Handle line range

@@ -202,3 +202,44 @@ def test_tombstone_container_is_not_reported_as_unknown():
     problems = validate_names.validate_file(
         f"{TOMBSTONE_DIR}/peiqi--a1b2c3d4.tombstone.md", GOOD_TOMBSTONE)
     assert not any("unknown markdown container" in p for p in problems)
+
+
+# --- P0-16: the naming contract must not drift with the two-axis split ---
+#
+# P0-16 L-5 split the identity axes: the end-user id and the agent owner
+# token are now different namespaces. The owner token is NOT a user id, so
+# it must not be spelled like one — and the naming rules must not start
+# accepting a file whose identity claims the agent namespace.
+
+def test_an_agent_owner_token_is_not_a_user_id():
+    """'agent--x' is the AGENT namespace; 'user--x' is the end-user one.
+
+    The two are separate namespaces and separate columns (P0-16 L-5). A
+    rule that treats one as the other is how an end-user id shaped like an
+    owner token could read a dark page.
+    """
+    from agent.memory.visibility import (
+        AGENT_OWNER_PREFIX,
+        agent_owner_token,
+        is_reserved_end_user_id,
+    )
+    from agent.memory.identity_ns import AGENT_PREFIX, USER_PREFIX
+
+    assert AGENT_OWNER_PREFIX == AGENT_PREFIX == "agent--"
+    assert USER_PREFIX == "user--"
+    assert agent_owner_token("alice") == "agent--alice"
+    assert is_reserved_end_user_id("agent--alice")
+    assert not is_reserved_end_user_id("user--alice")
+    assert not is_reserved_end_user_id("alice")
+
+
+def test_the_owner_token_does_not_change_the_memory_path_contract():
+    """The path contract is unchanged: a dark page is still an element."""
+    from agent.memory.naming import check_name, content_hash8
+
+    # a normal element FILE name is still valid
+    assert not check_name("记一件事--%s.md" % content_hash8("body"))
+    # and the naming rules are not loosened by the axis split
+    assert check_name("bad/name.md")
+    assert check_name("no-hash.md")
+    assert check_name("记一件事.md")

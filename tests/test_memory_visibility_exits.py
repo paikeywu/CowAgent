@@ -402,7 +402,13 @@ def test_l2_reverse_an_open_page_stays_visible_to_everyone(ws, cow):
 
 
 def test_l2_the_dark_page_is_indexed_under_its_own_scope(ws, cow):
-    """L-2：暗页在索引里带自己的 scope 与归属令牌（不是共享白页）。"""
+    """L-2：暗页在索引里带自己的 scope 与归属令牌（不是共享白页）。
+
+    P0-16 L-5：归属令牌住在**自己的列** ``sealed_owner``，不再和端用户
+    共用 ``user_id``。P0-14 L-2 当初把归属令牌写进了 ``user_id``，那是
+    两条轴混在一列 —— 端用户 id 只要撞上 ``agent--<id>`` 的形状就能读到
+    暗页。语义没变（暗页带自己的 scope 和归属），变的是归属住在哪一列。
+    """
     f = facade_for(ws, cow)
     p = write_event(f, "dark-evt", DARK_TOKEN, "暗页", visibility="sealed")
     rel = p.relative_to(ws).as_posix()
@@ -410,14 +416,17 @@ def test_l2_the_dark_page_is_indexed_under_its_own_scope(ws, cow):
     try:
         asyncio.run(mgr.sync())
         rows = mgr.storage.conn.execute(
-            "SELECT DISTINCT scope, user_id FROM chunks WHERE path = ?",
-            (rel,)).fetchall()
+            "SELECT DISTINCT scope, user_id, sealed_owner FROM chunks "
+            "WHERE path = ?", (rel,)).fetchall()
         assert rows, "暗页根本没进索引"
         for row in rows:
             assert row["scope"] == SCOPE_SEALED, (
                 f"暗页的 scope 不是 {SCOPE_SEALED}: {row['scope']!r}")
-            assert row["user_id"] == agent_owner_token(ACTOR), (
-                f"暗页的归属令牌不对: {row['user_id']!r}")
+            assert row["sealed_owner"] == agent_owner_token(ACTOR), (
+                f"暗页的归属令牌不对: {row['sealed_owner']!r}")
+            # 端用户轴不承载归属令牌（P0-16 L-5）
+            assert not (row["user_id"] or "").startswith("agent--"), (
+                f"端用户轴里混进了归属令牌: {row['user_id']!r}")
     finally:
         close_manager(mgr)
 

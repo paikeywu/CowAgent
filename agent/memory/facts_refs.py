@@ -48,8 +48,9 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 
+from agent.memory.facts_mask import RELEASED_ROW_NOTE
 from agent.memory.naming import canonical_text
 
 FACT_ID_PREFIX = "f_"
@@ -83,6 +84,40 @@ def is_feeling_run(run_id: str) -> bool:
 def feeling_run_id(element_id: str) -> str:
     """The ``run_id`` a feeling fact row carries."""
     return FEELING_RUN_PREFIX + element_id
+
+
+def row_element_id(row: dict) -> str:
+    """The element id of one parsed fact row.
+
+    Same rule as :func:`build_facts_index`: a feeling row's id comes from
+    its content (like every other layer's), and a plain fact row's id is
+    the sha256 of its own content. One definition — the index and the
+    reading view must never disagree about which row is which.
+    """
+    content = str(row.get("content") or "")
+    if is_feeling_run(str(row.get("run_id") or "")):
+        return feeling_element_id(content)
+    return fact_element_id(content)
+
+
+def row_element_ids(row: dict) -> List[str]:
+    """Every id that identifies this row — the derived one, plus the id the
+    row's own ``run_id`` claims when it is a feeling row.
+
+    The two agree for an untampered row (the run id carries the same
+    digest). When they disagree the row was rewritten, and the reading
+    view masks it if EITHER id says "released" — the safe direction.
+    """
+    out: List[str] = []
+    derived = row_element_id(row)
+    if derived:
+        out.append(derived)
+    run_id = str(row.get("run_id") or "")
+    if is_feeling_run(run_id):
+        claimed = run_id[len(FEELING_RUN_PREFIX):].strip()
+        if claimed and claimed not in out:
+            out.append(claimed)
+    return out
 
 
 @dataclass(frozen=True)
@@ -155,17 +190,25 @@ class FactsIndex:
         return candidates[0] if len(candidates) == 1 else None
 
 
-def build_facts_index(workspace_root: Path | str) -> FactsIndex:
+def build_facts_index(workspace_root: Path | str,
+                      mask_ids: Optional[Iterable[str]] = None) -> FactsIndex:
     """Scan ``memory/facts/**/*.jsonl`` and index every row by element id.
 
     Read-only, and tolerant: an unparseable line is skipped (it is the
     inspector's violation to report, not the reader's to crash on).
+
+    ``mask_ids`` (P0-16 F-1) are the element ids of rows that belong to
+    RELEASED elements. Their CONTENT is replaced by a placeholder in this
+    index — the disk is untouched; only what a reader sees changes. A
+    caller that only needs to know WHICH rows exist (the inspector, the
+    chain check) passes nothing and sees the real content.
     """
     workspace = Path(workspace_root)
     facts_root = workspace / "memory" / "facts"
     index = FactsIndex()
     if not facts_root.is_dir():
         return index
+    mask = set(mask_ids or ())
     for path in sorted(facts_root.rglob("*.jsonl")):
         if not path.is_file():
             continue
@@ -189,6 +232,11 @@ def build_facts_index(workspace_root: Path | str) -> FactsIndex:
             feeling = is_feeling_run(run_id)
             element_id = (feeling_element_id(content) if feeling
                           else fact_element_id(content))
+            if mask and any(i in mask for i in row_element_ids(row)):
+                # The row is released: the reader sees the placeholder, not
+                # the 原话. The id is kept — which row was released is not
+                # the secret; what it said is.
+                content = RELEASED_ROW_NOTE
             index.add(FactRow(
                 element_id=element_id,
                 path=rel,
