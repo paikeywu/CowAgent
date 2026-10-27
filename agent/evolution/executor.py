@@ -35,6 +35,7 @@ from agent.evolution.prompts import (
     build_review_user_message,
 )
 from agent.evolution.record import append_session_evolution
+from agent.memory.layers import EXCLUDED_INDEX_SEGMENTS
 
 # Tools the isolated evolution agent is allowed to use. Everything else is
 # withheld so an unattended review can only read context and edit approved
@@ -305,15 +306,22 @@ def _guard_tools(
 _WATCH_SUBDIRS = ("MEMORY.md", "AGENT.md", "skills", "knowledge", "output")
 # Subpaths under memory/ to ignore: evolution's own bookkeeping + the nightly
 # dream diary, none of which count as a user-facing change signal.
-_MEMORY_IGNORE = (".evolution_backups", "dreams", "evolution", "shelf", "facts",
-                  ".snapshots", ".audit")
-# shelf/ and facts/ joined the ignore list with live-memory v2: shelf/ cards
-# are auto-regenerated projections (watching them would make every catalog
-# rebuild look like "the workspace changed"), and facts/ is the append-only
-# evidence room whose writes are a steady background stream, not a signal.
-# .snapshots/ and .audit/ joined with P0-8: they are the inspector's own
-# bookkeeping (baseline + report trail), rewritten on every inspection —
-# watching them would make every inspection look like a workspace change.
+_MEMORY_IGNORE = (".evolution_backups", "dreams", "evolution")
+# The live-memory layers that are projections or bookkeeping, never a
+# user-facing change signal.
+#
+# shelf/ cards are auto-regenerated projections (watching them would make
+# every catalog rebuild look like "the workspace changed"), facts/ is the
+# append-only evidence room whose writes are a steady background stream,
+# .snapshots/ and .audit/ are the inspector's own bookkeeping (rewritten on
+# every inspection), and _tombstones/ is the release ledger (P0-11 P-3) —
+# a release is a privacy action, not a prompt for evolution to rewrite
+# something.
+#
+# The set is the SAME one the index scan uses (agent/memory/layers.py), so
+# the watcher and the scan cannot drift apart — they drifted once already
+# (P0-11: tombstones were excluded from the scan but not from the watcher).
+_INDEX_EXCLUDED = EXCLUDED_INDEX_SEGMENTS
 # Files the skill subsystem maintains automatically (the enable/disable index).
 # Not an evolution result, so a rewrite must not count as a change signal.
 _WATCH_IGNORE_NAMES = ("skills_config.json",)
@@ -354,6 +362,12 @@ def _workspace_snapshot(workspace_dir) -> dict:
         for p in mem_dir.rglob("*.md"):
             rel_parts = p.relative_to(mem_dir).parts
             if rel_parts and rel_parts[0] in _MEMORY_IGNORE:
+                continue
+            # The live-memory layers are matched by SEGMENT, not by the first
+            # one: _tombstones/ lives under markdown/, so a first-segment
+            # check would watch the release ledger (and a release would look
+            # like a user-facing change worth evolving from).
+            if any(seg in _INDEX_EXCLUDED for seg in rel_parts):
                 continue
             try:
                 st = p.stat()

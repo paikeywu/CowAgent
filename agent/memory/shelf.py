@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from agent.memory.facade import split_frontmatter  # noqa: E402
+from agent.memory.facts_refs import build_facts_index  # noqa: E402
 from agent.memory.inspector import Inspector  # noqa: E402
 
 _CST = timezone(timedelta(hours=8))
@@ -103,6 +104,17 @@ class ShelfGenerator:
         self.shelf_root = self.memory_root / "shelf"
         self.agent_id = agent_id or self.workspace_root.name
         self._inspection: Optional[Dict[str, Any]] = None
+        # The evidence room is indexed ONCE per rebuild: resolving an
+        # element's refs means looking the fact row up by its id, and
+        # re-reading every facts file for every event turned a full rebuild
+        # into O(events x facts) file reads.
+        self._facts_index = None
+
+    def _facts(self):
+        """The workspace's facts index, built once per rebuild."""
+        if self._facts_index is None:
+            self._facts_index = build_facts_index(self.workspace_root)
+        return self._facts_index
 
     # -- public entry --------------------------------------------------------
 
@@ -192,6 +204,11 @@ class ShelfGenerator:
                 # SH-7 filter: legitimately invisible (draft/sealed/released),
                 # NOT a defect — not reported as skipped.
                 continue
+            # P0-11 门禁④ (呈现侧): the event's ``refs`` are resolved against
+            # the evidence room, so a 感受 can be drilled down to its 原话
+            # from the shelf. A ref that does not resolve is a dangling
+            # pointer (INV-1) and surfaces in the gaps view.
+            facts_links = self._facts_links(fm.get("refs") or [])
             mentions = sorted(set(self._body_involves(body))
                               | {str(t) for t in (fm.get("involves") or [])
                                  if str(t)})
@@ -216,9 +233,66 @@ class ShelfGenerator:
                 "mentions": mentions,
                 "involves": sorted({str(fm.get("subject") or "")}
                                     | set(mentions) - {""}),
+                # P0-11 门禁④: the drill-down links into the evidence room.
+                "facts_links": facts_links,
             })
         out.sort(key=lambda r: (r["occurred_at"], r["rel_truth"]))
         return out, skipped
+
+    def _facts_cell(self, links: List[Dict[str, str]]) -> str:
+        """The 「感受」 cell: a drill-down link into the evidence room.
+
+        The link points at the facts FILE (not at a ``#L<n>`` anchor): the
+        shelf's link-validity rule (SH-1) resolves every link to a file on
+        disk, and a path carrying an anchor does not resolve to one. The
+        machine-side resolution to the exact ROW is the facts index's job
+        (``facts_refs.resolve``), which is what the gate's 呈现侧 assertion
+        uses.
+        """
+        if not links:
+            return "（无）"
+        cells = []
+        for entry in links:
+            words = _esc(entry.get("words") or "")
+            label = words if len(words) <= 24 else words[:24] + "…"
+            cells.append(f"[{label}]({entry['link']})")
+        return " · ".join(cells)
+
+    def _facts_links(self, refs: List[Any]) -> List[Dict[str, str]]:
+        """Resolve an element's refs into drill-down links into the evidence room.
+
+        P0-11 门禁④ (呈现侧): a 感受 is a fact-layer element, so the shelf
+        must be able to point at the row that holds its 原话. The ref is an
+        element id (``f_*``), which is DERIVED from the row's content — so
+        resolving it means looking the row up, not parsing a path out of the
+        string.
+
+        Returns one entry per resolved ref:
+        ``{"ref", "path" (workspace-relative), "line", "link" (relative to
+        shelf/), "words" (the 原话, first line)}``.
+
+        An unresolvable ref is NOT returned here: it is a dangling pointer
+        and the gaps view reports it (INV-1).
+        """
+        if not refs:
+            return []
+        index = self._facts()
+        out: List[Dict[str, str]] = []
+        for ref in refs:
+            if not isinstance(ref, str) or not ref:
+                continue
+            row = index.resolve(ref)
+            if row is None:
+                continue
+            out.append({
+                "ref": ref,
+                "path": row.path,
+                "line": str(row.line),
+                "link": self._posix_relpath(
+                    self.workspace_root / row.path, self.shelf_root),
+                "words": (row.content.strip().splitlines() or [""])[-1].strip(),
+            })
+        return out
 
     def _body_involves(self, body: str) -> List[str]:
         """Entity slugs from the P0-1 §4.3 body template's 关联 section:
@@ -446,32 +520,29 @@ class ShelfGenerator:
         return gaps
 
     def _dangling_refs(self, refs: List[Any]) -> List[str]:
-        """refs entries of the form 'f_<date>/<sess>#L<seq>' (or a plain
-        facts path) that do not resolve to an existing facts line."""
+        """refs entries that do not resolve to an existing facts row.
+
+        Two shapes are understood (see agent/memory/facts_refs.py):
+
+          * ``f_<20 hex>``      — the element id of a fact row (the form the
+            facade writes for a 感受);
+          * ``f_<path>#L<n>``   — a path anchor into the evidence room, the
+            form the gap rule has always understood.
+
+        A ref in either shape that points at nothing is a dangling pointer
+        (INV-1) and becomes a gap. Refs in a shape we do not understand are
+        NOT silently accepted either: they are reported, because a ref the
+        checker cannot read is a ref nobody can drill down through.
+        """
+        if not refs:
+            return []
+        index = self._facts()
         missing: List[str] = []
         for ref in refs:
-            if not isinstance(ref, str):
+            if not isinstance(ref, str) or not ref:
                 continue
-            target = ref
-            if target.startswith("f_"):
-                target = target[2:]
-            path_part, _, anchor = target.partition("#")
-            p = self.memory_root / "facts" / path_part
-            if not p.is_file():
-                p = self.workspace_root / "memory" / "facts" / path_part
-            if not p.is_file():
+            if index.resolve(ref) is None:
                 missing.append(ref)
-                continue
-            if anchor.upper().startswith("L"):
-                try:
-                    want = int(anchor[1:])
-                except ValueError:
-                    missing.append(ref)
-                    continue
-                with open(p, encoding="utf-8") as f:
-                    count = sum(1 for raw in f if raw.strip())
-                if want > count:
-                    missing.append(ref)
         return missing
 
     # -- fingerprint -------------------------------------------------------------
@@ -577,11 +648,16 @@ class ShelfGenerator:
         })
         rows = []
         for ev in events[-INDEX_TOP_N:][::-1]:
+            # P0-11 门禁④ (呈现侧): the 「感受」 cell points at the evidence
+            # room, so the 原话 is one click away (SH-1: the target must
+            # exist, and the facts row does).
+            facts_cell = self._facts_cell(ev.get("facts_links") or [])
             rows.append(
                 f"| {ev['date']} | {_esc(ev['type'])} | "
                 f"[{_esc(ev['title'])}]({ev['link']}) | "
-                f"[→]({ev['link']}) |")
-        remembered = ("| 日期 | 类型 | 标题 | 下钻 |\n|:--|:--|:--|:--|\n"
+                f"{facts_cell} | [→]({ev['link']}) |")
+        remembered = ("| 日期 | 类型 | 标题 | 感受 | 下钻 |\n"
+                      "|:--|:--|:--|:--|:--|\n"
                       + "\n".join(rows)) if rows else "（暂无）"
 
         gap_rows = []

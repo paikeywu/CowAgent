@@ -43,6 +43,10 @@ from agent.memory.facade import (  # noqa: E402
     split_frontmatter,
 )
 from agent.memory.naming import canonical_text  # noqa: E402
+from agent.memory.layers import (  # noqa: E402
+    EXCLUDED_INDEX_SEGMENTS as EXCLUDED_LAYER_SEGMENTS,
+    excluded_segments,
+)
 
 _CST = timezone(timedelta(hours=8))
 
@@ -74,7 +78,12 @@ CODE_INDEX_ORPHAN = "index-orphan"
 
 # Path segments the sync scan skips by policy (agent/memory/manager.py).
 # A chunk row under any of them is a policy violation, not a stale page.
-EXCLUDED_INDEX_SEGMENTS = ("shelf", "facts", ".snapshots", ".audit")
+#
+# The set lives in agent/memory/layers.py because THREE call sites need it
+# (the scan, this check, the evolution watcher) and they drifted once
+# already: P0-11 found tombstones excluded from the scan but not from
+# this check, so the inspector called a leaking row legitimate.
+EXCLUDED_INDEX_SEGMENTS = EXCLUDED_LAYER_SEGMENTS
 
 _SEV_HIGH = "high"
 _SEV_MID = "mid"
@@ -394,8 +403,7 @@ class Inspector:
             conn.close()
 
         for path, scope, user_id, n in rows:
-            segments = path.split("/")
-            excluded = [s for s in segments if s in EXCLUDED_INDEX_SEGMENTS]
+            excluded = list(excluded_segments(path))
             if excluded:
                 self._violation(
                     report, REASON_INDEX_EXCLUDED, path,

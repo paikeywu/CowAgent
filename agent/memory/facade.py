@@ -44,6 +44,11 @@ from agent.memory.naming import (
     check_name,
     check_relpath,
 )
+from agent.memory.facts_refs import (
+    feeling_element_id,
+    feeling_run_id,
+)
+from agent.memory.frontmatter import split_frontmatter
 
 # ---------------------------------------------------------------------------
 # Exceptions (P0-3 §0 名词约定 — exact names, do not rename)
@@ -165,6 +170,22 @@ _RESERVED_STEMS = {
 
 _SESS_NAME_RE = re.compile(r"^sess_[0-9a-f]{8}\.jsonl$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# P0-1 §4.3's body template carries a 「## 感受」 section. Gate ④ (感受可
+# 下钻到原话) needs that section to be a machine-locatable element rather
+# than a paragraph buried in the body, so the facade lifts it out into its
+# own facts row and points the element's ``refs`` at it.
+#
+# The section runs from its own heading to the next heading of the same or
+# a higher level (a ``###`` subsection belongs to the 感受 section).
+_FEELING_HEADING_RE = re.compile(r"^##\s+感受\s*$", re.M)
+_NEXT_SECTION_RE = re.compile(r"^##\s+\S", re.M)
+
+# The facts file the feeling rows live in. One file per day, named like
+# every other session file (sess_<8hex>.jsonl) — the rows are grouped so a
+# reader can see every feeling of that day in one place, and the row-level
+# hash chain runs inside that file like it does everywhere else.
+_FEELING_SESSION_ID = "feed0001"
 
 # WR-20: second confirmation window.
 CONFIRM_TTL_SECONDS = 600
@@ -713,6 +734,98 @@ class WriteFacade:
             prev = line.get("line_hash", prev)
         return violations
 
+    # -- gate ④: 感受 becomes a locatable element (P0-11 门禁④) ---------------
+
+    @staticmethod
+    def _extract_feeling(body: str) -> Optional[str]:
+        """The 「## 感受」 section of a body, or None.
+
+        The section runs from its heading to the next ``##`` heading (a
+        ``###`` subsection belongs to it). Only the section's own text is
+        taken — the heading itself is dropped, because the heading is the
+        section's NAME, not its content, and the content is what must land
+        in the facts row verbatim.
+        """
+        if not body:
+            return None
+        m = _FEELING_HEADING_RE.search(body)
+        if not m:
+            return None
+        start = m.end()
+        rest = body[start:]
+        nxt = _NEXT_SECTION_RE.search(rest)
+        section = rest[:nxt.start()] if nxt else rest
+        section = section.strip()
+        return section or None
+
+    def _record_feeling(self, body: str, *, date: str) -> Optional[str]:
+        """Write the body's 感受 section as its own facts row.
+
+        Returns the feeling's element id, or None when the body has no
+        感受 section.
+
+        Why a facts ROW and not a file: the facts layer is the append-only
+        evidence room (P0-1 §3), the element contract (``<slug>--<hash8>.md``)
+        is for markdown elements, and a feeling is a dimension attached to
+        an event — 03 §4.1 "感受必须与事件绑定，不独立成文件". A row in the
+        evidence room keeps the 原话 byte-for-byte, keeps the row-level
+        hash chain (P0-1 §3.3), and gives the feeling an id that
+        ``refs`` can point at (P0-1 §4.1: refs 只指事实层 f_*).
+
+        The id is derived from the section's own text (06 §3.1's
+        ``<layer> + sha256(canonical_text)[:20]`` rule), so the same
+        感受 always has the same id — the element id is a function of the
+        content, never a counter.
+        """
+        section = self._extract_feeling(body)
+        if not section:
+            return None
+        element_id = feeling_element_id(section)
+        # Idempotence: the id is derived from the section's text, so the
+        # same 感受 always has the same id. If the day's evidence room
+        # already holds it, it is NOT appended again — a revision of an
+        # event re-writes the same body, and the evidence room is
+        # append-only, so a second copy of the same 原话 would be a
+        # duplicate rather than new evidence.
+        if self._feeling_row_exists(date, section):
+            return element_id
+        # The facts row's ``run_id`` carries the layer: P0-1 §3.2 fixes the
+        # row at ten fields in a fixed order, so ``layer`` cannot be a field
+        # of its own without breaking that contract. ``run_id`` is the one
+        # free-form field, and it is part of the line hash, so the layer
+        # cannot be changed behind the chain's back.
+        line = self.append_fact(
+            date, _FEELING_SESSION_ID,
+            role="assistant",
+            content=section,
+            occurred_at=_utc8_now(),
+            run_id=feeling_run_id(element_id),
+        )
+        self._audit("record_feeling", element_id, "ok",
+                    f"facts_line={line['seq']}")
+        return element_id
+
+    def _feeling_row_exists(self, date: str, section: str) -> bool:
+        """True when this day's evidence room already holds this 感受."""
+        path = self.memory_root / "facts" / date / f"sess_{_FEELING_SESSION_ID}.jsonl"
+        if not path.is_file():
+            return False
+        try:
+            with open(path, encoding="utf-8") as f:
+                for raw in f:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        row = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if str(row.get("content") or "") == section:
+                        return True
+        except (OSError, UnicodeDecodeError):
+            return False
+        return False
+
     # -- markdown truth layer ------------------------------------------------
 
     def _render(self, fm: Dict[str, Any], body: str) -> str:
@@ -792,6 +905,23 @@ class WriteFacade:
         }
         if fm["visibility"] not in ("open", "sealed", "draft"):
             raise FacadeError(f"bad visibility {fm['visibility']!r}")
+        # P0-11 门禁④ (写入侧): a body's 感受 section becomes its own facts
+        # row, and the element's ``refs`` points at it — so the feeling is
+        # a machine-locatable element that can be drilled down to, not a
+        # paragraph buried in the body.
+        #
+        # It happens HERE, in the single choke point every element-creating
+        # entry funnels through (write_event / write_letter / write_entity
+        # / revise), so no entry can create a 感受 without a ref for it.
+        # A released element is exempt: the release transaction re-creates
+        # the element with the SAME body, and the feeling row already
+        # exists — appending it again would duplicate the 原话 in the
+        # append-only evidence room.
+        if status != "released":
+            feeling_id = self._record_feeling(
+                body, date=date or _utc8_now()[:10])
+            if feeling_id and feeling_id not in fm["refs"]:
+                fm["refs"].append(feeling_id)
         text_for_hash = canonical_text(body)
         fm["body_hash"] = "sha256:" + _sha256_hex(text_for_hash)
         fm["id"] = f"{layer}_{_sha256_hex(self.actor + text_for_hash)[:20]}"
@@ -1183,12 +1313,9 @@ class WriteFacade:
         return generator.rebuild()
 
 
-def split_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
-    """Split `---\\n<yaml>\\n---\\n<body>`. Returns ({}, text) when absent."""
-    if not text.startswith("---\n"):
-        return {}, text
-    end = text.find("\n---\n", 4)
-    if end == -1:
-        return {}, text
-    fm = yaml.safe_load(text[4:end]) or {}
-    return fm, text[end + 5:]
+# ``split_frontmatter`` is imported from agent.memory.frontmatter at the top
+# of this module and re-exported here: it used to be DEFINED here, but the
+# release-state resolver needs to read front-matter too, and importing the
+# facade from that resolver would make the two modules circular. Every
+# existing importer (``from agent.memory.facade import split_frontmatter``)
+# keeps working.

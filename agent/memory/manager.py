@@ -14,6 +14,8 @@ from agent.memory.config import MemoryConfig, get_default_memory_config
 from agent.memory.storage import MemoryStorage, MemoryChunk, SearchResult
 from agent.memory.chunker import TextChunker
 from agent.memory.embedding import EmbeddingProvider, EmbeddingCache
+from agent.memory.layers import excluded_segments
+from agent.memory.release_state import ReleaseStateCache
 from agent.memory.reranker import Reranker
 from agent.memory.summarizer import MemoryFlushManager, create_memory_files_if_needed
 
@@ -138,6 +140,14 @@ class MemoryManager:
         # Ensure workspace directories exist
         self._init_workspace()
         
+        # P0-11 P-2 (RR-04): the release projection. The flags on a chunk row
+        # mirror the truth layer, and the truth layer moves without the index
+        # moving (a release leaves the old bytes untouched), so the state is
+        # re-resolved from the disk and re-stamped whenever the truth layer's
+        # signature changed.
+        self._release_state = ReleaseStateCache(self.config.get_workspace())
+        self._release_signature = None
+
         self._dirty = False
     
     def _init_workspace(self):
@@ -149,6 +159,70 @@ class MemoryManager:
         workspace_dir = self.config.get_workspace()
         create_memory_files_if_needed(workspace_dir)
     
+    @staticmethod
+    def _file_seals_itself(content: str) -> bool:
+        """True when the file's own front-matter seals it.
+
+        ``visibility: sealed`` or ``status: released`` — the two states
+        P0-1 §4.1 defines and the shelf's SH-7 filter already honours.
+        Such a file is not part of the shared retrieval surface.
+
+        The front-matter is read with the SHARED parser (not a regex), so
+        the rule here and the rule in the shelf cannot drift apart. A
+        malformed front-matter is NOT treated as sealed: it is the
+        inspector's violation to report, and failing closed here would
+        silently drop a file from the index.
+        """
+        if not content.startswith("---\n"):
+            return False
+        try:
+            from agent.memory.frontmatter import split_frontmatter
+            fm, _body = split_frontmatter(content)
+        except Exception:
+            return False
+        if not fm:
+            return False
+        return (fm.get("visibility") == "sealed"
+                or fm.get("status") == "released")
+
+    def _refresh_release_projection(self) -> None:
+        """Re-stamp the release flags of the index from the truth layer.
+
+        P0-11 P-2 (RR-04): a release does NOT change the released file's
+        bytes (WR-11 keeps the old version untouched), so the scan never
+        re-indexes it and the index would keep serving the released text.
+        The flags are therefore refreshed from the DISK — the authority —
+        before every retrieval, but only when the truth layer's signature
+        actually moved (the refresh itself is a write).
+
+        This is a PROJECTION refresh, not a repair: it only sets the two
+        release flags, and only on rows that already exist. It never
+        deletes, never rewrites content, and never touches the truth layer.
+        """
+        try:
+            state = self._release_state.get()
+        except Exception as e:
+            from common.log import logger
+            logger.warning(
+                "[MemoryManager] Cannot resolve the release state: %s", e)
+            return
+        if state.signature == self._release_signature:
+            return
+        try:
+            changed = self.storage.apply_release_projection(
+                set(state.released_paths), set(state.sealed_paths))
+        except Exception as e:
+            from common.log import logger
+            logger.warning(
+                "[MemoryManager] Cannot apply the release projection: %s", e)
+            return
+        self._release_signature = state.signature
+        if changed:
+            from common.log import logger
+            logger.info(
+                "[MemoryManager] Release projection refreshed: %d path(s) "
+                "re-flagged", changed)
+
     async def search(
         self,
         query: str,
@@ -200,7 +274,13 @@ class MemoryManager:
         # Sync if needed
         if self.config.sync_on_search and self._dirty:
             await self.sync()
-        
+
+        # P0-11 P-2 (RR-04): the release flags are refreshed from the truth
+        # layer BEFORE the query runs, so a released element leaves the
+        # result set for every identity — anonymous, third party and owner
+        # alike. The refresh is a projection of the disk, not a repair.
+        self._refresh_release_projection()
+
         from common.log import logger
 
         # Perform vector search (if embedding provider available).
@@ -424,10 +504,15 @@ class MemoryManager:
                 # never .md today); it is referenced by pointer, not indexed.
                 # .snapshots/ + .audit/ are the inspector's own bookkeeping
                 # (baseline + report trail, P0-8) — same reason as shelf/.
+                # _tombstones/ (P0-11 P-3) are the release ledger: they carry
+                # original_path / consent_ref / the confirmation token hash,
+                # and a tombstone row in the index would be scope='shared' +
+                # user_id=NULL, i.e. readable by ANY caller (V2-Q-01).
                 # markdown/ stays indexed on purpose: it IS the truth layer.
-                if ("shelf" in rel_parts or "facts" in rel_parts
-                        or ".snapshots" in rel_parts
-                        or ".audit" in rel_parts):
+                #
+                # The set itself lives in agent/memory/layers.py so the scan
+                # and the inspector's check 5 cannot drift apart again.
+                if excluded_segments("/".join(rel_parts)):
                     continue
                 try:
                     if "users" in rel_parts:
@@ -522,6 +607,24 @@ class MemoryManager:
                 logger.warning(f"[MemoryManager] Skipping {file_path}: cannot read it ({e})")
                 continue
             file_hash = MemoryStorage.compute_hash(content)
+            # P0-11 P-2 / G4-e: a file that seals ITSELF does not belong in
+            # the shared index at all. The release event carries the
+            # consent_ref and the release metadata in its body, and a
+            # release record is the owner's business — indexing it made
+            # every release's metadata anonymously readable (V2-Q-01).
+            #
+            # The check is on the FILE's own front-matter, so it is a
+            # property of the disk, not of the index. A file that is
+            # released but whose front-matter still says active (the
+            # original version — WR-11 leaves its bytes untouched) is
+            # handled by the release projection instead: it stays in the
+            # index, flagged, and the visibility predicate hides it.
+            #
+            # The path is removed from the scan set, so the reconcile drops
+            # any rows an older build left for it.
+            if self._file_seals_itself(content):
+                scanned.get(source, set()).discard(rel_path)
+                continue
             previous_hash = self.storage.get_file_hash(rel_path)
             if previous_hash == file_hash:
                 continue
@@ -595,6 +698,14 @@ class MemoryManager:
                 )
 
         if not pending:
+            # P0-11 P-2: nothing changed on disk, but the truth layer's
+            # RELEASE state may have moved (a release writes a new version
+            # and a tombstone, and leaves the released file's own bytes
+            # untouched — so the scan above sees no change for it). The
+            # flags are re-stamped from the disk before returning, otherwise
+            # a released element would stay retrievable until the next
+            # file change.
+            self._refresh_release_projection()
             self._dirty = False
             return
 
@@ -628,6 +739,18 @@ class MemoryManager:
 
         # Pass 3: inline persist — same self-contained reasoning as Pass 1.
         cursor = 0
+
+        # P0-11 P-2 (RR-04): the release flags are stamped on every chunk as
+        # it is written, from the TRUTH LAYER (the authority) — not from the
+        # index, which is the projection. Resolved once per sync, because a
+        # release does not change the released file's bytes (WR-11), so the
+        # scan above would never re-index it.
+        try:
+            release_state = self._release_state.get()
+        except Exception as e:
+            logger.warning(f"[MemoryManager] Cannot resolve the release state: {e}")
+            release_state = None
+
         for entry in pending:
             n = len(entry["texts"])
             entry_embeddings = all_embeddings[cursor:cursor + n]
@@ -641,6 +764,10 @@ class MemoryManager:
                 # does not keep a second copy of the same file under
                 # "knowledge\note.md" and return it twice.
                 self.storage.delete_by_path(rel_path.replace("/", os.sep))
+            if release_state is not None:
+                element_released, file_sealed = release_state.flags_for(rel_path)
+            else:
+                element_released, file_sealed = 0, 0
             memory_chunks = []
             for chunk, embedding in zip(entry["chunks"], entry_embeddings):
                 chunk_id = self._generate_chunk_id(rel_path, chunk.start_line, chunk.end_line, chunk.part)
@@ -657,6 +784,8 @@ class MemoryManager:
                     embedding=embedding,
                     hash=chunk_hash,
                     metadata=None,
+                    element_released=element_released,
+                    file_sealed=file_sealed,
                 ))
             self.storage.save_chunks_batch(memory_chunks)
             stat = entry["file_path"].stat()
@@ -680,6 +809,12 @@ class MemoryManager:
                 )
             except Exception:
                 pass
+
+        # P0-11 P-2: the projection is refreshed once more at the end of the
+        # sync, so files that were indexed BEFORE the release (and whose
+        # bytes never changed) carry the right flags too. Without this the
+        # released content would survive in the index until the next edit.
+        self._refresh_release_projection()
 
         self._dirty = False
 

@@ -267,6 +267,20 @@ class MemoryChunk:
     embedding: Optional[List[float]]
     hash: str
     metadata: Optional[Dict[str, Any]] = None
+    # P0-11 P-2 (RR-04): the release projection of this chunk.
+    #
+    #   element_released — the ELEMENT this chunk belongs to was released.
+    #                     Set even for the version whose own front-matter
+    #                     still says active (WR-11 keeps the old bytes
+    #                     untouched, so the old file cannot know by itself).
+    #   file_sealed      — this chunk's own file seals itself
+    #                     (visibility=sealed / status=released).
+    #
+    # Both are integers (0/1) so the retrieval exit can filter on them in
+    # SQL — the visibility predicate in agent/memory/visibility.py is the
+    # one place that does.
+    element_released: int = 0
+    file_sealed: int = 0
 
 
 @dataclass
@@ -555,6 +569,8 @@ class MemoryStorage:
         # Older builds created chunks without hit tracking; add the columns
         # in place so an existing index keeps working without a rebuild.
         self._migrate_hit_columns()
+        # P0-11 P-2: same for the release projection flags.
+        self._migrate_release_columns()
 
         # Create indexes
         self.conn.execute("""
@@ -680,6 +696,25 @@ class MemoryStorage:
             )
         if "last_hit_at" not in cols:
             self.conn.execute("ALTER TABLE chunks ADD COLUMN last_hit_at INTEGER")
+
+    def _migrate_release_columns(self):
+        """Add the release projection flags (P0-11 P-2) to an older index.
+
+        Both default to 0, which means "not released / not sealed" — the
+        safe-for-visibility reading for a column that does not exist yet: an
+        index written before this feature has no released content in it
+        unless the truth layer says otherwise, and the projection refresh
+        re-stamps every row from the disk before the next search anyway.
+        """
+        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(chunks)")}
+        if "element_released" not in cols:
+            self.conn.execute(
+                "ALTER TABLE chunks ADD COLUMN element_released INTEGER NOT NULL DEFAULT 0"
+            )
+        if "file_sealed" not in cols:
+            self.conn.execute(
+                "ALTER TABLE chunks ADD COLUMN file_sealed INTEGER NOT NULL DEFAULT 0"
+            )
 
     def _migrate_legacy_fts_triggers(self) -> bool:
         """Drop external-content triggers that cannot read the previous row text.
@@ -874,8 +909,9 @@ class MemoryStorage:
             _SQL = """
                 INSERT INTO chunks
                 (id, user_id, scope, source, path, start_line, end_line,
-                 text, embedding, hash, metadata, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                 text, embedding, hash, metadata, element_released,
+                 file_sealed, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
                 ON CONFLICT(id) DO UPDATE SET
                     user_id     = excluded.user_id,
                     scope       = excluded.scope,
@@ -887,14 +923,17 @@ class MemoryStorage:
                     embedding   = excluded.embedding,
                     hash        = excluded.hash,
                     metadata    = excluded.metadata,
+                    element_released = excluded.element_released,
+                    file_sealed      = excluded.file_sealed,
                     updated_at  = strftime('%s', 'now')
             """
         else:
             _SQL = """
                 INSERT OR REPLACE INTO chunks
                 (id, user_id, scope, source, path, start_line, end_line,
-                 text, embedding, hash, metadata, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                 text, embedding, hash, metadata, element_released,
+                 file_sealed, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
             """
         params = (
             chunk.id, chunk.user_id, chunk.scope, chunk.source, chunk.path,
@@ -902,6 +941,8 @@ class MemoryStorage:
             None,
             chunk.hash,
             json.dumps(chunk.metadata) if chunk.metadata else None,
+            int(chunk.element_released or 0),
+            int(chunk.file_sealed or 0),
         )
         with self._lock:
             try:
@@ -921,8 +962,9 @@ class MemoryStorage:
             _SQL = """
                 INSERT INTO chunks
                 (id, user_id, scope, source, path, start_line, end_line,
-                 text, embedding, hash, metadata, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                 text, embedding, hash, metadata, element_released,
+                 file_sealed, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
                 ON CONFLICT(id) DO UPDATE SET
                     user_id     = excluded.user_id,
                     scope       = excluded.scope,
@@ -934,14 +976,17 @@ class MemoryStorage:
                     embedding   = excluded.embedding,
                     hash        = excluded.hash,
                     metadata    = excluded.metadata,
+                    element_released = excluded.element_released,
+                    file_sealed      = excluded.file_sealed,
                     updated_at  = strftime('%s', 'now')
             """
         else:
             _SQL = """
                 INSERT OR REPLACE INTO chunks
                 (id, user_id, scope, source, path, start_line, end_line,
-                 text, embedding, hash, metadata, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                 text, embedding, hash, metadata, element_released,
+                 file_sealed, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
             """
         params_list = [
             (
@@ -950,6 +995,8 @@ class MemoryStorage:
                 None,
                 c.hash,
                 json.dumps(c.metadata) if c.metadata else None,
+                int(c.element_released or 0),
+                int(c.file_sealed or 0),
             )
             for c in chunks
         ]
@@ -1116,7 +1163,9 @@ class MemoryStorage:
             return []
         
         scope_placeholders = ','.join('?' * len(scopes))
-        vis_sql, vis_params = visibility_clause(user_id, "chunks.scope", "chunks.user_id")
+        vis_sql, vis_params = visibility_clause(
+            user_id, "chunks.scope", "chunks.user_id",
+            "chunks.element_released", "chunks.file_sealed")
         sql_query = f"""
             SELECT chunks.*, bm25(chunks_fts) as rank
             FROM chunks_fts
@@ -1137,7 +1186,7 @@ class MemoryStorage:
                     start_line=row['start_line'],
                     end_line=row['end_line'],
                     score=self._bm25_rank_to_score(row['rank']),
-                    snippet=self._truncate_text(row['text'], 500),
+                    snippet=self._snippet_around(row['text'], query, 500),
                     source=row['source'],
                     user_id=row['user_id']
                 )
@@ -1147,6 +1196,57 @@ class MemoryStorage:
             from common.log import logger
             logger.warning("[MemoryStorage] _search_fts5 failed, returning empty", exc_info=True)
             return []
+
+    @staticmethod
+    def _snippet_around(text: str, query: str, max_chars: int = 500) -> str:
+        """A snippet CENTRED on the query, not on the head of the chunk.
+
+        P0-11 G4-c: the snippet must contain the 原话 the query found. A
+        head-truncated snippet shows the first N characters of the chunk,
+        which for a front-matter-carrying markdown file is the front-matter
+        — so the words that matched were cut off and the caller saw
+        metadata instead of the text they asked for.
+
+        The window is placed around the first place the query's own
+        characters appear. For CJK the query is segmented the same way the
+        matcher segments it, so a two-character Chinese word is found too.
+        When nothing is found (the match came from the vector path or from
+        a word the segmenter dropped), the head is shown — the old
+        behaviour, which is still better than nothing.
+        """
+        if not text:
+            return ""
+        if len(text) <= max_chars:
+            return text
+        haystack = text.lower()
+        position = -1
+        needle = (query or "").strip().lower()
+        if needle:
+            position = haystack.find(needle)
+        if position < 0:
+            # Fall back to the segmenter's windows: a CJK query matches
+            # through a sliding window, so the whole query string may not
+            # appear even though a window of it does.
+            for group in _query_groups(query or ""):
+                for window in group.windows:
+                    pos = haystack.find(window.lower())
+                    if pos >= 0:
+                        position = pos
+                        break
+                if position >= 0:
+                    break
+        if position < 0:
+            return text[:max_chars] + "..."
+        half = max_chars // 2
+        start = max(0, position - half)
+        end = min(len(text), start + max_chars)
+        start = max(0, end - max_chars)
+        snippet = text[start:end]
+        if start > 0:
+            snippet = "..." + snippet
+        if end < len(text):
+            snippet = snippet + "..."
+        return snippet
 
     def _search_like(
         self,
@@ -1214,7 +1314,7 @@ class MemoryStorage:
                     start_line=row['start_line'],
                     end_line=row['end_line'],
                     score=score,
-                    snippet=self._truncate_text(row['text'], 500),
+                    snippet=self._snippet_around(row['text'], query, 500),
                     source=row['source'],
                     user_id=row['user_id']
                 ))
@@ -1290,7 +1390,7 @@ class MemoryStorage:
                     start_line=row['start_line'],
                     end_line=row['end_line'],
                     score=0.3 + 0.55 * quality,
-                    snippet=self._truncate_text(row['text'], 500),
+                    snippet=self._snippet_around(row['text'], query, 500),
                     source=row['source'],
                     user_id=row['user_id']
                 ))
@@ -1378,6 +1478,51 @@ class MemoryStorage:
             "SELECT DISTINCT path FROM chunks WHERE source = ?", (source,)
         ).fetchall()
         return [row['path'] for row in rows]
+
+    def apply_release_projection(self, released_paths: set,
+                                 sealed_paths: set) -> int:
+        """Re-stamp the release flags of every indexed row from the truth layer.
+
+        P0-11 P-2 (RR-04): the flags on a chunk row are a PROJECTION of the
+        truth layer, and two things move them without the file's bytes
+        changing:
+
+          * a file released AFTER it was indexed — WR-11 keeps the old bytes
+            untouched, so the scan never re-indexes it, and without this
+            the released content stays retrievable forever;
+          * a file that sealed itself after it was indexed — same story.
+
+        So the flags are refreshed from the DISK (the authority) against the
+        rows that exist, and only rows whose flag actually changed are
+        written. Returns the number of rows changed.
+        """
+        try:
+            rows = self.conn.execute(
+                "SELECT DISTINCT path, element_released, file_sealed FROM chunks"
+            ).fetchall()
+        except Exception:
+            return 0
+        updates = []
+        for row in rows:
+            path = row["path"]
+            want_released = 1 if path in released_paths else 0
+            want_sealed = 1 if path in sealed_paths else 0
+            if (int(row["element_released"] or 0) == want_released
+                    and int(row["file_sealed"] or 0) == want_sealed):
+                continue
+            updates.append((want_released, want_sealed, path))
+        if not updates:
+            return 0
+        with self._lock:
+            try:
+                self.conn.executemany(
+                    "UPDATE chunks SET element_released = ?, file_sealed = ? "
+                    "WHERE path = ?", updates)
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+        return len(updates)
 
     def update_file_metadata(self, path: str, source: str, file_hash: str, mtime: int, size: int):
         """Update file metadata"""
@@ -1522,7 +1667,9 @@ class MemoryStorage:
             return []
 
         scope_placeholders = ','.join('?' * len(scopes))
-        vis_sql, vis_params = visibility_clause(user_id, "chunks.scope", "chunks.user_id")
+        vis_sql, vis_params = visibility_clause(
+            user_id, "chunks.scope", "chunks.user_id",
+            "chunks.element_released", "chunks.file_sealed")
         sql = f"""
             SELECT chunks.*, bm25(chunks_fts_trigram) as rank
             FROM chunks_fts_trigram
@@ -1552,7 +1699,7 @@ class MemoryStorage:
                     start_line=row['start_line'],
                     end_line=row['end_line'],
                     score=score * factor,
-                    snippet=self._truncate_text(text, 500),
+                    snippet=self._snippet_around(text, query, 500),
                     source=row['source'],
                     user_id=row['user_id']
                 ))
