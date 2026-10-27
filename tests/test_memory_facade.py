@@ -829,7 +829,11 @@ import sqlite3
 import threading
 from pathlib import Path
 
-from agent.memory.storage import MemorySchemaError, MemoryStorage
+from agent.memory.storage import (
+    MemorySchemaError,
+    MemoryStorage,
+    _query_groups,
+)
 
 
 def _stale_index(tmp_path, drop_columns=("sealed_owner",)):
@@ -1069,3 +1073,332 @@ def test_b2_the_manager_propagates_the_schema_failure(tmp_path):
                 asyncio.run(mgr.search("FTS5", max_results=5, min_score=0.0))
     finally:
         mgr.storage.close()
+
+
+# --- P0-18 L-1 / L-2 / R4 / R5 -----------------------------------------
+#
+# L-1: the relaxed search path referenced an undefined name, so every
+#      relaxed search that found a row raised NameError.
+# L-2: the relaxed path was called WITHOUT the owner axis, so the sealed
+#      branch of the predicate degraded to the constant (0) and the owner
+#      could not read their own dark page through it.
+# R4:  the vector path raised a raw sqlite3 error while the keyword path
+#      raised MemorySchemaError — a half-written contract.
+# R5:  the orphaned dark pages (owner in the pre-P0-16 user_id column,
+#      NULL in sealed_owner) got their owner back.
+
+def _two_group_index(tmp_path):
+    """An index whose rows make the RELAXED path reachable.
+
+    Two groups in one query ("alpha beta") and NO row carries both, so the
+    strict AND finds nothing and the relaxed path runs. That is the path
+    L-1 killed.
+    """
+    db = tmp_path / "index.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE chunks (id TEXT PRIMARY KEY, user_id TEXT, "
+        "scope TEXT NOT NULL DEFAULT 'shared', source TEXT NOT NULL DEFAULT 'memory', "
+        "path TEXT NOT NULL, start_line INTEGER NOT NULL, end_line INTEGER NOT NULL, "
+        "text TEXT NOT NULL, embedding TEXT, hash TEXT NOT NULL, metadata TEXT, "
+        "created_at INTEGER, updated_at INTEGER, "
+        "hit_count INTEGER NOT NULL DEFAULT 0, last_hit_at INTEGER, "
+        "element_released INTEGER NOT NULL DEFAULT 0, "
+        "file_sealed INTEGER NOT NULL DEFAULT 0, sealed_owner TEXT)")
+    conn.execute(
+        "INSERT INTO chunks (id, user_id, scope, source, path, start_line, "
+        "end_line, text, hash) VALUES "
+        "('c-alpha', NULL, 'shared', 'memory', 'memory/alpha.md', 1, 1, "
+        "'alpha 内容 alpha', 'h1'), "
+        "('c-beta', NULL, 'shared', 'memory', 'memory/beta.md', 1, 1, "
+        "'beta 内容 beta', 'h2')")
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_l1_the_relaxed_path_no_longer_raises_name_error(tmp_path):
+    """L-1: a relaxed search that finds rows must RETURN them.
+
+    It used to raise NameError on the first row, which P0-17 turned from
+    a silent empty result into a user-visible crash (the except clause
+    was narrowed to sqlite3.Error, so NameError was no longer swallowed).
+    """
+    db = _two_group_index(tmp_path)
+    storage = _unmigrated_storage(db)
+    try:
+        results = storage._search_like("alpha beta", None,
+                                       ["shared", "user", "sealed"], 5)
+        assert results, "the relaxed path found nothing"
+        paths = {r.path for r in results}
+        assert "memory/alpha.md" in paths
+        assert "memory/beta.md" in paths
+    finally:
+        storage.close()
+
+
+def test_l1_the_relaxed_path_returns_a_snippet_around_the_query(tmp_path):
+    """L-1: the snippet is cut around the ORIGINAL query.
+
+    The query is what the function had no access to, and it is what
+    makes the snippet show the matched words instead of the head of the
+    chunk.
+    """
+    db = _two_group_index(tmp_path)
+    storage = _unmigrated_storage(db)
+    try:
+        results = storage._search_like("alpha beta", None,
+                                       ["shared", "user", "sealed"], 5)
+        alpha = [r for r in results if r.path == "memory/alpha.md"]
+        assert alpha, "the alpha row is missing"
+        assert "alpha" in alpha[0].snippet
+    finally:
+        storage.close()
+
+
+def test_l1_reverse_a_single_group_query_is_unchanged(tmp_path):
+    """L-1 REVERSE: the common case (one group) behaves exactly as before.
+
+    A single group never reaches the relaxed path, so this guards against
+    the fix changing the path that everybody uses.
+    """
+    db = _two_group_index(tmp_path)
+    storage = _unmigrated_storage(db)
+    try:
+        results = storage._search_like("alpha", None,
+                                       ["shared", "user", "sealed"], 5)
+        assert len(results) == 1
+        assert results[0].path == "memory/alpha.md"
+        assert results[0].snippet == "alpha 内容 alpha"
+    finally:
+        storage.close()
+
+
+def test_l1_reverse_a_query_that_matches_nothing_still_returns_empty(tmp_path):
+    """L-1 REVERSE: no match is still an empty result, not an error."""
+    db = _two_group_index(tmp_path)
+    storage = _unmigrated_storage(db)
+    try:
+        results = storage._search_like("nothingmatchesthis", None,
+                                       ["shared", "user", "sealed"], 5)
+        assert results == []
+    finally:
+        storage.close()
+
+
+def test_l2_the_relaxed_path_carries_the_owner_axis(tmp_path):
+    """L-2: the relaxed path must see the owner axis.
+
+    It used to be called without owner_tokens, so the sealed branch of the
+    predicate was the constant (0) and the owner could not read their own
+    dark page through the relaxed path while the strict path could. Two
+    paths, one rule, two answers.
+    """
+    db = _two_group_index(tmp_path)
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "INSERT INTO chunks (id, user_id, scope, source, path, start_line, "
+        "end_line, text, hash, element_released, file_sealed, sealed_owner) "
+        "VALUES ('c-dark', NULL, 'sealed', 'memory', 'memory/dark.md', 1, 1, "
+        "'gamma dark gamma', 'h3', 0, 1, 'agent--agent-alice')")
+    conn.commit()
+    conn.close()
+
+    storage = _unmigrated_storage(db)
+    try:
+        scopes = ["shared", "user", "sealed"]
+        owner = ["agent--agent-alice"]
+        # "gamma zzznotfound" is two groups and no row carries both, so the
+        # strict AND finds nothing and the RELAXED path runs. The relaxed
+        # path must find the dark page — before L-2 it lost the owner axis
+        # and could not.
+        results = storage._search_like("gamma zzznotfound", None, scopes, 5,
+                                       None, owner)
+        assert results, "the relaxed path found nothing"
+        assert any(r.path == "memory/dark.md" for r in results), (
+            "the owner cannot see their own dark page through the "
+            "relaxed path — the owner axis was dropped")
+    finally:
+        storage.close()
+
+
+def test_l2_reverse_the_two_paths_agree_on_visibility(tmp_path):
+    """L-2 REVERSE: the strict and the relaxed path answer identically.
+
+    Same data, same identity, same rule -> the same set of visible rows.
+    A path that lets through what the other rejects is a permission bug,
+    not a ranking difference.
+    """
+    db = _two_group_index(tmp_path)
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "INSERT INTO chunks (id, user_id, scope, source, path, start_line, "
+        "end_line, text, hash, element_released, file_sealed, sealed_owner) "
+        "VALUES ('c-dark', NULL, 'sealed', 'memory', 'memory/dark.md', 1, 1, "
+        "'alpha dark alpha', 'h3', 0, 1, 'agent--agent-bob')")
+    conn.commit()
+    conn.close()
+
+    storage = _unmigrated_storage(db)
+    try:
+        scopes = ["shared", "user", "sealed"]
+        # The caller holds agent--agent-alice, but the dark page belongs
+        # to agent--agent-bob -> nobody may see it, through either path.
+        for owners in (["agent--agent-alice"], []):
+            groups = _query_groups("alpha zzznotfound")
+            strict = storage._search_like("alpha zzznotfound", None, scopes, 5,
+                                           None, owners)
+            relaxed = storage._search_like_relaxed(
+                groups, None, scopes, 5, identities=None,
+                owner_tokens=owners, query="alpha zzznotfound")
+            strict_paths = {r.path for r in strict}
+            relaxed_paths = {r.path for r in relaxed}
+            assert "memory/dark.md" not in strict_paths, (
+                "the strict path leaked another agent's dark page")
+            assert "memory/dark.md" not in relaxed_paths, (
+                "the relaxed path leaked another agent's dark page")
+            assert strict_paths == relaxed_paths, (
+                "the two paths disagree: strict=%s relaxed=%s"
+                % (strict_paths, relaxed_paths))
+    finally:
+        storage.close()
+
+
+def test_r4_the_vector_path_raises_the_same_schema_error(tmp_path):
+    """R4: both retrieval paths raise MemorySchemaError.
+
+    A caller that writes ``except MemorySchemaError:`` around a retrieval
+    call must catch the vector path too. It used to raise a raw
+    sqlite3.OperationalError, so the handler let it through.
+    """
+    db = tmp_path / "index.db"
+    storage = MemoryStorage(db)
+    try:
+        # Break the index the way a schema drift breaks it.
+        storage.conn.execute("DROP TABLE chunks")
+        storage.conn.commit()
+        with pytest.raises(MemorySchemaError):
+            storage.search_vector([0.1, 0.2], scopes=["shared"])
+    finally:
+        storage.close()
+
+
+def test_r4_reverse_a_non_structural_error_is_not_wrapped(tmp_path):
+    """R4 REVERSE: an argument problem is not a schema problem.
+
+    Wrapping it would tell the caller "the index is broken" when the
+    index is fine, and would send the caller looking in the wrong place.
+    """
+    db = tmp_path / "index.db"
+    storage = MemoryStorage(db)
+    try:
+        try:
+            storage.search_vector(["not-a-number"], scopes=["shared"])
+        except MemorySchemaError as e:
+            pytest.fail(
+                "a malformed embedding was reported as a schema error: %s" % e)
+        except Exception:
+            pass  # any non-schema exception is acceptable here
+    finally:
+        storage.close()
+
+
+def _legacy_dark_rows(db):
+    """The three legacy row shapes, as they sit on disk.
+
+    L1 is the shape P0-16 left behind: the owner token is in ``user_id``
+    (where the pre-P0-16 build put it) and ``sealed_owner`` is NULL.
+    L2 is an end-user id in the sealed scope — it must NOT be backfilled.
+    L3 is an ordinary row that happens to carry a token-shaped user_id.
+    """
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "INSERT INTO chunks (id, user_id, scope, source, path, start_line, "
+        "end_line, text, hash, element_released, file_sealed, sealed_owner) "
+        "VALUES "
+        "('L1', 'agent--agent-alice', 'sealed', 'memory', 'memory/L1.md', 1, 1, "
+        "'DARKPAGE legacy alpha', 'hL1', 0, 1, NULL), "
+        "('L2', 'wangjingjing', 'sealed', 'memory', 'memory/L2.md', 1, 1, "
+        "'DARKPAGE legacy beta', 'hL2', 0, 1, NULL), "
+        "('L3', 'agent--agent-alice', 'shared', 'memory', 'memory/L3.md', 1, 1, "
+        "'ORDINARY row gamma', 'hL3', 0, 0, NULL)")
+    conn.commit()
+    conn.close()
+
+
+def test_r5_the_backfill_restores_the_orphaned_dark_page(tmp_path):
+    """R5: a dark page whose owner is only in user_id gets it back."""
+    from agent.memory.schema_migrate import backfill_sealed_owner
+
+    db = tmp_path / "index.db"
+    storage = MemoryStorage(db)
+    storage.close()
+    _legacy_dark_rows(db)
+
+    changed = backfill_sealed_owner(db)
+    assert changed == 1, "exactly one row should have been backfilled"
+
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    rows = {r["id"]: r for r in conn.execute(
+        "SELECT id, user_id, scope, sealed_owner FROM chunks")}
+    conn.close()
+    assert rows["L1"]["sealed_owner"] == "agent--agent-alice", (
+        "the orphaned dark page did not get its owner back")
+    assert rows["L2"]["sealed_owner"] is None, (
+        "an END USER id was backfilled into the owner axis — that crosses "
+        "the two axes")
+    assert rows["L3"]["sealed_owner"] is None, (
+        "an ordinary row acquired an owner it never had")
+
+
+def test_r5_reverse_the_backfill_never_touches_the_end_user_axis(tmp_path):
+    """R5 REVERSE: the end-user axis stays out of the owner axis.
+
+    An end-user id that happens to look like an owner token must never be
+    treated as one. That is the L-5 two-axis separation, and it is a red
+    line rather than a heuristic.
+    """
+    from agent.memory.schema_migrate import backfill_sealed_owner
+
+    db = tmp_path / "index.db"
+    storage = MemoryStorage(db)
+    storage.close()
+    _legacy_dark_rows(db)
+    backfill_sealed_owner(db)
+
+    storage = MemoryStorage(db)
+    try:
+        scopes = ["shared", "user", "sealed"]
+        # The end user who owns the L2 row must not read it through the
+        # owner axis, and the owner must not read it either (its owner was
+        # never known).
+        as_end_user = storage.search_keyword(
+            "DARKPAGE legacy", scopes=scopes, identities=["wangjingjing"])
+        assert not any(r.path == "memory/L2.md" for r in as_end_user), (
+            "the end user read a dark page whose owner is unknown")
+        as_owner = storage.search_keyword(
+            "DARKPAGE legacy", scopes=scopes,
+            owner_tokens=["agent--agent-alice"])
+        paths = {r.path for r in as_owner}
+        assert "memory/L1.md" in paths, (
+            "the owner cannot read the dark page the backfill repaired")
+        assert "memory/L2.md" not in paths, (
+            "a dark page with an unknown owner became visible")
+    finally:
+        storage.close()
+
+
+def test_r5_reverse_the_backfill_is_idempotent(tmp_path):
+    """R5 REVERSE: running it twice changes nothing the second time."""
+    from agent.memory.schema_migrate import backfill_sealed_owner
+
+    db = tmp_path / "index.db"
+    storage = MemoryStorage(db)
+    storage.close()
+    _legacy_dark_rows(db)
+
+    first = backfill_sealed_owner(db)
+    second = backfill_sealed_owner(db)
+    assert first == 1
+    assert second == 0, "the backfill is not idempotent"

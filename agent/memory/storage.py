@@ -1156,7 +1156,22 @@ class MemoryStorage:
         identities: Optional[List[str]] = None,
         owner_tokens: Optional[List[str]] = None,
     ) -> List[SearchResult]:
-        """Search the configured vector backend."""
+        """Search the configured vector backend.
+
+        P0-18 R4: the exception contract is the SAME as the keyword path's.
+        A structural failure (the index is missing a column the visibility
+        predicate names, the table is gone, the file is damaged) raises
+        :class:`MemorySchemaError`, so a caller that writes
+        ``except MemorySchemaError:`` catches the vector path too. A
+        half-written contract is worse than none: the keyword path
+        promised a type, the vector path raised a raw
+        ``sqlite3.OperationalError``, and the caller's handler let it
+        through.
+
+        A failure that is NOT structural (a malformed embedding, a wrong
+        argument type) is left alone — wrapping it would tell the caller
+        "the index is broken" when the index is fine.
+        """
         if scopes is None:
             scopes = ["shared"]
             if user_id or identities or owner_tokens:
@@ -1169,11 +1184,20 @@ class MemoryStorage:
             metadata_filter["identities"] = list(identities)
         if owner_tokens:
             metadata_filter["owner_tokens"] = list(owner_tokens)
-        matches = self.vector_backend.search(
-            query_embedding,
-            limit=limit,
-            metadata_filter=metadata_filter,
-        )
+        try:
+            matches = self.vector_backend.search(
+                query_embedding,
+                limit=limit,
+                metadata_filter=metadata_filter,
+            )
+        except sqlite3.Error as e:
+            from common.log import logger
+            logger.error(
+                "[MemoryStorage] search_vector failed (structural error, "
+                "refusing to report an empty result): %s", e, exc_info=True)
+            raise MemorySchemaError(
+                f"[MemoryStorage] vector search failed on {self.db_path}: {e}"
+            ) from e
         return [
             SearchResult(
                 path=match.metadata["path"],
@@ -1478,8 +1502,25 @@ class MemoryStorage:
                 # The relaxed hits are scored against the FULL group list, so
                 # a page matching only one part of a three-part question
                 # still scores lower than one matching more of it.
+                #
+                # P0-18 L-2: the OWNER AXIS must travel with the call. The
+                # relaxed path used to be called without owner_tokens, so the
+                # sealed branch of the predicate degraded to the constant
+                # ``(0)`` — the owner could not read their own dark page
+                # through this path while the strict path could. Two paths,
+                # one rule, two answers.
+                #
+                # P0-18 L-1: ``query=`` is passed BY KEYWORD, and it is the
+                # ORIGINAL query text. The relaxed function needs it to cut
+                # a snippet around the match; without it the function raised
+                # NameError on the first row it found (P0-17 narrowed the
+                # except clause to sqlite3.Error, which turned a silent
+                # empty result into a user-visible crash).
                 results = self._search_like_relaxed(
-                    groups, user_id, scopes, limit, identities
+                    groups, user_id, scopes, limit,
+                    identities=identities,
+                    owner_tokens=owner_tokens,
+                    query=query,
                 )
 
             results.sort(key=lambda r: r.score, reverse=True)
@@ -1503,6 +1544,7 @@ class MemoryStorage:
         limit: int,
         identities: Optional[List[str]] = None,
         owner_tokens: Optional[List[str]] = None,
+        query: str = "",
     ) -> List[SearchResult]:
         """Per-group LIKE search, used when the ANDed query matched nothing.
 
@@ -1510,6 +1552,20 @@ class MemoryStorage:
         still uses every group, so a relaxed hit that covers more of the
         question outranks one that covers less — the relaxation widens the
         candidate set, it does not flatten the ranking.
+
+        P0-18 L-1: ``query`` is the ORIGINAL query text, and it is REQUIRED
+        for anything that reaches the row loop: the snippet is cut around
+        the query, and the function has no other way to know what the
+        caller asked for. It used to reference an undefined name of that
+        spelling, so every relaxed search that found a row raised NameError.
+        It defaults to ``""`` (the snippet then falls back to the head of
+        the chunk) rather than being mandatory, so a caller that genuinely
+        has no text to offer still gets results instead of a TypeError.
+
+        P0-18 L-2: ``owner_tokens`` is the OWNER AXIS and it must be passed
+        through unchanged. The strict path and this path answer the same
+        question with the same rule; a caller that reads one of them must
+        not get a different answer from the other.
         """
         scope_placeholders = ','.join('?' * len(scopes))
         seen = set()
