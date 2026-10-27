@@ -111,6 +111,24 @@ IMMUTABLE_FM_FIELDS = frozenset({
     "released_at", "consent_ref", "fm_hash", "slug", "hash8", "author_viewpoint",
 })
 
+# ---------------------------------------------------------------------------
+# subject 合法值域（P0-4 打回修复新增，P0-3 WR-19 的前提）
+#
+# 真人档案（entities/people/）的 subject **必须是真人 slug**——当前唯一被
+# 认可的真人 subject 是 "peiqi"（沛琦，体系内唯一真人档案主体，见 P0-1 §一
+# 裁定与 P0-3 §四）。目录 agents/ 下的任何 agent id 都**不得**成为 people/
+# 容器档案的 subject；agent 自身的记忆归属由 events/letters/relations/ 的
+# subject = actor 默认承载，不建 people/ 档案。这条约束是 WR-19/WR-20 的
+# 根基——真人档案释放走"peiqi 专属 + 二次确认"，前提是"是不是真人档案"
+# 这个判定本身不可被写入参数伪造。
+#
+# 新增真人主体（如未来的家庭成员）的正规路径：先由沛琦拍板扩充
+# HUMAN_PROFILE_SUBJECTS，再建档案；写入路径不接受临时发明 subject。
+#
+# events/letters/relations 的 subject 恒 = actor（门面注入，调用方不可
+# 指定）；跨主体的提及进 tags/refs，不动 subject。
+HUMAN_PROFILE_SUBJECTS = frozenset({"peiqi"})
+
 # Subdirectories the facade governs, relative to the actor's memory root.
 MANAGED_SUBDIRS = (
     "facts", "markdown/events", "markdown/entities",
@@ -470,6 +488,37 @@ class WriteFacade:
                 f"actor is the runtime identity {self.actor!r}"
             )
 
+    def _sanitize_editable(self, editable: Dict[str, Any],
+                           container: str) -> Dict[str, Any]:
+        """THE single editable-field filter for every element-creating entry
+        (write_event / write_letter / write_entity / revise / _execute_release
+        internals). P0-4 fix: before this method existed, only raw ``write()``
+        filtered the front-matter ``frontmatter`` dict, while the structured
+        entries passed ``**editable`` straight into ``_new_element`` — so
+        ``subject``/``status``/``released``/``released_by``/``consent_ref``
+        could be forged, and ``_is_human_profile`` (which keys on subject)
+        could be cheated into releasing a human profile without WR-19/WR-20.
+
+        One function, one rule set, called from one place (_new_element):
+          1. identity-claiming params (总纲第 2 条);
+          2. any IMMUTABLE_FM_FIELDS key the caller tried to smuggle in →
+             ImmutableFieldError (WR-09). This INCLUDES ``subject`` — callers
+             never name a subject; the facade injects actor (or carries the
+             old file's subject on revise/release, domain-checked against
+             HUMAN_PROFILE_SUBJECTS for people/ profiles). See the
+             HUMAN_PROFILE_SUBJECTS comment for the subject value domain.
+        Returns a cleaned dict safe for _new_element to consume.
+        """
+        self._reject_actor_params(editable)
+        bad = IMMUTABLE_FM_FIELDS & editable.keys()
+        if bad:
+            raise ImmutableFieldError(
+                f"front-matter fields {sorted(bad)} are facade-injected and may "
+                f"not be passed through editable (WR-09); 'edit' of them means "
+                f"a new version via revise() / release()"
+            )
+        return dict(editable)
+
     # -- naming (WR-07, same algorithm as scripts/memory/validate_names.py) --
 
     def _check_target_name(self, real: Path, relpath: str) -> None:
@@ -688,10 +737,33 @@ class WriteFacade:
         released_by: Optional[str] = None,
         consent_ref: Optional[str] = None,
         recorded_at: Optional[str] = None,
+        carry: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Path, Dict[str, Any]]:
-        """Build fm + file for a new element (or new version of one)."""
+        """Build fm + file for a new element (or new version of one).
+
+        ``editable`` passes through ``_sanitize_editable`` HERE, at the single
+        choke point all four public entries (write_event/write_letter/
+        write_entity/revise) and the release machinery funnel into — so no
+        caller can reach file creation with unfiltered fields (P0-4 fix).
+        """
+        editable = self._sanitize_editable(editable, container)
+        # ``carry`` is the TRUSTED channel for immutable fields carried
+        # forward from an existing on-disk front-matter (revise/release use
+        # it; public callers never see it). It bypasses _sanitize_editable by
+        # construction — the source is a file the facade itself wrote.
+        carry = carry or {}
+        subject = carry.get("subject")
+        if subject is not None and container == "entities/people":
+            # Even the trusted carry channel is domain-checked for people/
+            # profiles: the WR-19/WR-20 release gate keys on this value, so
+            # it must never be attestable to an agent id.
+            if subject not in HUMAN_PROFILE_SUBJECTS:
+                raise ImmutableFieldError(
+                    f"people/ profile subject must be a recognized human slug "
+                    f"{sorted(HUMAN_PROFILE_SUBJECTS)}, got {subject!r}"
+                )
         layer = LAYER_BY_CONTAINER[container]
-        occurred_at = editable.get("occurred_at") or _utc8_now()
+        occurred_at = carry.get("occurred_at") or _utc8_now()
         rec = recorded_at or _utc8_now()
         # WR-10 internal assertions (facade self-checks, a failure = our bug).
         if occurred_at > rec:
@@ -700,10 +772,10 @@ class WriteFacade:
             )
         fm: Dict[str, Any] = {
             "layer": layer,
-            "type": editable.get("type", "conversation"),
+            "type": carry.get("type") or editable.get("type", "conversation"),
             "title": title,
             "tags": list(editable.get("tags", [])),
-            "subject": editable.get("subject", self.actor),
+            "subject": carry.get("subject") or self.actor,
             "refs": list(editable.get("refs", [])),
             "occurred_at": occurred_at,
             "recorded_at": rec,
@@ -737,9 +809,12 @@ class WriteFacade:
 
     def write_event(self, slug: str, title: str, body: str,
                     date: Optional[str] = None, **editable: Any) -> Path:
+        """Create an event. ``editable`` carries ONLY caller-editable fields
+        (title/tags/refs/density/visibility); immutable fm fields (subject,
+        status, released, ...) are rejected by the shared _sanitize_editable
+        filter inside _new_element (P0-4 fix). subject always = actor."""
         date = date or _utc8_now()[:10]
         try:
-            self._reject_actor_params(editable)
             real, _ = self._new_element(
                 "events", slug=slug, title=title, body=body,
                 editable=editable, date=date)
@@ -751,7 +826,6 @@ class WriteFacade:
                      date: Optional[str] = None, **editable: Any) -> Path:
         date = date or _utc8_now()[:10]
         try:
-            self._reject_actor_params(editable)
             real, _ = self._new_element(
                 "letters", slug=slug, title=title, body=body,
                 editable=editable, date=date)
@@ -760,14 +834,30 @@ class WriteFacade:
         return real
 
     def write_entity(self, kind: str, slug: str, title: str, body: str,
+                     *, subject: Optional[str] = None,
                      **editable: Any) -> Path:
+        """Create a person/relation profile.
+
+        ``subject`` is a dedicated, audited parameter (not part of the
+        free-form editable dict) and only meaningful for people/ profiles,
+        where it MUST be in HUMAN_PROFILE_SUBJECTS — an agent id or an
+        unknown human slug is rejected. Default subject = actor.
+        """
         if kind not in ("people", "relations"):
             raise ValueError("kind must be 'people' or 'relations'")
         try:
-            self._reject_actor_params(editable)
+            if subject is not None:
+                if kind != "people" or subject not in HUMAN_PROFILE_SUBJECTS:
+                    raise ImmutableFieldError(
+                        f"entity subject must be in "
+                        f"{sorted(HUMAN_PROFILE_SUBJECTS)} for people/ "
+                        f"profiles (got {subject!r}); agents never own "
+                        f"people/ profiles and relations/ subject = actor"
+                    )
             real, _ = self._new_element(
                 f"entities/{kind}", slug=slug, title=title, body=body,
-                editable=editable)
+                editable=editable,
+                carry={"subject": subject} if subject else None)
         except FacadeError as e:
             raise self._reject(e, "write_entity", f"entities/{kind}/{slug}")
         return real
@@ -803,8 +893,15 @@ class WriteFacade:
     def revise(self, old_relpath: str, *, body: str,
                revision: Optional[int] = None,
                **editable: Any) -> Path:
+        """'Edit' = a new version file; old bytes untouched (WR-11).
+
+        P0-4 fix: immutable fm fields (subject/status/released/...) are
+        carried forward from the OLD front-matter by explicit whitelist — the
+        caller's ``editable`` may only hold caller-editable fields and goes
+        through the same _sanitize_editable filter as every other entry. A
+        revise() that tries to rename the subject (同名变体攻击) is rejected.
+        """
         try:
-            self._reject_actor_params(editable)
             old_real = self._resolve(old_relpath)
             if not old_real.is_file():
                 raise FileNotFoundError(old_relpath)
@@ -821,18 +918,21 @@ class WriteFacade:
             date = parts[-2] if _DATE_RE.match(parts[-2]) else None
             slug = fm.get("slug") or old_real.name.split("--")[0]
             rev = revision or int(fm.get("version", 1)) + 1
+            # Carry-forward whitelist: these come from the old file, NEVER
+            # from caller kwargs. Everything in the caller's dict that is not
+            # caller-editable (title/tags/refs/density/visibility) raises
+            # ImmutableFieldError inside _sanitize_editable.
+            carried = {k: fm.get(k) for k in ("tags", "refs", "density",
+                                              "visibility")}
+            caller_editable = dict(editable)  # caller may override the above
+            caller_editable.setdefault("title", fm.get("title", slug))
+            merged = {**carried, **caller_editable}
             new_real, _fm = self._new_element(
                 container, slug=slug,
-                title=editable.pop("title", fm.get("title", slug)),
-                body=body, editable={**{
-                    "type": fm.get("type"),
-                    "tags": fm.get("tags", []),
-                    "subject": fm.get("subject"),
-                    "refs": fm.get("refs", []),
-                    "occurred_at": fm.get("occurred_at"),
-                    "density": fm.get("density", 3),
-                    "visibility": fm.get("visibility", "open"),
-                }, **editable},
+                title=merged.pop("title", fm.get("title", slug)),
+                body=body, editable=merged,
+                carry={"type": fm.get("type"), "subject": fm.get("subject"),
+                       "occurred_at": fm.get("occurred_at")},
                 date=date, revision=rev if rev > 1 else None,
                 supersedes=[fm["id"]], version=int(fm.get("version", 1)) + 1,
             )
@@ -996,8 +1096,8 @@ class WriteFacade:
             ev_real, _ = self._new_element(
                 "events", slug=f"release-{slug}", title=f"释放：{fm.get('title')}",
                 body=ev_body, date=today,
-                editable={"type": "release", "subject": fm.get("subject"),
-                          "tags": ["release"], "visibility": "sealed"},
+                editable={"tags": ["release"], "visibility": "sealed"},
+                carry={"type": "release", "subject": fm.get("subject")},
             )
             created.append(ev_real)
             # ② target new version with status=released
@@ -1012,11 +1112,12 @@ class WriteFacade:
             rev_real, rev_fm = self._new_element(
                 container, slug=slug,
                 title=fm.get("title", slug), body=orig_body,
-                editable={"type": fm.get("type"), "tags": fm.get("tags", []),
-                          "subject": fm.get("subject"), "refs": fm.get("refs", []),
-                          "occurred_at": fm.get("occurred_at"),
+                editable={"tags": fm.get("tags", []),
+                          "refs": fm.get("refs", []),
                           "density": fm.get("density", 3),
                           "visibility": "sealed"},
+                carry={"type": fm.get("type"), "subject": fm.get("subject"),
+                       "occurred_at": fm.get("occurred_at")},
                 date=date,
                 revision=int(fm.get("version", 1)) + 1,
                 supersedes=[fm["id"]], version=int(fm.get("version", 1)) + 1,
