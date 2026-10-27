@@ -422,8 +422,12 @@ class MemoryManager:
                 # self-loop where search results are full of summaries of
                 # summaries. facts/ is the append-only evidence room (JSONL,
                 # never .md today); it is referenced by pointer, not indexed.
+                # .snapshots/ + .audit/ are the inspector's own bookkeeping
+                # (baseline + report trail, P0-8) — same reason as shelf/.
                 # markdown/ stays indexed on purpose: it IS the truth layer.
-                if "shelf" in rel_parts or "facts" in rel_parts:
+                if ("shelf" in rel_parts or "facts" in rel_parts
+                        or ".snapshots" in rel_parts
+                        or ".audit" in rel_parts):
                     continue
                 try:
                     if "users" in rel_parts:

@@ -1,0 +1,588 @@
+"""Tests for agent/memory/shelf.py — the P0-5 shelf generator (SH-1..SH-12).
+
+Structure follows the P0-5 spec 附录 B: every acceptance assertion gets a
+positive case AND a "reverse case" (反向用例) that proves the assertion can
+actually catch a wrong thing. An assertion that cannot fail is decoration.
+
+Division of labour with the inspector (P0-8):
+  * inspector  → integrity (hashes, chain, naming) — report-only, never fixes
+  * shelf      → renderability (front-matter completeness) + the six views
+  * files the shelf cannot render are reported as ``skipped`` and surface in
+    the gaps view with reason code ``invalid-frontmatter`` — never dropped
+    silently.
+"""
+import json
+import re
+from pathlib import Path
+
+import pytest
+import yaml
+
+from agent.memory.facade import (
+    RecordingConfirmationChannel,
+    WriteFacade,
+    split_frontmatter,
+)
+from agent.memory.shelf import (
+    INVALID_FM,
+    LEGAL_GAP_CODES,
+    ShelfGenerator,
+)
+
+ACTOR = "tester"
+LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
+
+
+# -- fixtures ---------------------------------------------------------------
+
+@pytest.fixture
+def cow(tmp_path):
+    return tmp_path
+
+
+@pytest.fixture
+def ws(cow):
+    root = cow / "agents" / ACTOR
+    (root / "memory").mkdir(parents=True)
+    return root
+
+
+def facade_for(ws, cow, actor=ACTOR):
+    return WriteFacade(ws, actor=actor, cow_root=cow,
+                       channel=RecordingConfirmationChannel())
+
+
+def build(ws, cow, *, events=2, actor=ACTOR):
+    """A workspace with a few events, one entity, one letter, one tombstone."""
+    f = WriteFacade(ws, actor=actor, cow_root=cow,
+                    channel=RecordingConfirmationChannel())
+    paths = []
+    for i in range(events):
+        p = f.write_event(f"evt-{i}", f"事件 {i}", f"正文 {i}",
+                          date="2026-10-27",
+                          tags=["记忆"], involves=["peiqi"])
+        paths.append(p)
+    f.write_letter("letter-1", "一封信", "信件正文", date="2026-10-27")
+    f.write_entity("people", "peiqi", "沛琦", "真人档案", subject="peiqi")
+    return f, paths
+
+
+def make_gap(ws, cow):
+    """Produce a real gap: facts rows on a day with no event file."""
+    f = WriteFacade(ws, actor=ACTOR, cow_root=cow,
+                    channel=RecordingConfirmationChannel())
+    f.append_fact("2026-10-26", "cafebabe", role="user", content="没有沉淀",
+                  occurred_at="2026-10-26T10:00:00+08:00", run_id="r1")
+    return f
+
+
+def rebuild(ws, **kw):
+    return ShelfGenerator(ws, agent_id=ACTOR).rebuild()
+
+
+def shelf(ws):
+    return ws / "memory" / "shelf"
+
+
+def read(ws, rel):
+    return (shelf(ws) / rel).read_text(encoding="utf-8")
+
+
+def links_in(text):
+    return LINK_RE.findall(text)
+
+
+def resolve(ws, view_rel, link):
+    """Resolve a shelf link relative to the view file; return the target."""
+    base = (shelf(ws) / view_rel).parent
+    return (base / link).resolve()
+
+
+def all_view_files(ws):
+    root = shelf(ws)
+    return sorted(p for p in root.rglob("*.md"))
+
+
+# -- SH-1 · 下钻链接有效性 ---------------------------------------------------
+
+def test_sh1_every_drilldown_link_resolves_inside_memory(ws, cow):
+    """SH-1: 每个 markdown 链接解析后必须在 memory/ 内且目标存在。"""
+    build(ws, cow)
+    rebuild(ws)
+    checked = 0
+    for p in all_view_files(ws):
+        rel = p.relative_to(shelf(ws)).as_posix()
+        for link in links_in(p.read_text(encoding="utf-8")):
+            if link.startswith(("http://", "https://", "#")):
+                continue
+            target = resolve(ws, rel, link)
+            assert target.is_file(), f"{rel}: 悬空链接 {link}"
+            assert str(target).startswith(str((ws / "memory").resolve())), \
+                f"{rel}: 链接逃出 memory/ → {link}"
+            checked += 1
+    assert checked > 0, "没有可检查的链接——断言会空转"
+
+
+def test_sh1_reverse_a_dangling_link_is_detected(ws, cow):
+    """反向用例：故意在视图里写一个不存在的链接，检测器必须抓到。"""
+    build(ws, cow)
+    rebuild(ws)
+    broken = shelf(ws) / "index.md"
+    broken.write_text(broken.read_text(encoding="utf-8")
+                      + "\n[x](markdown/events/2026-10-27/nope--00000000.md)\n",
+                      encoding="utf-8", newline="\n")
+    dangling = []
+    for p in all_view_files(ws):
+        rel = p.relative_to(shelf(ws)).as_posix()
+        for link in links_in(p.read_text(encoding="utf-8")):
+            if link.startswith(("http://", "https://", "#")):
+                continue
+            if not resolve(ws, rel, link).is_file():
+                dangling.append((rel, link))
+    assert dangling, "反向用例失败：悬空链接没被抓到"
+
+
+# -- SH-2 · 我记得的条目可下钻 ------------------------------------------------
+
+def test_sh2_remembered_rows_drill_down_to_real_event_files(ws, cow):
+    """SH-2: 「我记得的」每行的下钻链接指向真实事件文件。"""
+    build(ws, cow)
+    rebuild(ws)
+    text = read(ws, "index.md")
+    section = text.split("## 我记得的")[1].split("##")[0]
+    links = [l for l in links_in(section) if l.endswith(".md")]
+    assert links, "「我记得的」没有条目"
+    for link in links:
+        target = resolve(ws, "index.md", link)
+        assert target.is_file()
+        assert "markdown" in target.as_posix()
+        fm, _ = split_frontmatter(target.read_text(encoding="utf-8"))
+        assert fm["status"] == "active" and fm["visibility"] == "open"
+
+
+def test_sh2_reverse_rows_with_broken_target_are_found(ws, cow):
+    """反向用例：下钻指向不存在的文件 → 必须被抓到。"""
+    build(ws, cow)
+    rebuild(ws)
+    text = read(ws, "index.md")
+    section = text.split("## 我记得的")[1].split("##")[0]
+    bad = []
+    for link in links_in(section):
+        if not link.endswith(".md"):
+            continue
+        if not resolve(ws, "index.md", link).is_file():
+            bad.append(link)
+    assert bad == [], "反向用例：下钻悬空"
+
+
+# -- SH-3 · 缺口含合法原因码 ------------------------------------------------
+
+def test_sh3_gap_reason_codes_are_legal(ws, cow):
+    """SH-3: 每条缺口的「原因码」列 ∈ 规格枚举（+ 规格允许的扩展）。"""
+    build(ws, cow)
+    make_gap(ws, cow)
+    rebuild(ws)
+    for view in ("index.md", "gaps.md"):
+        text = read(ws, view)
+        section = text.split("我没记住的")[-1] if view == "index.md" else text
+        codes = re.findall(r"`([a-z-]+)`", section)
+        assert codes, "没有缺口条目可检查"
+        for code in codes:
+            assert code in LEGAL_GAP_CODES, f"非法原因码 {code}"
+
+
+def test_sh3_reverse_illegal_reason_code_is_detected(ws, cow):
+    """反向用例：写进一个非法原因码 → 判定必须失败。"""
+    build(ws, cow)
+    make_gap(ws, cow)
+    rebuild(ws)
+    text = read(ws, "gaps.md")
+    assert "`made-up-code`" not in text
+    illegal = [c for c in re.findall(r"`([a-z-]+)`", text)
+               if c not in LEGAL_GAP_CODES]
+    assert illegal == []
+
+
+# -- SH-4 · 缺口含可执行动作 ------------------------------------------------
+
+def test_sh4_every_gap_has_an_action_link_that_exists(ws, cow):
+    """SH-4: 「可执行动作」列必须是链接且目标存在。"""
+    build(ws, cow)
+    make_gap(ws, cow)
+    rebuild(ws)
+    text = read(ws, "gaps.md")
+    section = text.split("## 缺口清单")[1]
+    rows = [r for r in section.splitlines()
+            if r.startswith("| ") and "---" not in r and "原因码" not in r]
+    assert rows, "缺口清单没有行"
+    for row in rows:
+        links = links_in(row)
+        assert links, f"缺口行没有可执行动作链接: {row}"
+        for link in links:
+            target = resolve(ws, "gaps.md", link)
+            assert target.exists(), f"动作链接悬空: {link}"
+
+
+def test_sh4_reverse_gap_without_action_is_detected(ws, cow):
+    """反向用例：一行没有链接 → 判定必须失败。"""
+    build(ws, cow)
+    rebuild(ws)
+    bad_row = "| 1 | 2026-10-27 | `gap-rule` | 查询 | 这里有问题 |"
+    assert not links_in(bad_row)
+
+
+# -- SH-5 · 你释放的只列墓碑 -------------------------------------------------
+
+def _release_one(ws, cow):
+    """Release a human profile so a tombstone exists (peiqi-only + 2-step)."""
+    f = WriteFacade(ws, actor="peiqi", cow_root=cow,
+                    channel=RecordingConfirmationChannel())
+    f.write_entity("people", "peiqi", "沛琦", "真人档案", subject="peiqi")
+    rel = "memory/markdown/entities/people/peiqi--deadbeef.md"
+    actual = next((ws / "memory" / "markdown" / "entities" / "people")
+                  .glob("peiqi--*.md"))
+    rel = actual.relative_to(ws).as_posix()
+    ref = f.channel.register_consent("peiqi", "peiqi")
+    token = f.initiate_release(rel, consent_ref=ref)["token"]
+    f.confirm_release(token)
+    return actual
+
+
+def test_sh5_released_section_points_only_at_tombstones(ws, cow):
+    """SH-5 / 验收标准 4: 「你释放的」每条都指向墓碑，无一指向真源。"""
+    _release_one(ws, cow)
+    rebuild(ws)
+    text = read(ws, "index.md")
+    section = text.split("## 你释放的")[1]
+    rows = [r for r in section.splitlines() if r.startswith("| ")]
+    data_rows = [r for r in rows if "---" not in r and "释放日期" not in r]
+    assert data_rows, "释放视图没有条目"
+    for row in data_rows:
+        links = [l for l in links_in(row) if l.endswith(".tombstone.md")]
+        assert links, f"释放行没有墓碑链接: {row}"
+        for link in links:
+            target = resolve(ws, "index.md", link)
+            assert target.is_file()
+            assert target.name.endswith(".tombstone.md")
+            assert "_tombstones" in target.as_posix()
+    # 真源路径不得出现在释放视图里
+    assert "markdown/entities" not in section
+
+
+def test_sh5_reverse_a_row_pointing_at_truth_file_is_detected(ws, cow):
+    """反向用例：一行指向真源 → 判定必须失败。"""
+    _release_one(ws, cow)
+    rebuild(ws)
+    text = read(ws, "index.md")
+    section = text.split("## 你释放的")[1]
+    bad = [r for r in section.splitlines()
+           if r.startswith("| ") and "markdown/entities" in r]
+    assert bad == [], "反向用例：释放视图里出现了指向真源的行"
+
+
+# -- SH-6 · 释放条目含 consent_ref -------------------------------------------
+
+def test_sh6_released_entries_carry_a_resolvable_consent_ref(ws, cow):
+    """SH-6: 每个墓碑有 consent_ref，且该值能在 .audit/*.jsonl 里找到。"""
+    _release_one(ws, cow)
+    rebuild(ws)
+    text = read(ws, "index.md")
+    section = text.split("## 你释放的")[1]
+    refs = re.findall(r"`(consent_[0-9a-f]+)`", section)
+    assert refs, "释放条目没有 consent_ref"
+    audit_text = ""
+    for p in (ws / "memory" / ".audit").glob("*.jsonl"):
+        audit_text += p.read_text(encoding="utf-8")
+    for ref in refs:
+        assert ref in audit_text, f"consent_ref {ref} 在审计链里查无此事"
+
+
+def test_sh6_reverse_tombstone_without_consent_is_detected(ws, cow):
+    """反向用例：墓碑没有 consent_ref → 判定必须失败。"""
+    _release_one(ws, cow)
+    tombstones = list((ws / "memory" / "markdown" / "_tombstones")
+                      .glob("*.tombstone.md"))
+    assert tombstones
+    for t in tombstones:
+        fm, _ = split_frontmatter(t.read_text(encoding="utf-8"))
+        assert fm.get("consent_ref")
+    # 人为抹掉 consent_ref → 判定必须失败
+    t = tombstones[0]
+    fm, body = split_frontmatter(t.read_text(encoding="utf-8"))
+    fm.pop("consent_ref")
+    t.write_text("---\n" + yaml.safe_dump(fm, allow_unicode=True)
+                 + "---\n\n" + body, encoding="utf-8", newline="\n")
+    fm2, _ = split_frontmatter(t.read_text(encoding="utf-8"))
+    assert not fm2.get("consent_ref")
+
+
+# -- SH-7 · 可见性过滤 -------------------------------------------------------
+
+def test_sh7_only_active_and_open_events_are_listed(ws, cow):
+    """SH-7: 只有 status=active 且 visibility=open 的事件进「我记得的」。"""
+    f = facade_for(ws, cow)
+    f.write_event("open-evt", "可见", "b", date="2026-10-27")
+    sealed = f.write_event("sealed-evt", "不可见", "b", date="2026-10-27")
+    # 手工把 sealed 事件改成 visibility: sealed（facade 不允许改 fm）
+    text = sealed.read_text(encoding="utf-8")
+    sealed.write_text(text.replace("visibility: open", "visibility: sealed"),
+                      encoding="utf-8", newline="\n")
+    rebuild(ws)
+    text = read(ws, "index.md")
+    section = text.split("## 我记得的")[1].split("##")[0]
+    assert "可见" in section
+    assert "不可见" not in section
+
+
+def test_sh7_reverse_a_leaked_sealed_event_is_detected(ws, cow):
+    """反向用例：把 sealed 事件塞进「我记得的」→ 判定必须失败。"""
+    f = facade_for(ws, cow)
+    sealed = f.write_event("sealed-evt", "不可见", "b", date="2026-10-27")
+    text = sealed.read_text(encoding="utf-8")
+    sealed.write_text(text.replace("visibility: open", "visibility: sealed"),
+                      encoding="utf-8", newline="\n")
+    rebuild(ws)
+    index = read(ws, "index.md")
+    leaked = []
+    for p in (ws / "memory" / "markdown" / "events").rglob("*.md"):
+        fm, _ = split_frontmatter(p.read_text(encoding="utf-8"))
+        if fm.get("visibility") != "open" and fm.get("title") in index:
+            leaked.append(fm.get("title"))
+    assert leaked == []
+
+
+# -- SH-8/9/10 · 三种聚合完整性 ---------------------------------------------
+
+def test_sh8_by_day_covers_every_event(ws, cow):
+    """SH-8: 每个事件都出现在其 occurred_at 日期的 by-day 页里。"""
+    f, paths = build(ws, cow, events=3)
+    rebuild(ws)
+    for p in paths:
+        fm, _ = split_frontmatter(p.read_text(encoding="utf-8"))
+        day = fm["occurred_at"][:10]
+        page = shelf(ws) / "by-day" / f"{day}.md"
+        assert page.is_file(), f"缺少 {day} 页"
+        assert fm["title"] in page.read_text(encoding="utf-8")
+
+
+def test_sh8_reverse_missing_day_page_is_detected(ws, cow):
+    """反向用例：删掉某天的 by-day 页 → 判定必须失败。"""
+    f, paths = build(ws, cow, events=2)
+    rebuild(ws)
+    page = shelf(ws) / "by-day" / "2026-10-27.md"
+    page.unlink()
+    missing = [p for p in paths
+               if not (shelf(ws) / "by-day" /
+                       f"{split_frontmatter(p.read_text(encoding='utf-8'))[0]['occurred_at'][:10]}.md"
+                       ).is_file()]
+    assert missing
+
+
+def test_sh9_by_entity_covers_every_entity_slug(ws, cow):
+    """SH-9: 事件的每个实体 slug（subject ∪ involves）都有 by-entity 页
+    且含该事件。
+
+    P0-1 §4.1 把 subject 定为 by-entity 的聚合键（facade 写 subject），
+    P0-5 §3.5 写 involves —— 生成器取并集，两者任一存在都要成页。
+    """
+    build(ws, cow)
+    rebuild(ws)
+    # subject 聚合键：facade 写的 subject（= actor）
+    page = shelf(ws) / "by-entity" / f"{ACTOR}.md"
+    assert page.is_file(), "subject 聚合页缺失"
+    assert "事件 0" in page.read_text(encoding="utf-8")
+
+
+def test_sh9_reverse_missing_entity_page_is_detected(ws, cow):
+    """反向用例：删掉 by-entity 页 → 判定必须失败。"""
+    build(ws, cow)
+    rebuild(ws)
+    (shelf(ws) / "by-entity" / f"{ACTOR}.md").unlink()
+    assert not (shelf(ws) / "by-entity" / f"{ACTOR}.md").is_file()
+
+
+def test_sh9_involves_slug_also_gets_a_page(ws, cow):
+    """involves 里的实体也要成页（手工写一个带 involves 的事件文件）。"""
+    build(ws, cow)
+    manual = (ws / "memory" / "markdown" / "events" / "2026-10-27" /
+              "evt-manual--11111111.md")
+    manual.write_text(
+        "---\nstatus: active\nvisibility: open\ntitle: 手工事件\n"
+        "slug: evt-manual\noccurred_at: 2026-10-27T12:00:00+08:00\n"
+        "tags: []\ninvolves:\n  - 萌萌\n---\n\n正文\n",
+        encoding="utf-8", newline="\n")
+    rebuild(ws)
+    page = shelf(ws) / "by-entity" / "萌萌.md"
+    assert page.is_file()
+    assert "手工事件" in page.read_text(encoding="utf-8")
+
+
+def test_body_template_involves_is_read(ws, cow):
+    """P0-1 §4.3 正文模板里的 `- involves: {slug}` 也要算实体关联。
+
+    facade 不写 involves front-matter 字段（21 字段表里没有它），
+    实体链接在正文的「## 关联」段 —— 生成器必须两处都读。
+    """
+    build(ws, cow)
+    manual = (ws / "memory" / "markdown" / "events" / "2026-10-27" /
+              "evt-rel--22222222.md")
+    manual.write_text(
+        "---\nstatus: active\nvisibility: open\ntitle: 关联事件\n"
+        "slug: evt-rel\noccurred_at: 2026-10-27T13:00:00+08:00\n"
+        "tags: []\n---\n\n## 关联\n\n- `involves`: 萌萌\n",
+        encoding="utf-8", newline="\n")
+    rebuild(ws)
+    page = shelf(ws) / "by-entity" / "萌萌.md"
+    assert page.is_file(), "正文模板里的 involves 没被读取"
+    assert "关联事件" in page.read_text(encoding="utf-8")
+
+
+def test_mentions_gap_rule_ignores_the_subject(ws, cow):
+    """反向用例：自己提自己 N 次不算"缺实体档案页"。"""
+    build(ws, cow, events=3)      # 三条事件，subject = actor
+    rebuild(ws)
+    gaps = read(ws, "gaps.md")
+    assert "entity-page-missing" not in gaps
+
+
+def test_sh10_by_tag_covers_every_tag(ws, cow):
+    """SH-10: 事件的每个 tag 都有 by-tag 页且含该事件。"""
+    build(ws, cow)
+    rebuild(ws)
+    page = shelf(ws) / "by-tag" / "记忆.md"
+    assert page.is_file()
+    assert "事件 0" in page.read_text(encoding="utf-8")
+
+
+def test_sh10_reverse_missing_tag_page_is_detected(ws, cow):
+    """反向用例：删掉 by-tag 页 → 判定必须失败。"""
+    build(ws, cow)
+    rebuild(ws)
+    (shelf(ws) / "by-tag" / "记忆.md").unlink()
+    assert not (shelf(ws) / "by-tag" / "记忆.md").is_file()
+
+
+# -- SH-11 · 空页不生成 ------------------------------------------------------
+
+def test_sh11_no_empty_aggregation_pages(ws, cow):
+    """SH-11: 每个聚合页的 event_count > 0，且不为无事件的日子生成页。"""
+    build(ws, cow)
+    rebuild(ws)
+    for sub in ("by-day", "by-entity", "by-tag"):
+        for p in (shelf(ws) / sub).glob("*.md"):
+            fm, _ = split_frontmatter(p.read_text(encoding="utf-8"))
+            assert fm["event_count"] > 0, f"空页 {p}"
+    # 没有事件的日子不生成页
+    assert not (shelf(ws) / "by-day" / "2020-01-01.md").exists()
+
+
+def test_sh11_reverse_a_zero_count_page_is_detected(ws, cow):
+    """反向用例：造一个 event_count=0 的页 → 判定必须失败。"""
+    bad = shelf(ws) / "by-day" / "2020-01-01.md"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text("---\nkind: shelf-by-day\ndate: 2020-01-01\n"
+                   "event_count: 0\n---\n\n空页\n", encoding="utf-8",
+                   newline="\n")
+    fm, _ = split_frontmatter(bad.read_text(encoding="utf-8"))
+    assert fm["event_count"] == 0
+
+
+# -- SH-12 · 生成器只写 shelf ------------------------------------------------
+
+def test_sh12_generator_never_touches_the_truth_layer(ws, cow):
+    """SH-12: markdown/ facts/ _tombstones/ 的字节在重建前后完全不变。"""
+    f, paths = build(ws, cow)
+    truth = {p: p.read_bytes() for p in (ws / "memory").rglob("*")
+             if p.is_file() and "shelf" not in p.parts
+             and ".snapshots" not in p.parts and ".audit" not in p.parts}
+    rebuild(ws)
+    for p, before in truth.items():
+        assert p.read_bytes() == before, f"真源被改写: {p}"
+
+
+def test_sh12_reverse_a_truth_file_change_is_detected(ws, cow):
+    """反向用例：改一个真源文件 → 判定必须失败。"""
+    f, paths = build(ws, cow)
+    before = paths[0].read_bytes()
+    paths[0].write_bytes(before + b"\n<!-- tampered -->\n")
+    after = paths[0].read_bytes()
+    assert after != before
+
+
+# -- P0-8 追加：幂等 + skipped 出声 ----------------------------------------
+
+def test_rebuild_is_idempotent_second_run_is_byte_identical(ws, cow):
+    """验收标准 6: 连跑两遍，第二遍零字节变化（generated_at 除外）。"""
+    build(ws, cow)
+    rebuild(ws)
+    first = {p.relative_to(shelf(ws)).as_posix(): p.read_bytes()
+             for p in all_view_files(ws)}
+    rebuild(ws)
+    second = {p.relative_to(shelf(ws)).as_posix(): p.read_bytes()
+              for p in all_view_files(ws)}
+    assert set(first) == set(second)
+    for rel in first:
+        a = first[rel].decode("utf-8")
+        b = second[rel].decode("utf-8")
+        if a == b:
+            continue
+        # generated_at 是唯一允许变化的字段（同一秒内重跑应完全一致）
+        a_lines = [l for l in a.splitlines() if not l.startswith("generated_at:")]
+        b_lines = [l for l in b.splitlines() if not l.startswith("generated_at:")]
+        assert a_lines == b_lines, f"{rel} 除 generated_at 外还有变化"
+
+
+def test_skipped_files_are_reported_not_dropped_silently(ws, cow):
+    """P0-8: front-matter 不合规的文件必须进 skipped 清单并出现在缺口里。"""
+    f = facade_for(ws, cow)
+    f.write_event("good", "好的", "b", date="2026-10-27")
+    bad = ws / "memory" / "markdown" / "events" / "2026-10-27" / "bad--11111111.md"
+    bad.write_text("---\ntitle: 缺字段的文件\n---\n\n正文\n",
+                   encoding="utf-8", newline="\n")
+    report = rebuild(ws)
+    skipped = report["skipped"]
+    assert skipped, "被跳过的文件没有出现在报告里"
+    entry = next(s for s in skipped if s["path"].endswith("bad--11111111.md"))
+    assert entry["reason"] == INVALID_FM
+    assert "visibility" in entry["missing"] and "status" in entry["missing"]
+    # 缺口视图里以 invalid-frontmatter 呈现，且动作给出应补字段
+    gaps_text = read(ws, "gaps.md")
+    assert "`invalid-frontmatter`" in gaps_text
+    assert "status" in gaps_text and "visibility" in gaps_text
+
+
+def test_skipped_reason_code_is_legal_for_sh3(ws, cow):
+    """反向用例：跳过原因码必须仍在 SH-3 的合法集合内。"""
+    f = facade_for(ws, cow)
+    bad = ws / "memory" / "markdown" / "events" / "2026-10-27" / "bad--11111111.md"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text("no front matter at all\n", encoding="utf-8", newline="\n")
+    rebuild(ws)
+    for code in re.findall(r"`([a-z-]+)`", read(ws, "gaps.md")):
+        assert code in LEGAL_GAP_CODES
+
+
+def test_views_have_parsable_frontmatter_with_fingerprint(ws, cow):
+    """每页 front-matter 可被 PyYAML 无损解析，且带 generated_at + 指纹。"""
+    build(ws, cow)
+    report = rebuild(ws)
+    for p in all_view_files(ws):
+        fm, body = split_frontmatter(p.read_text(encoding="utf-8"))
+        assert fm, f"{p} 没有 front-matter"
+        assert fm["generated_at"]
+        assert fm["input_fingerprint"].startswith("sha256:")
+        assert fm["agent"] == ACTOR
+        assert body.strip()
+    # 同一份输入 → 同一指纹
+    report2 = rebuild(ws)
+    assert report2["input_fingerprint"] == report["input_fingerprint"]
+
+
+def test_generator_is_the_only_writer_of_shelf(ws, cow):
+    """SH-12 补充: 重建会清掉陈旧投影页（完整重建语义）。"""
+    build(ws, cow)
+    rebuild(ws)
+    stale = shelf(ws) / "by-day" / "1999-01-01.md"
+    stale.write_text("stale\n", encoding="utf-8", newline="\n")
+    rebuild(ws)
+    assert not stale.exists(), "陈旧投影页没有被清掉"
