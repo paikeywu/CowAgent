@@ -78,3 +78,31 @@ desktop/resources/bin/
 
 # Persistent Agent Mail credentials and npm runtime created by the optional compose overlay.
 docker/agent-mail-data/
+
+# --- Runtime state must never live in the source tree (P0-20 L-1) --------
+#
+# The memory index under <repo>/memory/long-term/index.db is RUNTIME STATE:
+# it is a rebuildable projection of the knowledge base, and it belongs to
+# whoever runs the app, not to the repository. It was found here because a
+# run had the repository itself configured as the workspace root, so the
+# index was written into the source tree -- and because it was neither
+# tracked nor ignored, `git clone` handed every new user someone else's
+# memory index (2.1 MB, 106 chunks of the shared knowledge base).
+#
+# The fix has two halves, and both are needed:
+#   1. this file keeps the runtime products out of the repository, and
+#   2. agent/memory/acceptance/phase1.py REFUSES to run against a workspace
+#      that is inside the source tree, so the criterion cannot recreate it.
+#
+# Rule: if you find yourself wanting to commit one of these, the thing you
+# want to commit is the SOURCE, not the state.
+#
+# The patterns are ANCHORED to the repository root on purpose. A bare
+# `memory/` also matches `agent/memory/` -- and a newly created file there
+# would be silently ignored, so the acceptance criteria could never be
+# committed. Anchoring keeps `agent/memory/` trackable and ignores only the
+# runtime state at the top level.
+/memory/
+/MEMORY.md
+/tmp_wx.txt
+

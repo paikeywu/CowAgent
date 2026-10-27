@@ -13,12 +13,39 @@ is exactly the case where nothing changed and there is nothing to embed.
 """
 
 import asyncio
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from agent.memory.config import MemoryConfig
 from agent.memory.manager import MemoryManager
+
+
+def _mklink_junction(link: Path, target: Path) -> None:
+    """Create a directory JUNCTION pointing at ``target``.
+
+    P0-20 S-2: this test used ``Path.symlink_to``, which on Windows needs
+    ``SeCreateSymbolicLinkPrivilege``. Without it the call raises
+    ``OSError: [WinError 1314]`` and the test dies before reaching an
+    assertion — reported as "environmental" for six rounds, when the cause
+    was the test's own choice of API.
+
+    A junction needs no privilege and resolves through ``os.path.realpath``
+    exactly like a symlink, so it exercises the same production code. The
+    property under test is that a root reached through a LINK still
+    matches — link resolution, not which reparse point Windows used.
+    """
+    if hasattr(os, "symlink"):
+        try:
+            link.symlink_to(target, target_is_directory=True)
+            return
+        except OSError:
+            pass  # no privilege (or the platform has no symlink) -> junction
+    r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
 
 
 def _manager(workspace: Path) -> MemoryManager:
@@ -162,7 +189,7 @@ def test_a_symlinked_knowledge_root_is_not_mistaken_for_an_empty_one(tmp_path, s
     (shared / "knowledge" / "shared-page.md").write_text(
         "# shared\nGLACIERQUARTZ7731\n", encoding="utf-8"
     )
-    (workspace / "knowledge").symlink_to(shared / "knowledge", target_is_directory=True)
+    _mklink_junction(workspace / "knowledge", shared / "knowledge")
 
     manager = _manager(workspace)
     asyncio.run(manager.sync())

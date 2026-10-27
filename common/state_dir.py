@@ -42,6 +42,64 @@ class StateDirError(RuntimeError):
     """Raised when an identity names an Agent that does not exist."""
 
 
+class SourceTreeWorkspaceError(StateDirError):
+    """The workspace root is inside a source tree — runtime state does not
+    belong there (P0-20 L-1).
+
+    Raised instead of quietly writing state into the repository. The
+    concrete accident this prevents: a run whose workspace resolved to the
+    repository root created ``<repo>/memory/long-term/index.db`` — a 2.1 MB
+    copy of somebody else's memory index — and because that file was
+    neither tracked nor ignored, ``git clone`` handed it to everyone.
+
+    The check is on the RESOLVED path, so a symlinked or relative path
+    cannot slip past it.
+    """
+
+
+def _source_tree_root(path: Path) -> Optional[Path]:
+    """The git work tree that contains ``path``, if any.
+
+    Walks up from ``path`` looking for a ``.git`` entry. A ``.git`` FILE
+    (a worktree or a submodule) counts as well as a directory: both mean
+    "this is inside a checkout".
+    """
+    try:
+        current = Path(os.path.realpath(str(path)))
+    except OSError:
+        return None
+    for candidate in [current] + list(current.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def assert_not_source_tree(workspace_root: Path | str) -> None:
+    """Refuse a workspace root that lives inside a git source tree.
+
+    Called from ``state_root`` — the ONE place that decides where an
+    Agent's state lives — so every consumer is covered by one check.
+
+    Why here and not in the acceptance criterion alone: the criterion was
+    one writer. The layout is where the decision belongs, because every
+    other writer (a script, a tool, a desktop app) goes through it too.
+
+    The refusal names the alternative, because a refusal that only says
+    "no" blocks the work without telling the caller what to do.
+    """
+    root = Path(workspace_root)
+    tree = _source_tree_root(root)
+    if tree is None:
+        return
+    raise SourceTreeWorkspaceError(
+        "工作区位于源码树内，拒绝把运行时状态写进源码树：%r 在 %r 之内。\n"
+        "  运行时状态（memory/long-term/index.db 等）属于运行它的人，不属于仓库；"
+        "它一旦进入版本库，clone 的人会拿到别人的记忆索引。\n"
+        "  请把 agent_workspace / workspace 指向一个工作区目录（例如 %%USERPROFILE%%\\cow），"
+        "而不是源码目录。" % (str(root), str(tree))
+    )
+
+
 def _resolve(identity: Optional[RuntimeIdentity]) -> RuntimeIdentity:
     return identity if identity is not None else current_identity()
 
@@ -53,18 +111,28 @@ def state_root(identity: Optional[RuntimeIdentity] = None) -> Path:
     skill sync and scheduler boot legitimately run before routing. An
     ``agent_id`` that does not resolve is a bug and raises rather than quietly
     falling back, which would leak one Agent's files into another's workspace.
+
+    P0-20 L-1: the resolved root is refused when it lives inside a git
+    source tree. Runtime state does not belong to the repository — this is
+    the one place that decides where an Agent's state lives, so this is
+    where the decision belongs. The check is cheap (it stops at the first
+    ``.git`` ancestor) and it is what keeps the next writer from
+    re-creating ``<repo>/memory/long-term/index.db``.
     """
     from agent.registry import get_agent_registry
 
     agent_id = _resolve(identity).agent_id
     registry = get_agent_registry()
     if not agent_id:
-        return Path(registry.get(require_enabled=False).workspace)
-    try:
-        profile = registry.get(agent_id, require_enabled=False)
-    except KeyError:
-        raise StateDirError(f"unknown agent id: {agent_id!r}") from None
-    return Path(profile.workspace)
+        root = Path(registry.get(require_enabled=False).workspace)
+    else:
+        try:
+            profile = registry.get(agent_id, require_enabled=False)
+        except KeyError:
+            raise StateDirError(f"unknown agent id: {agent_id!r}") from None
+        root = Path(profile.workspace)
+    assert_not_source_tree(root)
+    return root
 
 
 def shared_root() -> Path:

@@ -10,10 +10,45 @@ get does not depend on how its root happened to be spelled.
 """
 
 import asyncio
+import os
+import subprocess
 from pathlib import Path
 
 from agent.memory.config import MemoryConfig
 from agent.memory.manager import MemoryManager, _index_rel_path
+
+
+def _mklink_junction(link: Path, target: Path) -> None:
+    """Create a directory JUNCTION pointing at ``target``.
+
+    P0-20 S-2: this test used to call ``Path.symlink_to``, which on Windows
+    needs ``SeCreateSymbolicLinkPrivilege``. Without it the call raises
+    ``OSError: [WinError 1314] 客户端没有所需的特权`` and the test fails
+    before it reaches a single assertion — so the failure was reported as
+    "environmental" for six rounds, when the real cause was the test's own
+    choice of API.
+
+    A junction is the no-privilege equivalent and it exercises the SAME
+    production code: ``agent.memory.manager._real`` resolves with
+    ``os.path.realpath``, and a junction resolves through it exactly like a
+    symlink does (verified: both yield the same realpath and the same
+    ``relative_to`` result). The property under test — "a root reached
+    through a link still matches" — is about link RESOLUTION, not about
+    which kind of reparse point Windows used to spell it with.
+
+    The symlink form is kept as a fallback so the test still runs on a
+    machine that does have the privilege (and on POSIX, where junctions do
+    not exist and symlinks are the only spelling).
+    """
+    if hasattr(os, "symlink"):
+        try:
+            link.symlink_to(target, target_is_directory=True)
+            return
+        except OSError:
+            pass  # no privilege (or the platform has no symlink) -> junction
+    r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
 
 
 def test_knowledge_keeps_its_prefix_wherever_the_dir_lives(tmp_path):
@@ -46,7 +81,7 @@ def test_a_root_reached_through_a_symlink_still_matches(tmp_path):
     real = tmp_path / "real"
     (real / "knowledge").mkdir(parents=True)
     link = tmp_path / "link"
-    link.symlink_to(real)
+    _mklink_junction(link, real)
 
     # Root spelled through the symlink, file spelled through the real path.
     key = _index_rel_path(real / "knowledge" / "a.md", [(link / "knowledge", "knowledge")])

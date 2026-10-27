@@ -1033,6 +1033,25 @@ class WriteFacade:
         free-form editable dict) and only meaningful for people/ profiles,
         where it MUST be in HUMAN_PROFILE_SUBJECTS — an agent id or an
         unknown human slug is rejected. Default subject = actor.
+
+        P0-20 L-3: ``date`` is REFUSED here, and refused loudly.
+
+        The reason entities take no date is a real design decision — a
+        person or a relation spans time, so it carries no date segment
+        (``agent.memory.naming.build_memory_path`` enforces it: a date on
+        an entity raises ``ValueError``). But the DECISION was only half
+        implemented: ``date`` rode in on ``**editable``, was not in
+        ``IMMUTABLE_FM_FIELDS``, and was then silently dropped. A caller
+        who passed ``date=`` got a successful write and a file in a
+        different place than they asked for — a silent parameter swallow,
+        which is exactly the shape of bug this system exists to avoid
+        everywhere else.
+
+        So the parameter is now explicit, and it is REJECTED rather than
+        ignored: a caller who wants a dated record writes an event or a
+        letter, and a caller who passes ``date=`` by mistake is told so
+        instead of getting a file elsewhere. The rejection is audited
+        like every other refusal (总纲第 3 条: 拒绝必须出声).
         """
         if kind not in ("people", "relations"):
             raise ValueError("kind must be 'people' or 'relations'")
@@ -1045,6 +1064,32 @@ class WriteFacade:
                         f"profiles (got {subject!r}); agents never own "
                         f"people/ profiles and relations/ subject = actor"
                     )
+            # Two layers, same shape as the date check in _new_element:
+            # the KEY is present at all, and — if a caller passes it as
+            # part of a larger structure — its VALUE is a real date.
+            # Neither layer is enough alone: a shape check lets
+            # ``2026-13-45`` through, and a value check needs a key.
+            if "date" in editable:
+                date = editable.pop("date")
+                if date is not None and not _DATE_RE.match(str(date)):
+                    raise FacadeError(
+                        f"date must be YYYY-MM-DD, got {date!r}"
+                    )
+                try:
+                    datetime.strptime(str(date), "%Y-%m-%d")
+                except (ValueError, TypeError):
+                    raise FacadeError(
+                        f"date must be a real calendar date, got {date!r}"
+                    ) from None
+                # The date is well-formed, and it is STILL refused: an
+                # entity is not a dated record. Saying so is the point.
+                raise FacadeError(
+                    f"entities/{kind} carry no date segment — a person or a "
+                    f"relation spans time (got date={date!r}). Write a dated "
+                    f"record as an event or a letter; if you meant to set "
+                    f"when this profile became true, that is a separate field "
+                    f"and does not exist yet."
+                )
             real, _ = self._new_element(
                 f"entities/{kind}", slug=slug, title=title, body=body,
                 editable=editable,

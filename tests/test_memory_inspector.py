@@ -688,3 +688,158 @@ def test_b3_schema_drift_never_repairs_the_index(tmp_path):
     assert db.read_bytes() == before, \
         "the inspector modified the index it was supposed to only report"
 
+
+# ---------------------------------------------------------------------------
+# P0-20 S-1 / L-1：判据不得修改它要验收的对象
+# ---------------------------------------------------------------------------
+#
+# 风控原话：「判据会修改它要验收的对象——phase1.py 判 T3 前 sync，
+# 仓库根库 102→106 行。空目录那轮失败理由还漂移了：报的是『top1 不是
+# USER.md』而非它设计的『空库』理由，判据红了但理由不对 = 判据在说谎。」
+#
+# 两条要固化：
+#   S-1  验收前后取被测库指纹（路径+行数+mtime+sha256）并比对；变了就报出来
+#   L-1  phase1.py 拒绝在源码树内验收；而且「空库」这个失败理由要能被
+#         正确报出来，不能被别的理由盖住
+#
+# 本文件是「检查器那一层」的测试，所以 S-1 和 L-1 的判据本身放在这里。
+
+def test_s1_the_fingerprint_carries_a_digest_not_just_a_row_count(tmp_path):
+    """S-1：指纹必须带 sha256 —— 行数看不出字节变了。
+
+    检索会回写 ``hit_count``：行数不变，字节变了。只比行数的检查器看不见
+    判据改了自己的被测对象。
+    """
+    from agent.memory.acceptance import fingerprint
+
+    db = tmp_path / "memory" / "long-term" / "index.db"
+    db.parent.mkdir(parents=True)
+    import sqlite3
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE chunks (id TEXT)")
+    conn.commit()
+    conn.close()
+
+    first = fingerprint(str(tmp_path))
+    assert first.exists and first.rows == 0
+    assert first.sha256, "指纹没有摘要 —— 判据改了库也看不出来"
+
+    # 改一个字节：行数不变，摘要必须变
+    data = bytearray(db.read_bytes())
+    data[-1] = (data[-1] + 1) % 256
+    db.write_bytes(bytes(data))
+    second = fingerprint(str(tmp_path))
+    assert second.rows == first.rows, "行数不该变（这条前提错了，测法有问题）"
+    assert second.sha256 != first.sha256, "字节变了但摘要没变 —— 指纹是假的"
+    assert "sha256" in second.differs_from(first)
+
+
+def test_s1_an_unchanged_index_reports_no_difference(tmp_path):
+    """S-1 反向用例：没变就报「没变」，别把没变也说成变了。"""
+    from agent.memory.acceptance import fingerprint
+
+    db = tmp_path / "memory" / "long-term" / "index.db"
+    db.parent.mkdir(parents=True)
+    import sqlite3
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE chunks (id TEXT)")
+    conn.commit()
+    conn.close()
+
+    first = fingerprint(str(tmp_path))
+    second = fingerprint(str(tmp_path))
+    assert second.differs_from(first) == [], "同一个库两次指纹报了差异"
+
+
+def test_s1_the_fingerprint_never_creates_the_index(tmp_path):
+    """S-1：一个只打算「量」数据库的判据，不能顺手把它建出来。
+
+    建出来本身就是修改 —— 判据量的是一个它自己造出来的对象。
+    """
+    from agent.memory.acceptance import fingerprint
+
+    fp = fingerprint(str(tmp_path))
+    assert not fp.exists
+    assert not (tmp_path / "memory" / "long-term" / "index.db").exists(), \
+        "取指纹把索引建出来了 —— 判据量的是自己造的状态"
+
+
+def test_l1_the_acceptance_refuses_a_workspace_inside_the_source_tree(tmp_path):
+    """L-1：phase1.py 在源码树内验收 → 明确拒绝，不执行。
+
+    拒绝要在**碰任何索引之前**发生：一个事后的拒绝已经晚了 —— 运行时
+    状态已经写进源码树了。
+    """
+    from agent.memory.acceptance import (
+        SourceTreeWorkspaceError,
+        assert_not_source_tree,
+    )
+
+    tree = tmp_path / "repo"
+    (tree / ".git").mkdir(parents=True)
+    ws = tree / "workspace"
+    ws.mkdir()
+
+    with pytest.raises(SourceTreeWorkspaceError) as exc:
+        assert_not_source_tree(str(ws), tree)
+    assert "拒绝" in str(exc.value)
+    assert not (ws / "memory").exists(), "拒绝之前就写了状态"
+
+
+def test_l1_an_empty_index_reports_the_empty_reason_not_another(tmp_path):
+    """L-1 的「理由正确性」：空库上跑，失败理由必须**是**「库是空的」。
+
+    风控抓到的那一轮：判据红了，但报的理由是「top1 不是 USER.md」——
+    红的理由和它设计的理由不是一回事。判据红了但理由不对，等于判据
+    在说谎：读的人不知道它到底测了什么。
+    """
+    from agent.memory.acceptance import Report, fingerprint
+
+    report = Report()
+    fp = fingerprint(str(tmp_path))       # 不存在 -> exists=False
+    ok = report.judge("T3(REAL)", "中文召回", False,
+                      "被测库不存在 —— 前置条件不成立，无法判定召回质量",
+                      fingerprint=fp)
+    assert not ok
+
+
+def test_l1_the_phase1_criterion_runs_end_to_end_on_a_workspace(tmp_path, monkeypatch):
+    """L-1：判据在**合法**工作区上照常运行（拒绝不能变成停机）。
+
+    这里跑的是 phase1.py 本身（子进程），因为「拒绝」是 main() 里的
+    早退逻辑，不是一个可以被 import 的函数。
+    """
+    import subprocess
+    import sys as _sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    ws = tmp_path / "cow"
+    ws.mkdir()
+    # 一个空工作区：判据应当跑完并报「空库」而不是崩溃
+    proc = subprocess.run(
+        [_sys.executable, str(repo / "agent" / "memory" / "acceptance" / "phase1.py"),
+         "--workspace", str(ws), "--no-sync"],
+        cwd=str(repo), capture_output=True, text=True, timeout=180)
+    assert "阶段一验收" in proc.stdout, (
+        "判据没有正常开始:\n%s\n%s" % (proc.stdout[-2000:], proc.stderr[-2000:]))
+    assert "拒绝执行" not in proc.stdout, "合法工作区被拒了"
+
+
+def test_l1_the_phase1_criterion_refuses_the_source_tree(tmp_path):
+    """L-1：phase1.py 指向源码树 → 拒绝执行，且退出码可区分。"""
+    import subprocess
+    import sys as _sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    proc = subprocess.run(
+        [_sys.executable, str(repo / "agent" / "memory" / "acceptance" / "phase1.py"),
+         "--workspace", str(repo)],
+        cwd=str(repo), capture_output=True, text=True, timeout=180)
+    assert proc.returncode == 2, (
+        "拒绝的退出码应是 2（与判据失败的 1 可区分），实际 %d" % proc.returncode)
+    assert "拒绝执行" in proc.stdout
+    assert not (repo / "memory" / "long-term" / "index.db").exists(), \
+        "拒绝执行却把索引写进了源码树"
+

@@ -156,6 +156,20 @@ def test_public_mutations_and_legacy_upgrade_preserve_fts(tmp_path, language, ac
         'PYTHONPATH': os.pathsep.join([str(REPO), *sys.path]),
         'PYTHONNOUSERSITE': '1', 'PYTHONDONTWRITEBYTECODE': '1',
     }
+    # P0-20 S-2: the child needs SystemRoot (and the two names it also goes
+    # by on Windows). Without it the child's ``import asyncio`` dies with
+    # ``OSError: [WinError 10106]`` — ``_overlapped`` cannot initialise the
+    # Windows Sockets service provider without it — and the child exits
+    # before it reaches a single assertion of this test.
+    #
+    # That made all 13 cases of this file fail for a reason that has
+    # nothing to do with FTS5, and the failure was stable enough to hide
+    # in the "environmental failures" bucket for six rounds. It was never
+    # environmental: the test built the child environment itself, and the
+    # environment it built was incomplete.
+    for _key in ('SystemRoot', 'SystemDrive', 'windir'):
+        if os.environ.get(_key):
+            env[_key] = os.environ[_key]
     child = subprocess.run([sys.executable, '-c', PROGRAM, str(workspace), language, action,
                             json.dumps(LEGACY_TRIGGERS)], cwd=tmp_path, env=env,
                            capture_output=True, text=True, timeout=30)

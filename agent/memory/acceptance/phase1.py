@@ -60,6 +60,8 @@ sys.stdout.reconfigure(encoding="utf-8")
 from agent.memory.acceptance import (  # noqa: E402
     DEFAULT_WORKSPACE,
     Report,
+    SourceTreeWorkspaceError,
+    assert_not_source_tree,
     fingerprint,
     resolve_workspace,
 )
@@ -576,8 +578,69 @@ def judge_t6_reranker_e2e(manager, report, fp):
                         ok, "\n".join(detail), fingerprint=fp)
 
 
+# ---------------------------------------------------------------------------
+# S-1 判据不得修改它要验收的对象
+# ---------------------------------------------------------------------------
+def judge_s1_index_untouched(report, workspace, fp_before):
+    """Did the acceptance run modify the index it measured?
+
+    P0-20 S-1 (风控): "会修改它要验收的对象——phase1.py 判 T3 前 sync，
+    仓库根库 102→106 行。"  A criterion that changes the thing it measures
+    is measuring a state it manufactured itself.
+
+    The comparison is on the DIGEST, not the row count: a search rewrites
+    ``hit_count`` on the rows it matched, which changes the bytes and
+    leaves the row count alone. The digest is what sees that.
+
+    What is NOT a violation: the explicit ``sync`` step. Syncing the
+    corpus before measuring it is the point of an integration criterion —
+    it is the corpus being brought up to date, not the measurement
+    mutating it. So the fingerprint compared here is the one taken AFTER
+    the sync and BEFORE the real-corpus criteria, and only what the
+    criteria themselves did is on trial.
+
+    A violation is reported even when every other criterion is green —
+    that is the whole point: a green run that moved the index cannot
+    read as a clean pass.
+    """
+    fp_after = fingerprint(workspace)
+    detail = []
+    detail.append(f"判据执行前: {fp_before.render()}")
+    detail.append(f"判据执行后: {fp_after.render()}")
+    changed = fp_after.differs_from(fp_before)
+    if not changed:
+        detail.append("被测库字节级未变 —— 判据没有修改它要验收的对象")
+        return report.judge("S1(unit)", "判据未修改被测库（前后指纹一致）",
+                            True, "\n".join(detail), fingerprint=fp_after)
+    detail.append(f"被测库发生变化: {', '.join(changed)}")
+    detail.append("  —— 判据修改了它要验收的对象；即使其它判据全绿，本次结果不可作为"
+                  "『系统行为正确』的证据")
+    # Say WHICH field moved and what it means, so the reader does not have
+    # to guess. rows moving is a corpus change (the sync re-indexed);
+    # sha256 moving alone is a bookkeeping write (hit_count).
+    if "rows" in changed:
+        detail.append("  rows 变化 = 语料行数变了（同步重建了索引）")
+    elif "sha256" in changed:
+        detail.append("  仅 sha256 变化 = 行数未变但字节变了（典型的 hit_count 回写）")
+    return report.judge("S1(unit)", "判据未修改被测库（前后指纹一致）",
+                        False, "\n".join(detail), fingerprint=fp_after)
+
+
 def main() -> int:
     workspace, how = resolve_workspace(ARGS.workspace)
+
+    # P0-20 L-1: the source tree is not a workspace. Refuse BEFORE anything
+    # touches an index — a refusal that happens after the sync has already
+    # written the runtime state is a refusal that came too late.
+    try:
+        assert_not_source_tree(workspace, REPO)
+    except SourceTreeWorkspaceError as e:
+        print("=" * 72)
+        print("阶段一验收 · 拒绝执行")
+        print("=" * 72)
+        print(str(e))
+        return 2
+
     fp = fingerprint(workspace)
 
     print("=" * 72)
@@ -625,6 +688,14 @@ def main() -> int:
                      fingerprint=fp)
         report.summary()
         return 1
+
+    # P0-20 S-1: the index BEFORE the real-corpus criteria ran. The
+    # criteria are about to search the index, and a search rewrites
+    # ``hit_count`` — so the digest taken afterwards is compared against
+    # this one, and any difference is REPORTED even when every criterion
+    # is green.
+    fp_before = fingerprint(workspace)
+
     try:
         if not ARGS.no_sync:
             print("[sync] 同步真实工作区索引 …")
@@ -640,6 +711,11 @@ def main() -> int:
         guarded(judge_t6_reranker_e2e, manager, report, fp)
     finally:
         manager.storage.close()
+
+    # S-1: compare the index AFTER the criteria with the one BEFORE them.
+    # This is reported as a criterion of its own so a green run that
+    # modified the object it measured cannot read as a clean 8/8.
+    guarded(judge_s1_index_untouched, report, workspace, fp_before)
 
     ok = report.summary()
     return 0 if ok else 1

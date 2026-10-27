@@ -20,6 +20,7 @@ from agent.memory.facade import (
     ConfirmationExpiredError,
     ConsentRequiredError,
     CrossRoleWriteError,
+    FacadeError,
     ImmutableFieldError,
     PathEscapeError,
     RecordingConfirmationChannel,
@@ -1455,3 +1456,67 @@ def test_r5_reverse_the_backfill_is_idempotent(tmp_path):
     second = backfill_sealed_owner(db)
     assert first == 1
     assert second == 0, "the backfill is not idempotent"
+
+
+# ---------------------------------------------------------------------------
+# P0-20 L-3：write_entity 不再静默吞 date
+# ---------------------------------------------------------------------------
+#
+# 交办单：「write_event / write_letter 都有日期校验了，write_entity 没有
+# → 静默吞掉。不要留一个『静默吞参数』的口子。」
+#
+# 背景：实体不按日期归档是**有意的设计**（naming.build_memory_path 明确：
+# "entities and relations span time, so they carry no date segment"）。
+# 但那个设计只实现了一半 —— date 搭着 **editable 进来，既不在
+# IMMUTABLE_FM_FIELDS 里，也没有被读取，于是被安静地丢掉。调用方拿到
+# 一次「成功」的写入，和一个不在他要求的位置上的文件。
+#
+# 所以修法不是给实体加日期，而是让这个参数**被明确拒绝并且出声**。
+
+@pytest.mark.parametrize("bad_date", [
+    "2026-13-45",      # 形状像日期，值不是
+    "2026-02-30",      # 真实存在的月日，但这一天不存在
+    "not-a-date",
+    "20261027",
+])
+def test_l3_write_entity_rejects_a_malformed_date(tmp_path, bad_date):
+    """L-3：坏日期被拒（两层校验：形状 + 值），并入审计链。"""
+    cow, ws = make_cow(tmp_path)
+    f = facade_for(ws, cow)
+    before = _rejections(_audit_rows(ws))
+    with pytest.raises(FacadeError):
+        f.write_entity("people", "dated", "t", "body", date=bad_date)
+    assert _rejections(_audit_rows(ws)) != before, "拒绝必须出声"
+    assert not list((ws / "memory" / "markdown" / "entities").rglob("*.md"))
+
+
+def test_l3_write_entity_refuses_a_well_formed_date_too(tmp_path):
+    """L-3：日期**合法**也要拒 —— 因为实体本来就不按日期归档。
+
+    这一条是 L-3 的要点：只做「坏日期校验」等于把静默吞换成「好日期静默
+    吞」。合法日期必须被明确拒绝并说明原因，否则调用方仍然拿不到他要的
+    语义。
+    """
+    cow, ws = make_cow(tmp_path)
+    f = facade_for(ws, cow)
+    before = _rejections(_audit_rows(ws))
+    with pytest.raises(FacadeError) as exc:
+        f.write_entity("people", "dated", "t", "body", date="2026-10-27")
+    assert "no date segment" in str(exc.value)
+    assert _rejections(_audit_rows(ws)) != before
+    assert not list((ws / "memory" / "markdown" / "entities").rglob("*.md"))
+
+
+def test_l3_write_entity_without_a_date_still_works(tmp_path):
+    """L-3 反向用例：不传 date 的正常写入必须照旧成功。
+
+    没有这条，上面的拒绝可能只是「write_entity 全坏了」—— 拒绝和「什么都
+    写不进去」在断言上是同一种绿。
+    """
+    cow, ws = make_cow(tmp_path)
+    f = facade_for(ws, cow)
+    p = f.write_entity("people", "peiqi", "沛琦", "真人档案", subject="peiqi")
+    assert p.exists()
+    # 实体路径里没有日期段
+    rel = p.relative_to(ws).as_posix()
+    assert "2026" not in rel, f"实体路径里出现了日期段: {rel}"

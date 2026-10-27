@@ -51,6 +51,7 @@ invocation keeps working.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 from dataclasses import dataclass
@@ -79,15 +80,24 @@ class IndexFingerprint:
     """Which index a criterion actually read.
 
     A criterion that cannot say which index it read is not a criterion:
-    it is a claim. The three fields together are enough to tell two runs
+    it is a claim. The four fields together are enough to tell two runs
     apart — the path says WHICH index, the row count says whether the
-    corpus changed, and the mtime says WHEN it changed.
+    corpus changed, the mtime says WHEN it changed, and the digest says
+    WHETHER THE BYTES changed.
+
+    P0-20 S-1: the digest was added because a criterion that MODIFIES the
+    object it measures cannot be trusted, and rows+mtime cannot prove it
+    did not: a search rewrites ``hit_count`` on the rows it matched, which
+    changes the bytes WITHOUT changing the row count. The digest is what
+    makes "the criterion changed the index" a checkable statement instead
+    of an opinion.
     """
 
     path: str
     rows: int
     mtime: float
     exists: bool = True
+    sha256: str = ""
 
     @property
     def empty(self) -> bool:
@@ -98,20 +108,42 @@ class IndexFingerprint:
         """One line, short enough to print under every criterion."""
         if not self.exists:
             return "%s (不存在 / absent)" % self.path
-        return "%s（%d 行, mtime=%s）" % (
+        return "%s（%d 行, mtime=%s, sha256=%s）" % (
             self.path,
             self.rows,
             _mtime_stamp(self.mtime),
+            self.sha256[:16] if self.sha256 else "-",
         )
 
     def render_en(self) -> str:
         if not self.exists:
             return "%s (absent)" % self.path
-        return "%s (%d rows, mtime=%s)" % (
+        return "%s (%d rows, mtime=%s, sha256=%s)" % (
             self.path,
             self.rows,
             _mtime_stamp(self.mtime),
+            self.sha256[:16] if self.sha256 else "-",
         )
+
+    def differs_from(self, other: "IndexFingerprint") -> List[str]:
+        """Which fields differ from ``other`` — the S-1 comparison.
+
+        Returns a LIST of the differing field names, so the report can say
+        WHICH thing moved instead of only that something did. An empty list
+        means the index is byte-identical.
+        """
+        out: List[str] = []
+        if self.path != other.path:
+            out.append("path")
+        if self.rows != other.rows:
+            out.append("rows")
+        if self.exists != other.exists:
+            out.append("exists")
+        if self.sha256 and other.sha256 and self.sha256 != other.sha256:
+            out.append("sha256")
+        elif bool(self.sha256) != bool(other.sha256):
+            out.append("sha256")
+        return out
 
 
 def _mtime_stamp(ts: float) -> str:
@@ -130,6 +162,27 @@ def index_path_for(workspace: str) -> Path:
     lives under the workspace root, not under the per-user root.
     """
     return Path(workspace) / "memory" / "long-term" / "index.db"
+
+
+def sha256_of(path: Path) -> str:
+    """The digest of the index file's BYTES.
+
+    P0-20 S-1: the row count cannot prove the criterion did not modify
+    the index — a search rewrites ``hit_count`` on the rows it matched,
+    which changes the bytes and leaves the row count alone. The digest is
+    the only field that sees that.
+
+    Read in chunks: the index is tens of megabytes on a real workspace,
+    and reading it whole would be a memory spike in a probe.
+    """
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+    except OSError:
+        return ""
+    return h.hexdigest()
 
 
 def fingerprint(workspace: str) -> IndexFingerprint:
@@ -157,7 +210,70 @@ def fingerprint(workspace: str) -> IndexFingerprint:
         mtime = db.stat().st_mtime
     except OSError:
         mtime = 0.0
-    return IndexFingerprint(path=str(db), rows=rows, mtime=mtime, exists=True)
+    return IndexFingerprint(path=str(db), rows=rows, mtime=mtime,
+                            exists=True, sha256=sha256_of(db))
+
+
+# ---------------------------------------------------------------------------
+# The source tree is not a workspace (P0-20 L-1)
+# ---------------------------------------------------------------------------
+#
+# The criterion must refuse to run against a workspace that lives INSIDE
+# the repository, for two reasons that are both about the criterion's own
+# integrity:
+#
+#   1. It would write runtime state into the source tree. That is how
+#      ``<repo>/memory/long-term/index.db`` (2.1 MB of somebody else's
+#      memory index) came to exist in the first place — and because it was
+#      neither tracked nor ignored, ``git clone`` handed it to everyone.
+#   2. It would measure a corpus that is a COPY of the shared knowledge
+#      base, not the shared knowledge base itself. The same question then
+#      has two answers depending on which index you read, and a criterion
+#      that cannot name its corpus is not a criterion.
+#
+# The check is on the RESOLVED paths, so a symlinked or relative path
+# cannot sneak past it.
+
+def _is_inside(child: Path, parent: Path) -> bool:
+    """True when ``child`` is ``parent`` or lives under it."""
+    try:
+        child_r = Path(os.path.realpath(str(child)))
+        parent_r = Path(os.path.realpath(str(parent)))
+    except OSError:
+        return False
+    try:
+        child_r.relative_to(parent_r)
+        return True
+    except ValueError:
+        return False
+
+
+class SourceTreeWorkspaceError(RuntimeError):
+    """The workspace points into the source tree — refused, not warned."""
+
+
+def assert_not_source_tree(workspace: str, source_root: Path) -> None:
+    """Refuse a workspace that is inside the source tree.
+
+    ``source_root`` is the repository root (the directory that holds
+    ``.git``). The workspace is refused when it IS that directory or
+    lives under it.
+
+    Raises ``SourceTreeWorkspaceError`` with a message that says what to
+    do instead — a refusal that does not tell the caller the alternative
+    is a refusal that just blocks the work.
+    """
+    ws = Path(workspace)
+    if _is_inside(ws, source_root):
+        raise SourceTreeWorkspaceError(
+            "拒绝在源码树内验收：workspace %r 位于源码树 %r 之内。\n"
+            "  理由：① 验收会把运行时状态（memory/long-term/index.db）写进源码树，"
+            "且该文件既未被跟踪也未被忽略，clone 仓库的人会拿到别人的记忆索引；\n"
+            "        ② 源码树内的 knowledge/ 是共享知识库的副本而非真源，"
+            "同一问题在两个索引里答案不同，判据说不清自己量的是哪份语料。\n"
+            "  请改指向真实工作区（例如 --workspace \"C:\\\\Users\\\\User\\\\cow\"）。"
+            % (str(ws), str(source_root))
+        )
 
 
 def resolve_workspace(explicit: Optional[str]) -> Tuple[str, str]:

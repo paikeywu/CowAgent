@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agent.memory.config import MemoryConfig
 from agent.memory.facade import (
     RecordingConfirmationChannel,
+    TargetExistsError,
     WriteFacade,
     split_frontmatter,
 )
@@ -583,3 +584,162 @@ def test_the_owner_token_is_the_author_viewpoint():
     assert owner_token({"author_viewpoint": ACTOR}) == agent_owner_token(ACTOR)
     assert owner_token({}) is None
     assert agent_owner_token(ACTOR) != agent_owner_token(OTHER)
+
+
+# ---------------------------------------------------------------------------
+# P0-20 L-2：暗页的双轴语义在**真实样本**上成立
+# ---------------------------------------------------------------------------
+#
+# 交办单指出的正是这一点：「所有暗页相关的规则、谓词、遮蔽逻辑，
+# 全部是在 0 个真实样本上验证的。」
+#
+# 上面那批用例在临时目录里造了一个像样的工作区，但它们造的是**测试的
+# 形状**：临时目录里没有共享知识库、没有真实的扫描根、没有真实的投影
+# 刷新。下面的用例走**生产路径**在**真实工作区**上造暗页 —— 门面写
+# front-matter、扫描按真源路径索引、投影从磁盘刷新 —— 然后验三面。
+#
+# 为什么不用 tmp_path：真实工作区的索引里同时有共享知识库和主人格身份
+# 文件，白页的反向用例必须在一堆真实内容里成立，才说明谓词没有把正常
+# 内容一起吃掉。
+
+#: The REAL workspace. The acceptance criterion's fixed default, so the
+#: probe and this test measure the same corpus.
+REAL_WORKSPACE = r"C:\Users\User\cow"
+
+#: This Agent's own id — the owner of the dark page it writes.
+REAL_ACTOR = "agent-mvnewfyb"
+
+REAL_DARK_TOKEN = "ZZDARKREAL9921"
+REAL_OPEN_TOKEN = "ZZOPENREAL8834"
+
+
+def _real_body(token, title):
+    return ("# %s\n\n## 发生了什么\n\n这段正文包含标记词%s。\n\n"
+            "## 感受\n\n这是暗页的三面验证样本。\n" % (title, token))
+
+
+def _real_facade():
+    return WriteFacade(REAL_WORKSPACE, actor=REAL_ACTOR,
+                        cow_root=REAL_WORKSPACE,
+                        channel=RecordingConfirmationChannel())
+
+
+def _write_real_event(slug, title, token, **editable):
+    """Write a real event in the real workspace, idempotently.
+
+    WR-08 forbids overwriting an existing element, so a second run of this
+    test must REUSE the file the first run wrote instead of failing on it.
+    A test that only passes on a clean machine is a test that fails for a
+    reason that has nothing to do with what it measures.
+    """
+    facade = _real_facade()
+    body = _real_body(token, title)
+    try:
+        return facade.write_event(slug, title, body, date="2026-10-28",
+                                  **editable)
+    except TargetExistsError:
+        from agent.memory.naming import build_memory_path
+
+        rel = build_memory_path("events", slug, body, date="2026-10-28")
+        existing = facade._resolve(rel)
+        assert existing.exists(), (
+            "写入报『已存在』但文件不在 —— 判据的前件不成立")
+        return existing
+
+
+def _real_manager():
+    cfg = MemoryConfig(workspace_root=REAL_WORKSPACE, sync_on_search=False)
+    return MemoryManager(cfg, embedding_provider=None, reranker=None)
+
+
+def _real_db_path():
+    return Path(REAL_WORKSPACE) / "memory" / "long-term" / "index.db"
+
+
+@pytest.mark.skipif(not Path(REAL_WORKSPACE).is_dir(),
+                    reason="真实工作区不在本机")
+def test_l2_a_real_dark_page_is_sealed_only_for_its_owner():
+    """L-2（真实样本）：生产路径造的暗页，三面可见性必须一致。
+
+    ① 主人格可见 ② 第三方不可见 ③ 匿名不可见
+    ④ 索引里 scope='sealed' 且 sealed_owner 非空
+    ⑤ 端用户轴不承载归属令牌（P0-16 L-5 的两轴分离）
+    """
+    import sqlite3
+
+    dark = _write_real_event(
+        "p020-regression-dark", "P0-20 暗页回归", REAL_DARK_TOKEN,
+        visibility="sealed")
+    rel = dark.relative_to(REAL_WORKSPACE).as_posix()
+    mgr = _real_manager()
+    try:
+        asyncio.run(mgr.sync())
+
+        with identity_scope(agent_id=REAL_ACTOR):
+            owner_found = hits(mgr, REAL_DARK_TOKEN)
+        assert owner_found, "主人格检索不到自己的暗页（真实工作区上 L-2 失效）"
+        assert not hits(mgr, REAL_DARK_TOKEN, user_id="someone-else"), (
+            "第三方检索到了别人的暗页（真实工作区上 L-2 失效）")
+        assert not hits(mgr, REAL_DARK_TOKEN, user_id=None), (
+            "匿名检索到了暗页（真实工作区上 L-2 失效）")
+
+        conn = sqlite3.connect("file:%s?mode=ro" % _real_db_path(), uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT scope, user_id, sealed_owner FROM chunks "
+                "WHERE path = ?", (rel,)).fetchall()
+        finally:
+            conn.close()
+        assert rows, "暗页根本没进真实索引"
+        for row in rows:
+            assert row["scope"] == SCOPE_SEALED, (
+                f"暗页的 scope 不是 {SCOPE_SEALED}: {row['scope']!r}")
+            assert row["sealed_owner"] == agent_owner_token(REAL_ACTOR), (
+                f"暗页的归属令牌不对: {row['sealed_owner']!r}")
+            assert not (row["user_id"] or "").startswith("agent--"), (
+                f"端用户轴里混进了归属令牌: {row['user_id']!r}")
+    finally:
+        close_manager(mgr)
+
+
+@pytest.mark.skipif(not Path(REAL_WORKSPACE).is_dir(),
+                    reason="真实工作区不在本机")
+def test_l2_reverse_a_real_open_page_is_not_mistaken_for_a_dark_page():
+    """L-2 反向用例（真实样本）：白页不得被误判成暗页。
+
+    没有这条，上面那条可能只是「全都坏了」—— 白页和暗页一起消失，
+    三面断言里的「主人格可见」之外的每一条都会照样成立。
+    """
+    import sqlite3
+
+    opened = _write_real_event(
+        "p020-regression-open", "P0-20 白页回归", REAL_OPEN_TOKEN,
+        visibility="open")
+    rel = opened.relative_to(REAL_WORKSPACE).as_posix()
+    mgr = _real_manager()
+    try:
+        asyncio.run(mgr.sync())
+        with identity_scope(agent_id=REAL_ACTOR):
+            assert hits(mgr, REAL_OPEN_TOKEN), "白页对主人格不可见"
+        assert hits(mgr, REAL_OPEN_TOKEN, user_id="someone-else"), (
+            "白页对第三方不可见 —— 谓词把正常内容也吃了")
+        assert hits(mgr, REAL_OPEN_TOKEN, user_id=None), (
+            "白页对匿名不可见 —— 谓词把正常内容也吃了")
+
+        conn = sqlite3.connect("file:%s?mode=ro" % _real_db_path(), uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT scope, sealed_owner FROM chunks "
+                "WHERE path = ?", (rel,)).fetchall()
+        finally:
+            conn.close()
+        assert rows, "白页根本没进真实索引"
+        for row in rows:
+            assert row["scope"] != SCOPE_SEALED, (
+                "白页被标成了暗页 —— 整库都会变暗页")
+            assert not row["sealed_owner"], (
+                f"白页带上了归属令牌: {row['sealed_owner']!r}")
+    finally:
+        close_manager(mgr)

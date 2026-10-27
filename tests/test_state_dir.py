@@ -276,3 +276,84 @@ def test_tmp_file_is_unique_and_under_tmp_dir(monkeypatch, tmp_path):
     first, second = state_dir.tmp_file("wx_media", ".png"), state_dir.tmp_file("wx_media", ".png")
     assert first != second
     assert Path(first).parent == tmp_path and first.endswith(".png")
+
+
+# ---------------------------------------------------------------------------
+# P0-20 L-1：源码树不是合法的工作区
+# ---------------------------------------------------------------------------
+#
+# 交办单第 4 条：「state_dir 不要把源码树当成合法 workspace」。
+#
+# 事故经过（实测）：某次运行的 workspace 解析到了仓库根，于是
+# manager 的扫描把**共享知识库**索引进了**仓库根自己的**
+# ``memory/long-term/index.db`` —— 2.1 MB、106 条、全部是别人知识库的
+# 副本。那个文件既没被跟踪也没被忽略，于是 ``git clone`` 的人会拿到它。
+#
+# 这条守卫放在 state_dir 而不是只放在验收判据里，是因为 state_dir 是
+# **唯一**决定状态落在哪里的地方：判据只是一个写入者，而脚本、工具、
+# 桌面端都走这里。
+
+def test_a_workspace_inside_a_source_tree_is_refused(tmp_path):
+    """L-1：工作区落在 git 源码树内 → 拒绝，并说明该指向哪里。"""
+    tree = tmp_path / "repo"
+    (tree / ".git").mkdir(parents=True)
+    ws = tree / "sub" / "workspace"
+    ws.mkdir(parents=True)
+
+    with pytest.raises(state_dir.SourceTreeWorkspaceError) as exc:
+        state_dir.assert_not_source_tree(ws)
+
+    # 拒绝必须说清楚「该指向哪里」，否则它只是挡住工作。
+    message = str(exc.value)
+    assert "源码树" in message
+    assert "agent_workspace" in message
+
+
+def test_the_repository_root_itself_is_refused(tmp_path):
+    """L-1：工作区就是仓库根本身 → 同样拒绝。"""
+    tree = tmp_path / "repo"
+    (tree / ".git").mkdir(parents=True)
+
+    with pytest.raises(state_dir.SourceTreeWorkspaceError):
+        state_dir.assert_not_source_tree(tree)
+
+
+def test_a_worktree_dot_git_file_counts_as_a_source_tree(tmp_path):
+    """L-1：``.git`` 是**文件**（worktree / submodule）也算源码树。
+
+    只认目录会把 worktree 和 submodule 漏掉 —— 而那正是最容易在开发中
+    被当成工作区的地方。
+    """
+    tree = tmp_path / "wt"
+    tree.mkdir()
+    (tree / ".git").write_text("gitdir: C:/somewhere/else/.git/worktrees/wt\n",
+                                encoding="utf-8")
+
+    assert state_dir._source_tree_root(tree) == tree.resolve()
+    with pytest.raises(state_dir.SourceTreeWorkspaceError):
+        state_dir.assert_not_source_tree(tree)
+
+
+def test_a_normal_workspace_is_not_refused(tmp_path):
+    """L-1 反向用例：普通工作区（不在 git 树内）必须照旧可用。
+
+    没有这条，守卫可能变成「一切皆拒绝」—— 那不是修复，是停机。
+    """
+    ws = tmp_path / "cow"
+    ws.mkdir()
+    state_dir.assert_not_source_tree(ws)      # 不抛即通过
+
+
+def test_state_root_refuses_a_source_tree_workspace(tmp_path):
+    """L-1：守卫接在 state_root 上（真正决定状态落地的那一处）。"""
+    tree = tmp_path / "repo"
+    (tree / ".git").mkdir(parents=True)
+    ws = tree / "workspace"
+    ws.mkdir()
+
+    set_agent_registry(AgentRegistry.from_config({"agent_workspace": str(ws)}))
+    try:
+        with pytest.raises(state_dir.SourceTreeWorkspaceError):
+            state_dir.state_root()
+    finally:
+        set_agent_registry(None)
