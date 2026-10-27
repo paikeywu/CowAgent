@@ -574,3 +574,117 @@ def test_l4_a_degraded_read_clears_when_the_truth_layer_resolves(tmp_path):
         encoding="utf-8").splitlines() if x.strip()]
     assert len(lines) == 1, "the audit history was lost on recovery"
 
+
+# --- P0-17 B-3: schema drift must be visible, and only when real ---------
+#
+# P0-17 found the worst failure shape in this system: an index whose
+# schema is behind the code made every retrieval query fail, the failure
+# was caught, and the system reported "no matches" — indistinguishable
+# from an empty corpus, with no error and no red light anywhere.
+#
+# These tests pin the check's three properties: it fires on real drift,
+# it names the workspace and the columns, and it does NOT fire on a
+# complete index (a check that cries wolf on a healthy system gets
+# ignored, which is the same as having no check at all).
+
+
+def _drift_violations(report):
+    return [v for v in report["violations"]
+            if v.get("code") == "schema-drift"]
+
+
+def _make_drifted_index_db(ws, drop_columns=("sealed_owner",)):
+    """An index whose schema is behind the current code."""
+    from agent.memory.schema_drift import EXPECTED_CHUNK_COLUMNS
+
+    db = ws / "memory" / "long-term" / "index.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db))
+    cols = []
+    for name in EXPECTED_CHUNK_COLUMNS:
+        if name in drop_columns:
+            continue
+        if name == "id":
+            cols.append("id TEXT PRIMARY KEY")
+        elif name in ("user_id", "scope", "source", "path", "text", "hash",
+                      "metadata"):
+            cols.append(f"{name} TEXT")
+        elif name in ("start_line", "end_line", "created_at", "updated_at",
+                      "last_hit_at"):
+            cols.append(f"{name} INTEGER")
+        elif name == "embedding":
+            cols.append("embedding TEXT")
+        elif name == "hit_count":
+            cols.append("hit_count INTEGER NOT NULL DEFAULT 0")
+        elif name in ("element_released", "file_sealed"):
+            cols.append(f"{name} INTEGER NOT NULL DEFAULT 0")
+    conn.execute("CREATE TABLE chunks (" + ", ".join(cols) + ")")
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_b3_schema_drift_is_reported_with_the_workspace_and_the_columns(tmp_path):
+    """A stale index turns the inspector RED, naming the columns."""
+    cow, ws = tmp_path, tmp_path / "agents" / ACTOR
+    (ws / "memory").mkdir(parents=True)
+    db = _make_drifted_index_db(ws)
+
+    # REVERSE CASE first: a complete index is not drift.
+    from agent.memory.schema_drift import repair_columns
+    repair_columns(db)
+    assert not _drift_violations(Inspector(ws).inspect()), \
+        "a complete index was reported as drift"
+
+    # Now break it on purpose.
+    conn = sqlite3.connect(str(db))
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)")}
+    if "sealed_owner" in cols:
+        # SQLite cannot DROP a column before 3.35 — it has 3.53, so this
+        # rebuilds the table without it.
+        keep = [c for c in cols if c != "sealed_owner"]
+        collist = ", ".join(keep)
+        conn.execute(f"CREATE TABLE chunks_new ({collist})")
+        conn.execute("INSERT INTO chunks_new SELECT " +
+                     ", ".join(keep) + " FROM chunks")
+        conn.execute("DROP TABLE chunks")
+        conn.execute("ALTER TABLE chunks_new RENAME TO chunks")
+        conn.commit()
+    conn.close()
+
+    hits = _drift_violations(Inspector(ws).inspect())
+    assert hits, "the inspector did NOT report the schema drift"
+    assert hits[0]["severity"] == "high"
+    assert "sealed_owner" in hits[0]["missing_columns"]
+    assert str(ws) in hits[0]["index_root"]
+
+
+def test_b3_schema_drift_clears_when_the_index_is_migrated(tmp_path):
+    """The check goes green by itself once the column is added."""
+    cow, ws = tmp_path, tmp_path / "agents" / ACTOR
+    (ws / "memory").mkdir(parents=True)
+    db = _make_drifted_index_db(ws)
+
+    hits = _drift_violations(Inspector(ws).inspect())
+    assert hits, "the drift was not reported in the first place"
+
+    from agent.memory.schema_drift import repair_columns
+
+    added = repair_columns(db)
+    assert "sealed_owner" in added
+    assert not _drift_violations(Inspector(ws).inspect()), \
+        "the check stayed red after the migration"
+
+
+def test_b3_schema_drift_never_repairs_the_index(tmp_path):
+    """REPORT-ONLY: the inspector must not migrate what it reports."""
+    cow, ws = tmp_path, tmp_path / "agents" / ACTOR
+    (ws / "memory").mkdir(parents=True)
+    db = _make_drifted_index_db(ws)
+    before = db.read_bytes()
+
+    hits = _drift_violations(Inspector(ws).inspect())
+    assert hits
+    assert db.read_bytes() == before, \
+        "the inspector modified the index it was supposed to only report"
+

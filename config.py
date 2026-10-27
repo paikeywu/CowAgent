@@ -636,6 +636,22 @@ def load_config():
     # downstream layer (logs, CLI, agent prompts, channel replies) shares it.
     resolved_lang = i18n.resolve_language(config.get("cow_lang", "auto"))
 
+    # P0-17 B-1: bring EVERY workspace's memory index up to the current
+    # schema, right after the registry is built (the registry is what says
+    # which workspaces exist). Doing it here rather than lazily is the
+    # point: an index that is only migrated when its agent is addressed
+    # stays behind the schema until then, and its first retrieval query
+    # fails — silently, as "no matches".
+    try:
+        from agent.memory.schema_migrate import run_startup_migration
+
+        run_startup_migration()
+    except Exception as e:
+        # A migration problem must not stop the process from booting: the
+        # retrieval path fails loudly on its own (P0-17 B-2), and the
+        # inspector reports the drift (P0-17 B-3).
+        logger.error("[INIT] Memory index schema migration failed: %s", e)
+
     logger.info("[INIT] load config: {}".format(drag_sensitive(config)))
 
     # print system initialization info

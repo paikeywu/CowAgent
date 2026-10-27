@@ -304,6 +304,22 @@ class SearchResult:
     user_id: Optional[str] = None
 
 
+class MemorySchemaError(RuntimeError):
+    """The index's SCHEMA does not match what the code needs.
+
+    P0-17 B-2: a structural failure (a missing column, a broken index, a
+    schema the current code cannot query) used to be caught and turned into
+    an EMPTY result list. That is the most dangerous failure shape in this
+    system, because "no matches" and "the query could not run" are
+    indistinguishable from the outside — the retrieval exits reported
+    "found nothing" while the truth was "the query never ran". It reads as
+    a working system that happens to know nothing.
+
+    So the two are now separated: a structural failure RAISES, and only a
+    genuine absence of matches returns ``[]``.
+    """
+
+
 class MemoryStorage:
     """SQLite-based storage with FTS5 for keyword search"""
     
@@ -581,6 +597,11 @@ class MemoryStorage:
         self._migrate_hit_columns()
         # P0-11 P-2: same for the release projection flags.
         self._migrate_release_columns()
+        # P0-17 B-1/B-2: the schema is now CHECKED. The migration adds what
+        # this build knows; this proves the result is queryable, so a
+        # database that could not be migrated fails here — loudly, at open
+        # time — instead of returning empty results for every later query.
+        self._verify_schema()
 
         # Create indexes
         self.conn.execute("""
@@ -732,6 +753,44 @@ class MemoryStorage:
             # gave.
             self.conn.execute(
                 "ALTER TABLE chunks ADD COLUMN sealed_owner TEXT"
+            )
+
+    def _verify_schema(self):
+        """Fail loudly when the index cannot answer the queries we run.
+
+        P0-17 B-2: the migration above ADDS the columns this build knows
+        about, but it cannot add a column a future build introduced, and
+        a database whose file is not writable cannot be migrated at all.
+        Either way the retrieval queries would fail with "no such column",
+        and the retrieval path used to catch that and return an empty list
+        — indistinguishable from "nothing matched".
+
+        So the schema is CHECKED, not assumed, and a mismatch raises
+        :class:`MemorySchemaError`. The check is metadata-only (one
+        ``PRAGMA table_info``), so it is cheap enough to run on every open.
+        """
+        from agent.memory.schema_drift import (
+            EXPECTED_CHUNK_COLUMNS,
+            chunk_columns,
+        )
+
+        cols = chunk_columns(self.conn)
+        if cols is None:
+            # No chunks table at all: this database was never initialized.
+            # _init_db creates it before this runs, so reaching here means
+            # the CREATE was skipped — which is itself a structural
+            # failure worth reporting rather than querying.
+            raise MemorySchemaError(
+                f"[MemoryStorage] index {self.db_path} has no 'chunks' table; "
+                f"the schema was never initialized"
+            )
+        missing = [c for c in EXPECTED_CHUNK_COLUMNS if c not in cols]
+        if missing:
+            raise MemorySchemaError(
+                f"[MemoryStorage] index {self.db_path} is missing the column(s) "
+                f"{', '.join(missing)}; the retrieval queries cannot run "
+                f"against it. Migrate it (ALTER TABLE chunks ADD COLUMN ...) "
+                f"before searching."
             )
 
     def _migrate_legacy_fts_triggers(self) -> bool:
@@ -1167,15 +1226,26 @@ class MemoryStorage:
         # match only the ASCII portion of a mixed query (e.g. "Python" from
         # "Python教程") and silently discard the CJK part.  Those queries go
         # directly to Step 2 (trigram), which handles both ASCII and CJK together.
+        #
+        # P0-17 B-2: a stage that fails for a STRUCTURAL reason is recorded
+        # and the chain continues — a broken FTS5 shadow table must not kill
+        # keyword search. But if EVERY stage failed, the call is an ERROR,
+        # not an empty result: raising here is what stops "the query could
+        # not run" from being reported as "nothing matched".
+        first_failure: Optional[MemorySchemaError] = None
         fts1_attempted = False
         if (self.fts5_available
                 and not MemoryStorage._contains_cjk(query)
                 and MemoryStorage._build_fts_query(query)):
             fts1_attempted = True
-            fts_results = self._search_fts5(query, user_id, scopes, limit,
-                                            identities, owner_tokens)
-            if fts_results:
-                return fts_results
+            try:
+                fts_results = self._search_fts5(query, user_id, scopes, limit,
+                                                identities, owner_tokens)
+            except MemorySchemaError as e:
+                first_failure = first_failure or e
+            else:
+                if fts_results:
+                    return fts_results
 
         # Step 2: Trigram FTS5 — CJK/mixed queries, plus fallback when unicode61
         # returned nothing (trigram indexes all scripts with 3-char sliding windows,
@@ -1183,19 +1253,35 @@ class MemoryStorage:
         if self.trigram_fts5_available and (
             MemoryStorage._contains_cjk(query) or fts1_attempted
         ):
-            trigram_results = self._search_fts5_trigram(
-                query, user_id, scopes, limit, identities, owner_tokens)
-            if trigram_results:
-                return trigram_results
+            try:
+                trigram_results = self._search_fts5_trigram(
+                    query, user_id, scopes, limit, identities, owner_tokens)
+            except MemorySchemaError as e:
+                first_failure = first_failure or e
+            else:
+                if trigram_results:
+                    return trigram_results
 
         # Step 3: LIKE fallback — last resort (FTS5 unavailable, CJK queries
         # trigram cannot match, or an FTS5 stage that found nothing).
         if (not self.fts5_available
                 or MemoryStorage._contains_cjk(query)
                 or fts1_attempted):
-            return self._search_like(query, user_id, scopes, limit, identities,
-                                     owner_tokens)
+            try:
+                like_results = self._search_like(query, user_id, scopes, limit,
+                                                 identities, owner_tokens)
+            except MemorySchemaError as e:
+                first_failure = first_failure or e
+            else:
+                # A stage that RAN and found nothing is a genuine empty
+                # result: the caller gets [].
+                return like_results
 
+        # Every stage failed: the query never ran. That is an error, not an
+        # absence of matches, and saying otherwise is the silent lie this
+        # whole change exists to remove.
+        if first_failure is not None:
+            raise first_failure
         return []
     
     def _search_fts5(
@@ -1245,10 +1331,18 @@ class MemoryStorage:
                 )
                 for row in rows
             ]
-        except Exception:
+        except sqlite3.Error as e:
+            # P0-17 B-2: a STRUCTURAL failure must not become "no matches".
+            # "The query could not run" and "nothing matched" are
+            # indistinguishable from the outside, and the second reading is
+            # a lie. So this raises.
             from common.log import logger
-            logger.warning("[MemoryStorage] _search_fts5 failed, returning empty", exc_info=True)
-            return []
+            logger.error(
+                "[MemoryStorage] _search_fts5 failed (structural error, "
+                "refusing to report an empty result): %s", e, exc_info=True)
+            raise MemorySchemaError(
+                f"[MemoryStorage] FTS5 search failed on {self.db_path}: {e}"
+            ) from e
 
     @staticmethod
     def _snippet_around(text: str, query: str, max_chars: int = 500) -> str:
@@ -1390,10 +1484,16 @@ class MemoryStorage:
 
             results.sort(key=lambda r: r.score, reverse=True)
             return results
-        except Exception:
+        except sqlite3.Error as e:
+            # P0-17 B-2: same rule as the FTS5 path — a structural failure
+            # raises instead of masquerading as "no matches".
             from common.log import logger
-            logger.warning("[MemoryStorage] _search_like failed, returning empty", exc_info=True)
-            return []
+            logger.error(
+                "[MemoryStorage] _search_like failed (structural error, "
+                "refusing to report an empty result): %s", e, exc_info=True)
+            raise MemorySchemaError(
+                f"[MemoryStorage] LIKE search failed on {self.db_path}: {e}"
+            ) from e
 
     def _search_like_relaxed(
         self,
@@ -1437,8 +1537,20 @@ class MemoryStorage:
             params.append(limit)
             try:
                 rows = self.conn.execute(sql, params).fetchall()
-            except Exception:
-                continue
+            except sqlite3.Error as e:
+                # P0-17 B-2: this path used to `continue`, which dropped the
+                # group silently — the relaxed search then returned a
+                # PARTIAL result set, which is worse than an empty one:
+                # it looks like an answer. A structural failure raises.
+                from common.log import logger
+                logger.error(
+                    "[MemoryStorage] _search_like_relaxed failed (structural "
+                    "error, refusing to report a partial result): %s", e,
+                    exc_info=True)
+                raise MemorySchemaError(
+                    f"[MemoryStorage] relaxed LIKE search failed on "
+                    f"{self.db_path}: {e}"
+                ) from e
             for row in rows:
                 key = (row['path'], row['start_line'], row['end_line'])
                 if key in seen:
@@ -1837,10 +1949,17 @@ class MemoryStorage:
                 ))
             results.sort(key=lambda r: r.score, reverse=True)
             return results
-        except Exception:
+        except sqlite3.Error as e:
+            # P0-17 B-2: same rule as the FTS5 path — a structural failure
+            # raises instead of masquerading as "no matches".
             from common.log import logger
-            logger.warning("[MemoryStorage] _search_fts5_trigram failed, returning empty", exc_info=True)
-            return []
+            logger.error(
+                "[MemoryStorage] _search_fts5_trigram failed (structural error, "
+                "refusing to report an empty result): %s", e, exc_info=True)
+            raise MemorySchemaError(
+                f"[MemoryStorage] trigram FTS5 search failed on "
+                f"{self.db_path}: {e}"
+            ) from e
 
     @staticmethod
     def _build_fts_query(raw_query: str) -> Optional[str]:

@@ -808,3 +808,264 @@ def test_f1_a_the_placeholder_leaks_nothing_about_the_original(tmp_path):
     # no count of what was withheld
     assert "1" not in masked.split('"element_id"')[0]
     assert "count" not in masked and "filtered" not in masked
+
+
+# --- P0-17 B-1/B-2: a stale index must not look like an empty corpus ------
+#
+# P0-17's finding: an index whose schema was behind the code made every
+# retrieval query fail with "no such column"; the search path caught the
+# error and returned an EMPTY LIST. From the outside that is
+# indistinguishable from "nothing matched" — the system looked healthy
+# and knew nothing.
+#
+# These tests pin the two halves of the fix:
+#   * B-2 — a structural failure RAISES (and logs at ERROR level);
+#   * B-2 reverse — a genuine absence of matches still returns [] quietly.
+# and the migration that makes B-1 self-healing:
+#   * B-1 — opening a stale index adds the missing column.
+
+import logging
+import sqlite3
+import threading
+from pathlib import Path
+
+from agent.memory.storage import MemorySchemaError, MemoryStorage
+
+
+def _stale_index(tmp_path, drop_columns=("sealed_owner",)):
+    """An index.db written by an older build: same rows, older schema."""
+    from agent.memory.schema_drift import EXPECTED_CHUNK_COLUMNS
+
+    db = tmp_path / "index.db"
+    conn = sqlite3.connect(str(db))
+    definitions = []
+    for name in EXPECTED_CHUNK_COLUMNS:
+        if name in drop_columns:
+            continue
+        if name == "id":
+            definitions.append("id TEXT PRIMARY KEY")
+        elif name in ("user_id", "scope", "source", "path", "text", "hash",
+                      "metadata"):
+            definitions.append(f"{name} TEXT")
+        elif name in ("start_line", "end_line", "created_at", "updated_at",
+                      "last_hit_at"):
+            definitions.append(f"{name} INTEGER")
+        elif name == "embedding":
+            definitions.append("embedding TEXT")
+        elif name == "hit_count":
+            definitions.append("hit_count INTEGER NOT NULL DEFAULT 0")
+        elif name in ("element_released", "file_sealed"):
+            definitions.append(f"{name} INTEGER NOT NULL DEFAULT 0")
+    conn.execute("CREATE TABLE chunks (" + ", ".join(definitions) + ")")
+    conn.execute("INSERT INTO chunks (id, user_id, scope, source, path, "
+                 "start_line, end_line, text, hash) VALUES "
+                 "('c1', NULL, 'shared', 'memory', 'memory/a.md', 1, 1, "
+                 "'内容内容 FTS5 内容', 'h1')")
+    conn.commit()
+    conn.close()
+    return db
+
+
+def _columns(db):
+    conn = sqlite3.connect(str(db))
+    try:
+        return {r[1] for r in conn.execute("PRAGMA table_info(chunks)")}
+    finally:
+        conn.close()
+
+
+def test_b1_opening_a_stale_index_migrates_it(tmp_path):
+    """B-1: the migration runs when the index is OPENED."""
+    db = _stale_index(tmp_path)
+    assert "sealed_owner" not in _columns(db)
+
+    storage = MemoryStorage(db)
+    try:
+        assert "sealed_owner" in _columns(db), (
+            "the migration did not add the missing column")
+        # and the index is usable
+        results = storage.search_keyword("FTS5", limit=5,
+                                         scopes=["shared", "user", "sealed"])
+        assert results, "the migrated index returned nothing"
+    finally:
+        storage.close()
+
+
+def test_b1_migrate_all_covers_every_workspace(tmp_path):
+    """B-1: the batch migration reaches EVERY workspace, not just one."""
+    from agent.memory.schema_migrate import migrate_all
+
+    roots = []
+    for i in range(3):
+        ws = tmp_path / f"ws{i}"
+        db = ws / "memory" / "long-term" / "index.db"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        stale = _stale_index(ws)
+        for suffix in ("-wal", "-shm"):
+            extra = stale.with_name(stale.name + suffix)
+            if extra.exists():
+                extra.replace(db.with_name(db.name + suffix))
+        stale.replace(db)
+        roots.append(str(ws))
+
+    migrated, failed = migrate_all(roots=roots)
+    assert not failed, f"migration failed: {failed}"
+    assert len(migrated) == 3
+    for ws in roots:
+        db = Path(ws) / "memory" / "long-term" / "index.db"
+        assert "sealed_owner" in _columns(db), f"{ws} was not migrated"
+
+
+def _unmigrated_storage(db):
+    """A storage instance whose schema was NOT migrated.
+
+    ``MemoryStorage(db)`` migrates on open, so the broken state has to be
+    built by hand — that is precisely the state a workspace is in when the
+    migration could not run (an unwritable file, a build that predates the
+    column, a database the current code never opened).
+    """
+    storage = MemoryStorage.__new__(MemoryStorage)
+    storage.db_path = db
+    storage.conn = sqlite3.connect(str(db))
+    storage.conn.row_factory = sqlite3.Row
+    storage.vector_backend = None
+    storage._lock = threading.RLock()
+    storage.fts5_available = False
+    storage.trigram_fts5_available = False
+    return storage
+
+
+def test_b2_a_stale_index_raises_instead_of_returning_empty(tmp_path):
+    """B-2: a structural failure is an ERROR, not an empty result set.
+
+    The trigger is a caller that holds an OWNER token: only then does the
+    visibility predicate name ``sealed_owner`` at all. A caller without
+    one never reaches the missing column (the sealed branch is the
+    constant ``(0)``), which is why the failure looked intermittent.
+    """
+    db = _stale_index(tmp_path)
+    storage = _unmigrated_storage(db)
+
+    with pytest.raises(MemorySchemaError):
+        storage.search_keyword("FTS5", limit=5,
+                               scopes=["shared", "user", "sealed"],
+                               owner_tokens=["agent--someone"])
+
+
+def test_b2_reverse_an_anonymous_caller_on_a_stale_index_still_gets_results(
+        tmp_path):
+    """B-2 REVERSE (the other half of the trigger condition).
+
+    A caller with NO owner token never names the missing column, so its
+    query runs and returns its hits. This is what makes the failure look
+    intermittent: the same stale index answers an anonymous CLI and
+    fails an agent.
+    """
+    db = _stale_index(tmp_path)
+    storage = _unmigrated_storage(db)
+
+    results = storage.search_keyword("FTS5", limit=5,
+                                     scopes=["shared", "user", "sealed"])
+    assert results, "an anonymous caller on a stale index got nothing"
+
+
+def test_b2_a_stale_index_logs_at_error_level(tmp_path):
+    """B-2: the failure must be LOUD — an ERROR line, not a silent []."""
+    from common.log import logger
+
+    db = _stale_index(tmp_path)
+    storage = _unmigrated_storage(db)
+
+    records = []
+
+    class _Cap(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    cap = _Cap()
+    logger.addHandler(cap)
+    try:
+        with pytest.raises(MemorySchemaError):
+            storage.search_keyword("FTS5", limit=5,
+                                   scopes=["shared", "user", "sealed"],
+                                   owner_tokens=["agent--someone"])
+    finally:
+        logger.removeHandler(cap)
+
+    errors = [r for r in records if r.levelno >= logging.ERROR]
+    assert errors, "no ERROR log line was emitted for a structural failure"
+    assert "refusing to report an empty result" in errors[0].getMessage()
+
+
+def test_b2_reverse_a_genuinely_empty_index_returns_empty_without_error(tmp_path):
+    """B-2 REVERSE: 'nothing matched' must still be [] and must stay quiet."""
+    db = tmp_path / "index.db"
+    storage = MemoryStorage(db)
+    try:
+        records = []
+
+        class _Cap(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        cap = _Cap()
+        from common.log import logger
+
+        logger.addHandler(cap)
+        try:
+            results = storage.search_keyword(
+                "FTS5", limit=5, scopes=["shared", "user", "sealed"])
+        finally:
+            logger.removeHandler(cap)
+
+        assert results == [], "an empty index returned something"
+        errors = [r for r in records if r.levelno >= logging.ERROR]
+        assert not errors, f"a normal empty result logged errors: {errors}"
+    finally:
+        storage.close()
+
+
+def test_b2_reverse_a_full_index_without_a_match_returns_empty(tmp_path):
+    """B-2 REVERSE: rows exist, the query matches none → [] and no error."""
+    db = _stale_index(tmp_path)
+    storage = MemoryStorage(db)
+    try:
+        results = storage.search_keyword("ZZZNOMATCHZZZ", limit=5,
+                                         scopes=["shared", "user", "sealed"])
+        assert results == [], "a non-matching query returned something"
+    finally:
+        storage.close()
+
+
+def test_b2_the_manager_propagates_the_schema_failure(tmp_path):
+    """B-2: the failure must reach the caller, not stop at the storage."""
+    import asyncio
+
+    from agent.memory.config import MemoryConfig
+    from agent.memory.manager import MemoryManager
+    from common.runtime_identity import RuntimeIdentity, use_identity
+
+    ws = tmp_path / "ws"
+    (ws / "memory").mkdir(parents=True)
+    cfg = MemoryConfig(workspace_root=str(ws), sync_on_search=False)
+    mgr = MemoryManager(cfg, embedding_provider=None, reranker=None)
+    try:
+        # Break the index AFTER the manager opened it: the queries will
+        # name a column that is gone.
+        conn = mgr.storage.conn
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)")}
+        if "sealed_owner" in cols:
+            keep = [c for c in cols if c != "sealed_owner"]
+            collist = ", ".join(keep)
+            conn.execute(f"CREATE TABLE chunks_new ({collist})")
+            conn.execute("INSERT INTO chunks_new SELECT " +
+                         ", ".join(keep) + " FROM chunks")
+            conn.execute("DROP TABLE chunks")
+            conn.execute("ALTER TABLE chunks_new RENAME TO chunks")
+            conn.commit()
+        # An agent identity — that is what supplies the owner token.
+        with use_identity(RuntimeIdentity(agent_id="agent-x")):
+            with pytest.raises(MemorySchemaError):
+                asyncio.run(mgr.search("FTS5", max_results=5, min_score=0.0))
+    finally:
+        mgr.storage.close()

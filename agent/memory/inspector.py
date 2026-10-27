@@ -80,6 +80,13 @@ REASON_PROJECTION_DEGRADED = "gap-rule:release-projection-degraded"
 # marker was written by nobody who read it — the loudest possible
 # silence.
 REASON_READ_DEGRADED = "gap-rule:read-degraded"
+# P0-17 B-3: an index whose SCHEMA is behind the code. The retrieval
+# queries name columns that a stale index does not have, the SQL raises,
+# and (before P0-17) the failure was caught and reported as "no matches".
+# The drift is therefore invisible from the outside — the system looks
+# healthy and knows nothing. Naming the workspace and the columns is what
+# turns it into something a human can act on.
+REASON_SCHEMA_DRIFT = "gap-rule:schema-drift"
 
 # Short machine codes carried on every violation (the shelf view needs a
 # stable code, not a sentence).
@@ -89,6 +96,7 @@ CODE_INDEX_EXCLUDED = "index-excluded-path"
 CODE_INDEX_ORPHAN = "index-orphan"
 CODE_PROJECTION_DEGRADED = "release-projection-degraded"
 CODE_READ_DEGRADED = "read-degraded"
+CODE_SCHEMA_DRIFT = "schema-drift"
 
 # Path segments the sync scan skips by policy (agent/memory/manager.py).
 # A chunk row under any of them is a policy violation, not a stale page.
@@ -189,6 +197,7 @@ class Inspector:
         self._check_index_hygiene(report)
         self._check_projection_degraded(report)
         self._check_read_degraded(report)
+        self._check_schema_drift(report)
         if persist_snapshot:
             self._write_snapshot(snapshot)
         self._write_audit(report)
@@ -515,6 +524,92 @@ class Inspector:
             last_path=payload.get("last_path"),
             at=payload.get("at"),
             error=payload.get("last_error"))
+
+    # -- check 8: index schema drift (P0-17 B-3) ----------------------------
+
+    def _check_schema_drift(self, report: Dict[str, Any]) -> None:
+        """Report an index whose SCHEMA is behind the current code.
+
+        A stale index is invisible from the outside: the retrieval queries
+        name a column it does not have, the SQL raises, and (before P0-17)
+        the failure was caught and returned as an empty result set. The
+        system looked healthy and knew nothing — the most expensive kind
+        of silence, because nobody goes looking for a bug in a system
+        that reports no errors.
+
+        The check names the workspace AND the columns, because "an index
+        is behind" is not actionable: the person reading it has to know
+        which file to migrate and what to add.
+
+        A workspace whose index is complete is NOT reported — the check
+        goes green by itself once the migration has run, and a check that
+        cries wolf on a healthy index gets ignored.
+        """
+        from agent.memory.schema_drift import (
+            describe_drift,
+            missing_columns,
+            scan_workspaces,
+        )
+
+        roots = self._drift_roots()
+        # This workspace's own index first (the one being inspected), then
+        # every other workspace the roster knows about.
+        drift = scan_workspaces(roots)
+        own_db = self._index_db_path()
+        if own_db.is_file():
+            own_missing = missing_columns(own_db)
+            if own_missing:
+                drift.setdefault(str(self.workspace_root), own_missing)
+
+        for root in sorted(drift):
+            missing = drift[root]
+            rel = self._relative_to_self(root)
+            self._violation(
+                report, REASON_SCHEMA_DRIFT, rel,
+                f"the index is behind the current schema (missing "
+                f"{', '.join(missing)}); retrieval queries against it fail, "
+                f"and a failed query is reported as 'no matches' rather "
+                f"than as an error",
+                _SEV_HIGH, code=CODE_SCHEMA_DRIFT,
+                missing_columns=missing,
+                index_root=root,
+                drift_summary=describe_drift({root: missing}),
+            )
+
+    def _relative_to_self(self, root: str) -> str:
+        """The workspace root as a path relative to this workspace, when it
+        is inside it; otherwise the absolute path."""
+        try:
+            return Path(root).relative_to(self.workspace_root).as_posix() or "."
+        except ValueError:
+            return str(root)
+
+    def _drift_roots(self) -> List[str]:
+        """Every workspace root whose index should be checked.
+
+        The roster is the source of truth for which workspaces exist — the
+        agents directory is only a layout detail, and a workspace may live
+        anywhere. When the roster cannot be resolved (a source checkout
+        with no team.json, a test), this workspace alone is checked: the
+        check degrades to "less coverage", never to a false red.
+        """
+        roots = [str(self.workspace_root)]
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+            from agent.registry import get_agent_registry
+
+            for profile in get_agent_registry().list(include_disabled=True):
+                roots.append(str(profile.workspace))
+        except Exception:
+            pass
+        # Deduplicate, keep order.
+        seen = set()
+        unique = []
+        for root in roots:
+            if root not in seen:
+                seen.add(root)
+                unique.append(root)
+        return unique
 
     # -- snapshots -------------------------------------------------------------
 
