@@ -1126,9 +1126,17 @@ class WriteFacade:
             )
             created.append(rev_real)
             # ③ tombstone
+            # P0-10 L-2: the tombstone is NOT a memory element, so it does
+            # not get the <slug>--<hash8>.md element contract — but it does
+            # get a stricter one of its own (validate_names.py
+            # _TOMBSTONE rules): <原元素名>.tombstone.md, where the original
+            # element name must itself satisfy the element naming rule, and
+            # the file must carry all 8 audit fields. `real.stem` drops the
+            # original .md so the name reads <slug>--<hash8>.tombstone.md
+            # instead of <slug>--<hash8>.md.tombstone.md.
             tomb_dir = self.memory_root / "markdown" / "_tombstones"
             tomb_dir.mkdir(parents=True, exist_ok=True)
-            tomb = tomb_dir / f"{real.name}.tombstone.md"
+            tomb = tomb_dir / f"{real.stem}.tombstone.md"
             tomb.write_text(
                 "---\n"
                 f"original_path: {relpath}\n"
@@ -1156,12 +1164,23 @@ class WriteFacade:
         return {"event": str(created[0]), "new_version": str(created[1]),
                 "tombstone": str(created[2])}
 
-    # -- shelf generator placeholder (P0-5 的接口位) ---------------------------
+    # -- shelf generator (P0-5 landed: agent/memory/shelf.py) -----------------
 
-    def generate_shelf(self) -> None:
-        """Projection generator hook. shelf/ is never hand-written (WR-06);
-        the generator that lands in P0-5 will own this."""
-        raise NotImplementedError("shelf generator lands with P0-5")
+    def generate_shelf(self) -> Dict[str, Any]:
+        """Rebuild this workspace's shelf/ projection.
+
+        P0-10 L-3: this used to be a NotImplementedError stub left over from
+        P0-4 ("the generator that lands in P0-5 will own this"). P0-5 has
+        landed, so a stub that raises is a landmine: anyone calling it gets
+        an exception instead of a directory card. It is now a thin wrapper
+        over the real generator.
+
+        The import is local on purpose: shelf.py imports from facade.py
+        (split_frontmatter), so a module-level import here would be a cycle.
+        """
+        from agent.memory.shelf import ShelfGenerator
+        generator = ShelfGenerator(self.workspace_root, agent_id=self.actor)
+        return generator.rebuild()
 
 
 def split_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:

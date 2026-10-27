@@ -327,6 +327,100 @@ def test_tc_e4_positive_full_release_flow(tmp_path):
     assert fm2 == {}
 
 
+# -- P0-10 L-2: tombstone naming + audit fields ------------------------------
+
+def test_tombstone_name_follows_its_own_rule(tmp_path):
+    """墓碑名必须是 <原元素名>.tombstone.md（原元素名本身符合元素命名规则）。
+
+    旧实现写的是 <原元素名>.md.tombstone.md（原名已含 .md）——那会让
+    validate_names 的门禁从 0 violating 变成 N violating。
+    """
+    cow, ws = make_cow(tmp_path)
+    f = facade_for(ws, cow, actor="peiqi")
+    profile = f.write_entity("people", "peiqi", "沛琦", "profile",
+                              subject="peiqi")
+    rel = profile.relative_to(ws).as_posix()
+    ref = f.channel.register_consent("peiqi", "peiqi")
+    token = f.initiate_release(rel, consent_ref=ref)["token"]
+    f.confirm_release(token)
+
+    tombs = list((ws / "memory" / "markdown" / "_tombstones").glob("*.tombstone.md"))
+    assert len(tombs) == 1
+    name = tombs[0].name
+    assert name.endswith(".tombstone.md")
+    assert not name.endswith(".md.tombstone.md"), f"墓碑名重复了 .md: {name}"
+    # <原元素名> 必须自身满足元素命名规则
+    stem = name[: -len(".tombstone.md")]
+    from agent.memory.naming import check_name
+    assert check_name(stem + ".md") is None, f"原元素名不合规: {stem}"
+
+
+def test_tombstone_carries_all_eight_audit_fields(tmp_path):
+    """墓碑必须带齐 8 个审计字段（缺一即违规）。"""
+    cow, ws = make_cow(tmp_path)
+    f = facade_for(ws, cow, actor="peiqi")
+    profile = f.write_entity("people", "peiqi", "沛琦", "profile",
+                              subject="peiqi")
+    rel = profile.relative_to(ws).as_posix()
+    ref = f.channel.register_consent("peiqi", "peiqi")
+    token = f.initiate_release(rel, consent_ref=ref)["token"]
+    f.confirm_release(token)
+
+    tomb = list((ws / "memory" / "markdown" / "_tombstones")
+                .glob("*.tombstone.md"))[0]
+    text = tomb.read_text(encoding="utf-8")
+    from scripts.memory.validate_names import TOMBSTONE_REQUIRED_FIELDS
+    for field in TOMBSTONE_REQUIRED_FIELDS:
+        assert f"{field}:" in text, f"墓碑缺少审计字段 {field}"
+
+
+def test_tombstone_passes_the_name_validator(tmp_path):
+    """端到端：释放一次后，全库 validate_names 仍是 0 violating。"""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]
+                           / "scripts" / "memory"))
+    import validate_names
+    cow, ws = make_cow(tmp_path)
+    f = facade_for(ws, cow, actor="peiqi")
+    profile = f.write_entity("people", "peiqi", "沛琦", "profile",
+                              subject="peiqi")
+    rel = profile.relative_to(ws).as_posix()
+    ref = f.channel.register_consent("peiqi", "peiqi")
+    token = f.initiate_release(rel, consent_ref=ref)["token"]
+    f.confirm_release(token)
+    violations = validate_names.validate_root(ws)
+    assert violations == [], f"释放后出现命名违规: {violations}"
+
+
+# -- P0-10 L-3: generate_shelf is no longer a stub --------------------------
+
+def test_generate_shelf_is_wired_to_the_real_generator(tmp_path):
+    """P0-5 已落地，generate_shelf() 不能再是抛异常的桩。"""
+    cow, ws = make_cow(tmp_path)
+    f = facade_for(ws, cow)
+    f.write_event("e1", "事件", "正文", date="2026-10-27")
+    report = f.generate_shelf()
+    assert isinstance(report, dict)
+    assert report["agent"] == ACTOR
+    shelf = ws / "memory" / "shelf"
+    assert (shelf / "index.md").is_file()
+    assert (shelf / "self.md").is_file()
+    assert (shelf / "gaps.md").is_file()
+
+
+def test_generate_shelf_never_raises_notimplemented(tmp_path):
+    cow, ws = make_cow(tmp_path)
+    f = facade_for(ws, cow)
+    try:
+        f.generate_shelf()
+    except NotImplementedError as e:  # pragma: no cover - the whole point
+        pytest.fail(f"generate_shelf 仍是桩: {e}")
+    except Exception:
+        pass  # any other failure is a real bug, surfaced by the test above
+
+
+
 # ---------------------------------------------------------------------------
 # P0-4 打回修复用例：editable 不可变字段注入（subject 伪造攻击链）
 # 风控 P0-6 实测：write() 过滤了 frontmatter，但四个结构化入口的

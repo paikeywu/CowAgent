@@ -38,7 +38,7 @@ import re
 import sys
 import tempfile
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -55,14 +55,109 @@ DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # Truth-layer files that are allowed to break the slug--hash8 pattern.
 PATTERN_ALLOWLIST = {"memory/markdown/README.md"}
 
+# ---------------------------------------------------------------------------
+# Tombstones (P0-10 L-2)
+#
+# A tombstone is NOT a memory element: it records that an element was
+# released and must never be released again. It therefore does not carry
+# an element_id, and the element contract (<slug>--<hash8>.md) does not
+# apply to it. But "not an element" is not an excuse — a tombstone is an
+# audit record, and an audit record that cannot be parsed is worthless.
+# So _tombstones gets a rule of its own that is STRICTER than the element
+# rule in the ways that matter:
+#
+#   1. the file name must be <原元素名>.tombstone.md, where 原元素名 itself
+#      must satisfy the element naming rule (so a tombstone always points
+#      at a name that could exist);
+#   2. the file must carry all 8 audit fields — a tombstone missing one of
+#      them cannot answer "who released this, on whose consent, when".
+#
+# This is NOT an exemption from the byte budget: check_relpath() still
+# applies to every tombstone.
+# ---------------------------------------------------------------------------
+TOMBSTONE_CONTAINER = "memory/markdown/_tombstones"
+TOMBSTONE_SUFFIX = ".tombstone.md"
+TOMBSTONE_NAME_RE = re.compile(r"^(?P<stem>.+)\.tombstone\.md$")
 
-def validate_file(relpath: str) -> List[str]:
-    """One workspace-relative POSIX path -> list of violations (empty = clean)."""
+# The 8 audit fields a tombstone must carry (SEED 裁决 2026-10-27).
+TOMBSTONE_REQUIRED_FIELDS = (
+    "original_path",
+    "original_hash",
+    "released_by",
+    "released_at",
+    "consent_ref",
+    "confirmation_token_hash",
+    "initiated_at",
+    "confirmed_at",
+)
+
+
+def _tombstone_problems(name: str, content: Optional[str]) -> List[str]:
+    """The dedicated rule set for memory/markdown/_tombstones/."""
+    problems: List[str] = []
+    m = TOMBSTONE_NAME_RE.match(name)
+    if not m:
+        problems.append(
+            f"name: tombstone files must be <原元素名>{TOMBSTONE_SUFFIX}, "
+            f"got {name!r}")
+        return problems
+    stem = m.group("stem")
+    # The original element name must itself satisfy the element rule, so a
+    # tombstone can never point at a name that could not exist.
+    bad = check_name(stem + ".md")
+    if bad:
+        problems.append(
+            f"name: the original element name {stem!r} does not satisfy the "
+            f"element naming rule ({bad})")
+    if content is None:
+        # No content available (caller did not read the file): the field
+        # check cannot run. validate_root() always reads, so this only
+        # affects direct calls to validate_file().
+        return problems
+    fm = _parse_frontmatter(content)
+    missing = [f for f in TOMBSTONE_REQUIRED_FIELDS if f not in fm]
+    if missing:
+        problems.append(
+            f"fields: tombstone is missing required audit field(s) "
+            f"{missing} (all of {list(TOMBSTONE_REQUIRED_FIELDS)} required)")
+    return problems
+
+
+def _parse_frontmatter(content: str) -> Dict[str, str]:
+    """Minimal front-matter reader — the tombstone rule needs field NAMES,
+    and validate_names.py must not grow a YAML dependency."""
+    if not content.startswith("---\n"):
+        return {}
+    end = content.find("\n---\n", 4)
+    if end == -1:
+        return {}
+    out: Dict[str, str] = {}
+    for line in content[4:end].splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if ":" not in line:
+            continue
+        key, _sep, value = line.partition(":")
+        out[key.strip()] = value.strip()
+    return out
+
+
+def validate_file(relpath: str, content: Optional[str] = None) -> List[str]:
+    """One workspace-relative POSIX path -> list of violations (empty = clean).
+
+    ``content`` is the file's text; it is required for the tombstone audit
+    field check (a tombstone's validity is half its name, half its fields)
+    and ignored everywhere else.
+    """
     problems: List[str] = []
     budget = check_relpath(relpath)
     if budget:
         problems.append(f"budget: {budget}")
     name = relpath.rsplit("/", 1)[-1]
+
+    if relpath.startswith(TOMBSTONE_CONTAINER + "/"):
+        problems.extend(_tombstone_problems(name, content))
+        return problems
 
     if relpath.startswith("memory/markdown/"):
         if relpath in PATTERN_ALLOWLIST:
@@ -117,7 +212,18 @@ def validate_root(root: Path) -> List[Tuple[str, List[str]]]:
     out: List[Tuple[str, List[str]]] = []
     for p in iter_memory_files(root):
         rel = p.relative_to(root).as_posix()
-        problems = validate_file(rel)
+        content: Optional[str] = None
+        if rel.startswith(TOMBSTONE_CONTAINER + "/"):
+            # Tombstones are judged on their fields too, so the content has
+            # to be read. A file we cannot read is reported, not skipped.
+            try:
+                content = p.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as e:
+                content = None
+                problems = [f"fields: tombstone cannot be read ({e})"]
+                out.append((rel, problems))
+                continue
+        problems = validate_file(rel, content)
         if problems:
             out.append((rel, problems))
     return out

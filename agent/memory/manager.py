@@ -552,6 +552,19 @@ class MemoryManager:
         # Agent is switched to its own knowledge/ — stayed in the index and kept
         # being returned by memory_search long after no tool could open it.
         #
+        # P0-10 L-1 (two holes closed here):
+        #   ① EXCLUDED paths. The live-memory layers the scan skips (shelf/,
+        #      facts/, .snapshots/, .audit/) were indexed before the skip
+        #      existed; their rows stayed behind and, being scope='shared' +
+        #      user_id=NULL, stayed anonymously searchable — a released
+        #      record's directory card leaking into third-party retrieval
+        #      (V2-Q-01). They are stale by definition now, so the reconcile
+        #      drops them.
+        #   ② ORPHAN chunk rows. list_paths() reads the `files` table; a
+        #      chunk row whose `files` counterpart was lost is invisible
+        #      there, so the reconcile could never see it and it survived
+        #      forever. list_chunk_paths() closes that.
+        #
         # Only a source whose root resolved and exists is reconciled. An empty
         # scan set then means the files are genuinely gone, rather than that the
         # root was momentarily unresolvable, which must not cost a whole index.
@@ -562,7 +575,9 @@ class MemoryManager:
             reconcilable.append("knowledge")
         for source in reconcilable:
             try:
-                stale = set(self.storage.list_paths(source)) - scanned.get(source, set())
+                indexed = set(self.storage.list_paths(source))
+                indexed |= set(self.storage.list_chunk_paths(source))
+                stale = indexed - scanned.get(source, set())
             except Exception as e:
                 logger.warning(f"[MemoryManager] Cannot reconcile {source} index: {e}")
                 continue

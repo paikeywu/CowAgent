@@ -355,3 +355,122 @@ def test_report_contains_no_writes_outside_audit_and_snapshots(tmp_path):
                for k in changed), f"inspector wrote outside audit/snapshots: {changed}"
     # truth-layer files byte-identical
     assert ev.read_bytes() == before[ev.relative_to(ws).as_posix()]
+
+
+# -- P0-10 L-1: index layer hygiene -----------------------------------------
+#
+# The inspector checks the TRUTH layer only (P0-8). P0-10 L-1 found that
+# the INDEX layer had no hygiene at all: rows that the scan excludes by
+# policy (shelf/ facts/ .snapshots/ .audit/) and orphan rows (a chunk whose
+# files-table counterpart is gone) stayed searchable — and because those
+# rows carry scope='shared' + user_id=NULL, EVERY caller could see them
+# (V2-Q-01: a released record's directory card leaking to third parties).
+
+import sqlite3
+
+
+def _make_index_db(ws, rows):
+    """Create a minimal index.db with the given (path, scope, user_id) rows.
+
+    ``rows`` entries: (path, scope, user_id, with_files_row).
+    """
+    db = ws / "memory" / "long-term" / "index.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db))
+    conn.execute("CREATE TABLE chunks (id TEXT PRIMARY KEY, user_id TEXT, "
+                 "scope TEXT, source TEXT, path TEXT, text TEXT)")
+    conn.execute("CREATE TABLE files (path TEXT PRIMARY KEY, source TEXT, "
+                 "hash TEXT, mtime INTEGER, size INTEGER, updated_at TEXT)")
+    for i, (path, scope, user_id, with_files) in enumerate(rows):
+        conn.execute(
+            "INSERT INTO chunks (id, user_id, scope, source, path, text) "
+            "VALUES (?,?,?,?,?,?)",
+            (f"c{i}", user_id, scope, "memory", path, "some text"))
+        if with_files:
+            conn.execute(
+                "INSERT INTO files (path, source, hash) VALUES (?,?,?)",
+                (path, "memory", "h"))
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_index_excluded_path_is_reported(tmp_path):
+    """A chunk under an excluded layer must be reported (it is searchable)."""
+    cow, ws = tmp_path, tmp_path / "agents" / ACTOR
+    (ws / "memory").mkdir(parents=True)
+    _make_index_db(ws, [("memory/shelf/index.md", "shared", None, True)])
+    report = Inspector(ws).inspect()
+    hits = [v for v in report["violations"]
+            if v["reason"] == "gap-rule:index-excluded-path"]
+    assert len(hits) == 1
+    assert hits[0]["code"] == "index-excluded-path"
+    assert hits[0]["path"] == "memory/shelf/index.md"
+    assert hits[0]["severity"] == "high"
+    assert "shelf" in hits[0]["excluded_segments"]
+    assert hits[0]["scope"] == "shared" and hits[0]["user_id"] is None
+
+
+def test_index_orphan_chunk_without_files_row_is_reported(tmp_path):
+    """A chunk row whose files counterpart is gone = permanent orphan."""
+    cow, ws = tmp_path, tmp_path / "agents" / ACTOR
+    (ws / "memory").mkdir(parents=True)
+    _make_index_db(ws, [("memory/users/u-accept/memory_scope.md",
+                          "shared", None, False)])
+    report = Inspector(ws).inspect()
+    hits = [v for v in report["violations"]
+            if v["reason"] == "gap-rule:index-orphan"]
+    assert len(hits) == 1
+    assert hits[0]["code"] == "index-orphan"
+    assert "files-table counterpart" in hits[0]["detail"]
+
+
+def test_index_row_for_deleted_file_is_reported(tmp_path):
+    """A registered row whose file no longer exists on disk = stale page."""
+    cow, ws = tmp_path, tmp_path / "agents" / ACTOR
+    (ws / "memory").mkdir(parents=True)
+    _make_index_db(ws, [("memory/2020-01-01.md", "shared", None, True)])
+    report = Inspector(ws).inspect()
+    hits = [v for v in report["violations"]
+            if v["reason"] == "gap-rule:index-orphan"]
+    assert len(hits) == 1
+    assert "no longer exists" in hits[0]["detail"]
+
+
+def test_clean_index_reports_no_index_violations(tmp_path):
+    """A registered row whose file EXISTS must not be reported."""
+    cow, ws = tmp_path, tmp_path / "agents" / ACTOR
+    (ws / "memory").mkdir(parents=True)
+    (ws / "memory" / "2026-10-27.md").write_text("hello", encoding="utf-8")
+    _make_index_db(ws, [("memory/2026-10-27.md", "shared", None, True)])
+    report = Inspector(ws).inspect()
+    assert not [v for v in report["violations"]
+                if v["reason"].startswith("gap-rule:index-")]
+
+
+def test_index_hygiene_never_repairs_the_index(tmp_path):
+    """REPORT-ONLY: the inspector must not delete the rows it reports."""
+    cow, ws = tmp_path, tmp_path / "agents" / ACTOR
+    (ws / "memory").mkdir(parents=True)
+    db = _make_index_db(ws, [("memory/shelf/index.md", "shared", None, True)])
+    before = db.read_bytes()
+    Inspector(ws).inspect()
+    conn = sqlite3.connect(str(db))
+    n = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    conn.close()
+    assert n == 1, "inspector deleted an index row — it must only report"
+    assert db.read_bytes() != b"" and before is not None
+
+
+def test_index_hygiene_violations_reach_the_audit_trail(tmp_path):
+    """Reported index violations land in .audit/inspector.jsonl."""
+    cow, ws = tmp_path, tmp_path / "agents" / ACTOR
+    (ws / "memory").mkdir(parents=True)
+    _make_index_db(ws, [("memory/shelf/index.md", "shared", None, True)])
+    Inspector(ws).inspect()
+    audit = ws / "memory" / ".audit" / "inspector.jsonl"
+    assert audit.is_file()
+    lines = [json.loads(x) for x in
+             audit.read_text(encoding="utf-8").splitlines() if x.strip()]
+    assert lines and lines[-1]["violation_count"] >= 1
+

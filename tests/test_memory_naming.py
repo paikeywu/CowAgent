@@ -111,3 +111,94 @@ def test_normalize_slug_byte_safe_on_cjk_boundary():
     slug = normalize_slug("记" * 20)  # 60 bytes -> truncated to <= 40
     assert len(slug.encode("utf-8")) <= SLUG_MAX_BYTES
     assert all(ch == "记" for ch in slug)
+
+
+# -- P0-10 L-2: the tombstone rule set --------------------------------------
+#
+# A tombstone is not a memory element, so the element contract does not
+# apply — but "not an element" is not an exemption. It gets its own rule
+# set, stricter in the ways that matter: the name must point at a name
+# that could exist, and the file must carry all 8 audit fields.
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "memory"))
+import validate_names  # noqa: E402
+
+
+TOMBSTONE_DIR = "memory/markdown/_tombstones"
+
+GOOD_TOMBSTONE = """---
+original_path: memory/markdown/entities/people/peiqi--a1b2c3d4.md
+original_hash: sha256:abc
+released_by: peiqi
+released_at: 2026-10-27T10:00:00+08:00
+consent_ref: consent_123
+confirmation_token_hash: sha256:def
+initiated_at: 2026-10-27T09:59:00+08:00
+confirmed_at: 2026-10-27T10:00:00+08:00
+---
+
+墓碑：原档案已释放。
+"""
+
+
+def test_valid_tombstone_passes():
+    problems = validate_names.validate_file(
+        f"{TOMBSTONE_DIR}/peiqi--a1b2c3d4.tombstone.md", GOOD_TOMBSTONE)
+    assert problems == [], problems
+
+
+def test_tombstone_missing_audit_field_is_violation():
+    """缺任一审计字段即违规（逐个字段都试一遍）。"""
+    for field in validate_names.TOMBSTONE_REQUIRED_FIELDS:
+        broken = "\n".join(
+            line for line in GOOD_TOMBSTONE.splitlines()
+            if not line.startswith(field + ":"))
+        problems = validate_names.validate_file(
+            f"{TOMBSTONE_DIR}/peiqi--a1b2c3d4.tombstone.md", broken)
+        assert problems, f"缺 {field} 未被抓出"
+        assert any("fields" in p for p in problems)
+
+
+def test_tombstone_name_must_point_at_a_valid_element_name():
+    """墓碑名里的原元素名本身必须满足元素命名规则。"""
+    for bad_stem in ("plain", "x--A1B2C3D4", "a" * 41 + "--a1b2c3d4"):
+        problems = validate_names.validate_file(
+            f"{TOMBSTONE_DIR}/{bad_stem}.tombstone.md", GOOD_TOMBSTONE)
+        assert problems, f"{bad_stem} 未被抓出"
+        assert any("name" in p for p in problems)
+
+
+def test_tombstone_name_must_end_with_the_suffix():
+    """不是 .tombstone.md 结尾即违规。"""
+    for bad_name in ("peiqi--a1b2c3d4.md", "peiqi--a1b2c3d4",
+                     "peiqi--a1b2c3d4.tombstone.txt"):
+        problems = validate_names.validate_file(
+            f"{TOMBSTONE_DIR}/{bad_name}", GOOD_TOMBSTONE)
+        assert problems, f"{bad_name} 未被抓出"
+        assert any("name" in p for p in problems)
+
+
+def test_old_double_md_tombstone_name_is_violation():
+    """旧实现写的 <原名>.md.tombstone.md 必须被判违规（这正是 L-2 的形态）。"""
+    problems = validate_names.validate_file(
+        f"{TOMBSTONE_DIR}/peiqi--a1b2c3d4.md.tombstone.md", GOOD_TOMBSTONE)
+    assert problems
+    assert any("name" in p for p in problems)
+
+
+def test_tombstone_still_obeys_the_byte_budget():
+    """墓碑不是豁免：字节预算照常适用。"""
+    long_stem = "记" * 30 + "--a1b2c3d4"
+    problems = validate_names.validate_file(
+        f"{TOMBSTONE_DIR}/{long_stem}.tombstone.md", GOOD_TOMBSTONE)
+    assert any("budget" in p for p in problems)
+
+
+def test_tombstone_container_is_not_reported_as_unknown():
+    """_tombstones 是合法容器（专属规则），不是 'unknown container'。"""
+    problems = validate_names.validate_file(
+        f"{TOMBSTONE_DIR}/peiqi--a1b2c3d4.tombstone.md", GOOD_TOMBSTONE)
+    assert not any("unknown markdown container" in p for p in problems)

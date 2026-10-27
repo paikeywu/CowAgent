@@ -28,6 +28,7 @@ import argparse
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -56,11 +57,24 @@ REASON_SHRUNK = "gap-rule:facts-shrunk"
 REASON_HISTORY = "gap-rule:history-rewritten"
 REASON_NAMING = "gap-rule:naming"
 REASON_SNAPSHOT_TAMPER = "gap-rule:snapshot-hash-mismatch"
+# P0-10 L-1: the index layer has its own hygiene. A chunk row can outlive
+# the file it indexes (deleted page) or point at a layer the scan excludes
+# by policy (shelf/ facts/ .snapshots/ .audit/) — the latter is an
+# anonymity leak, because those rows carry scope='shared' + user_id=NULL
+# and are therefore visible to EVERY caller (V2-Q-01).
+REASON_INDEX_EXCLUDED = "gap-rule:index-excluded-path"
+REASON_INDEX_ORPHAN = "gap-rule:index-orphan"
 
 # Short machine codes carried on every violation (the shelf view needs a
 # stable code, not a sentence).
 CODE_SHRUNK = "facts-shrunk"
 CODE_HISTORY = "history-rewritten"
+CODE_INDEX_EXCLUDED = "index-excluded-path"
+CODE_INDEX_ORPHAN = "index-orphan"
+
+# Path segments the sync scan skips by policy (agent/memory/manager.py).
+# A chunk row under any of them is a policy violation, not a stale page.
+EXCLUDED_INDEX_SEGMENTS = ("shelf", "facts", ".snapshots", ".audit")
 
 _SEV_HIGH = "high"
 _SEV_MID = "mid"
@@ -149,6 +163,7 @@ class Inspector:
         self._check_markdown(report)
         snapshot = self._check_facts(report, prev_snapshot)
         self._check_naming(report)
+        self._check_index_hygiene(report)
         if persist_snapshot:
             self._write_snapshot(snapshot)
         self._write_audit(report)
@@ -308,6 +323,106 @@ class Inspector:
         for rel, problems in validate_names.validate_root(self.workspace_root):
             for prob in problems:
                 self._violation(report, REASON_NAMING, rel, prob, _SEV_MID)
+
+    # -- check 5: index layer hygiene (P0-10 L-1) ----------------------------
+
+    def _index_db_path(self) -> Path:
+        """This workspace's index. One per Agent (common/state_dir.memory_index_db
+        puts it at ``<agent_base>/memory/long-term/index.db``)."""
+        return self.memory_root / "long-term" / "index.db"
+
+    def _shared_root(self) -> Optional[Path]:
+        """The shared root, for knowledge/ paths that live outside this
+        workspace. None when the registry is not resolvable (the check then
+        degrades to 'registered but unverifiable', never to a false red)."""
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+            from common import state_dir
+            return Path(state_dir.shared_root())
+        except Exception:
+            return None
+
+    def _index_source_file(self, rel: str) -> Optional[Path]:
+        """Where the file behind an index path actually lives, or None when
+        it cannot be found anywhere. ``knowledge/...`` may live in this
+        workspace's own knowledge/ or in the shared one; everything else is
+        relative to the workspace root."""
+        candidates = [self.workspace_root / rel]
+        if rel.startswith("knowledge/"):
+            shared = self._shared_root()
+            if shared is not None:
+                candidates.append(shared / rel)
+        for cand in candidates:
+            if cand.is_file():
+                return cand
+        return None
+
+    def _check_index_hygiene(self, report: Dict[str, Any]) -> None:
+        """Report index rows that should not be searchable.
+
+        REPORT-ONLY, like every other check: the index is repaired by
+        running sync() (whose reconcile now drops excluded paths and chunk
+        rows without a files counterpart). The inspector never edits the
+        database — an index that "fixes itself" is how a deletion becomes
+        invisible to the audit trail.
+        """
+        db = self._index_db_path()
+        if not db.is_file():
+            return
+        rel_db = db.relative_to(self.workspace_root).as_posix()
+        try:
+            conn = sqlite3.connect(
+                "file:" + str(db).replace("\\", "/") + "?mode=ro", uri=True)
+        except sqlite3.Error as e:
+            self._violation(report, REASON_INDEX_ORPHAN, rel_db,
+                            f"cannot open index read-only: {e}", _SEV_MID,
+                            code=CODE_INDEX_ORPHAN)
+            return
+        try:
+            rows = conn.execute(
+                "SELECT c.path, c.scope, c.user_id, COUNT(*) "
+                "FROM chunks c GROUP BY c.path, c.scope, c.user_id"
+            ).fetchall()
+            registered = {r[0] for r in conn.execute(
+                "SELECT DISTINCT path FROM files").fetchall()}
+        except sqlite3.Error as e:
+            self._violation(report, REASON_INDEX_ORPHAN, rel_db,
+                            f"cannot read index: {e}", _SEV_MID,
+                            code=CODE_INDEX_ORPHAN)
+            return
+        finally:
+            conn.close()
+
+        for path, scope, user_id, n in rows:
+            segments = path.split("/")
+            excluded = [s for s in segments if s in EXCLUDED_INDEX_SEGMENTS]
+            if excluded:
+                self._violation(
+                    report, REASON_INDEX_EXCLUDED, path,
+                    f"{n} chunk row(s) under excluded segment(s) "
+                    f"{excluded} (scope={scope!r}, user_id={user_id!r}) — this "
+                    f"layer is not indexed by policy; a 'shared' row here is "
+                    f"visible to every caller",
+                    _SEV_HIGH, code=CODE_INDEX_EXCLUDED,
+                    chunk_count=n, scope=scope, user_id=user_id,
+                    excluded_segments=excluded)
+                continue
+            if path not in registered:
+                self._violation(
+                    report, REASON_INDEX_ORPHAN, path,
+                    f"{n} chunk row(s) with no files-table counterpart — the "
+                    f"page is not registered, so sync()'s reconcile cannot "
+                    f"see it (run a sync to drop it)",
+                    _SEV_MID, code=CODE_INDEX_ORPHAN,
+                    chunk_count=n, scope=scope, user_id=user_id)
+                continue
+            if self._index_source_file(path) is None:
+                self._violation(
+                    report, REASON_INDEX_ORPHAN, path,
+                    f"{n} chunk row(s) for a file that no longer exists on "
+                    f"disk — the row outlived its page",
+                    _SEV_MID, code=CODE_INDEX_ORPHAN,
+                    chunk_count=n, scope=scope, user_id=user_id)
 
     # -- snapshots -------------------------------------------------------------
 

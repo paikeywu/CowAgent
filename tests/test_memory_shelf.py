@@ -511,8 +511,33 @@ def test_sh12_reverse_a_truth_file_change_is_detected(ws, cow):
 
 # -- P0-8 追加：幂等 + skipped 出声 ----------------------------------------
 
-def test_rebuild_is_idempotent_second_run_is_byte_identical(ws, cow):
-    """验收标准 6: 连跑两遍，第二遍零字节变化（generated_at 除外）。"""
+def test_rebuild_is_idempotent_second_run_is_byte_identical(ws, cow, monkeypatch):
+    """验收标准 6: 连跑两遍，第二遍零字节变化。
+
+    严格形式：把生成器的时钟钉死，同一份输入的两次 rebuild 必须逐字节
+    相同（不只是"除 generated_at 外相同"）。旧写法只剥掉了 front-matter
+    里的 ``generated_at:`` 一行，而正文里还有一处时间戳（"最后更新：…"），
+    两次 rebuild 跨秒时就会误报——这是一个被时间边界掩盖的真 bug。
+    """
+    import agent.memory.shelf as shelf_mod
+    monkeypatch.setattr(shelf_mod, "_utc8_now", lambda: "2026-10-27T00:00:00+08:00")
+    build(ws, cow)
+    rebuild(ws)
+    first = {p.relative_to(shelf(ws)).as_posix(): p.read_bytes()
+             for p in all_view_files(ws)}
+    rebuild(ws)
+    second = {p.relative_to(shelf(ws)).as_posix(): p.read_bytes()
+              for p in all_view_files(ws)}
+    assert set(first) == set(second)
+    for rel in first:
+        assert first[rel] == second[rel], f"{rel} 第二次 rebuild 不是逐字节相同"
+
+
+def test_rebuild_differs_only_in_timestamp_when_clock_moves(ws, cow, monkeypatch):
+    """时钟真实推进时，唯一允许变化的是时间戳本身（两处出现）。"""
+    import agent.memory.shelf as shelf_mod
+    stamps = iter(["2026-10-27T00:00:00+08:00", "2026-10-27T00:00:05+08:00"])
+    monkeypatch.setattr(shelf_mod, "_utc8_now", lambda: next(stamps))
     build(ws, cow)
     rebuild(ws)
     first = {p.relative_to(shelf(ws)).as_posix(): p.read_bytes()
@@ -526,10 +551,10 @@ def test_rebuild_is_idempotent_second_run_is_byte_identical(ws, cow):
         b = second[rel].decode("utf-8")
         if a == b:
             continue
-        # generated_at 是唯一允许变化的字段（同一秒内重跑应完全一致）
-        a_lines = [l for l in a.splitlines() if not l.startswith("generated_at:")]
-        b_lines = [l for l in b.splitlines() if not l.startswith("generated_at:")]
-        assert a_lines == b_lines, f"{rel} 除 generated_at 外还有变化"
+        # 去掉所有出现的时间戳后必须完全一致
+        na = a.replace("2026-10-27T00:00:00+08:00", "<TS>")
+        nb = b.replace("2026-10-27T00:00:05+08:00", "<TS>")
+        assert na == nb, f"{rel} 除时间戳外还有变化"
 
 
 def test_skipped_files_are_reported_not_dropped_silently(ws, cow):

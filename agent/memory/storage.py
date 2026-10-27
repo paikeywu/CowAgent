@@ -1364,6 +1364,21 @@ class MemoryStorage:
         ).fetchall()
         return [row['path'] for row in rows]
 
+    def list_chunk_paths(self, source: str) -> List[str]:
+        """Every path that still has CHUNK rows under a source.
+
+        ``list_paths`` reads the ``files`` table, so a chunk row whose
+        ``files`` counterpart was lost is invisible to it — and therefore
+        invisible to sync()'s reconcile, which is how such a row survives
+        forever as an orphan (P0-10 L-1: ``memory/users/u-accept/
+        memory_scope.md`` had a chunk and no files row on a real
+        workspace). The reconcile needs both sets.
+        """
+        rows = self.conn.execute(
+            "SELECT DISTINCT path FROM chunks WHERE source = ?", (source,)
+        ).fetchall()
+        return [row['path'] for row in rows]
+
     def update_file_metadata(self, path: str, source: str, file_hash: str, mtime: int, size: int):
         """Update file metadata"""
         with self._lock:
