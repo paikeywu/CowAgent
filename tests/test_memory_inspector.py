@@ -1266,3 +1266,235 @@ def test_f3_the_empty_verdict_comes_from_the_pre_sync_fingerprint(tmp_path):
     detail = "\n".join(report.rows[0][1] if len(report.rows[0]) > 1 else "")
     printed = [r for r in report.rows]
     assert printed, "没有判据结果"
+
+
+# -----------------------------------------------------------------------------
+# P0-22：巡检必须遍历**全部**索引；排除层的公开行必须被检出；守卫必须被查
+# -----------------------------------------------------------------------------
+#
+# 风控对 P0-21 的结论：巡检第 9 项只比对 sealed/released、不覆盖排除层，
+# 而那 6 行残留**没有任何检测器会报红**。交办单把「巡检必须遍历全部
+# 16 个库」列为本轮最关键一条 —— 巡检漏掉一个库 = 漏掉一次泄漏。
+
+def _sweep_violations(report, code=None, root=None):
+    """The sweep's findings, optionally narrowed to ONE workspace.
+
+    The sweep covers EVERY index of the family, so a finding may belong
+    to another workspace. A criterion about "this workspace's index"
+    must say WHICH index it is talking about — otherwise it is asserting
+    on the state of the whole machine, and it fails for reasons that have
+    nothing to do with what it measures.
+    """
+    sweep = report.get("index_sweep") or {}
+    out = sweep.get("violations") or []
+    if code:
+        out = [v for v in out if v.get("code") == code]
+    if root is not None:
+        out = [v for v in out if v.get("workspace_root") == str(root)]
+    return out
+
+
+def test_p022_the_sweep_reports_an_excluded_public_row(tmp_path):
+    """排除层的公开行 = 泄漏（书架/事实层/墓碑不进索引）。
+
+    这正是旧桌面版留下的那 6 行：``memory/shelf/*.md`` 被写成
+    ``scope='shared'`` + ``user_id=NULL``，匿名可读，而旧巡检看不见它。
+    """
+    cow, ws = tmp_path, tmp_path / "agents" / ACTOR
+    (ws / "memory").mkdir(parents=True)
+    _make_index_db(ws, [("memory/shelf/index.md", "shared", None, True)])
+
+    report = Inspector(ws).inspect()
+    hits = _sweep_violations(report, "index-excluded-path", root=ws)
+    assert hits, "排除层的公开行没有被报出来 —— 这就是那 6 行残留"
+    assert hits[0]["severity"] == "high"
+    assert hits[0]["path"] == "memory/shelf/index.md"
+    assert "shelf" in hits[0]["excluded_segments"]
+
+
+def test_p022_reverse_the_sweep_does_not_cry_wolf(tmp_path):
+    """反向用例：正常的行不得被误报。
+
+    一个对正确行也喊狼来了的检查，最后只会被关掉 —— 那时候它连真正
+    的泄漏也一起关了。
+    """
+    cow, ws = tmp_path, tmp_path / "agents" / ACTOR
+    (ws / "memory").mkdir(parents=True)
+    (ws / "memory" / "2026-10-27.md").write_text("hello", encoding="utf-8")
+    _make_index_db(ws, [("memory/2026-10-27.md", "shared", None, True)])
+
+    report = Inspector(ws).inspect()
+    assert not _sweep_violations(report, "index-excluded-path", root=ws), (
+        f"正常行被误报: {_sweep_violations(report, 'index-excluded-path')}")
+
+
+def test_p022_the_sweep_walks_every_index_of_the_family(tmp_path,
+                                                        monkeypatch):
+    """巡检必须遍历**全部**索引，不只是被寻址过的那一个。
+
+    一个没人在这轮会话里说过话的工作区，它的索引才是泄漏最容易躺着
+    的地方 —— 所以「只看自己」等于没看。
+    """
+    cow = tmp_path / "cow"
+    roots = []
+    for name in ("a", "b", "c"):
+        root = cow / "agents" / name
+        (root / "memory").mkdir(parents=True)
+        _make_index_db(root, [("memory/x.md", "shared", None, True)])
+        roots.append(str(root))
+
+    monkeypatch.setattr(
+        "agent.memory.index_guard.discover_index_roots",
+        lambda extra=None: list(roots))
+
+    ws = cow / "agents" / "a"
+    report = Inspector(ws).inspect()
+    sweep = report["index_sweep"]
+    checked = set(sweep["checked"])
+    for root in roots:
+        assert root in checked, f"巡检漏掉了 {root}: {checked}"
+    assert sweep["checked_count"] == len(roots), sweep
+
+
+def test_p022_the_sweep_reports_an_index_without_the_guard(tmp_path,
+                                                           monkeypatch):
+    """守卫被删掉的库必须被报红（高危）。
+
+    ``CREATE TRIGGER IF NOT EXISTS`` 永不抛异常，所以被删了触发器的库
+    会静默裸奔：旧桌面版随时能把暗页写成公开行，而没有任何检测器说话。
+    """
+    import sqlite3
+
+    from agent.memory.index_guard import GUARD_TRIGGERS
+    from agent.memory.storage import MemoryStorage
+
+    cow = tmp_path / "cow"
+    root = cow / "agents" / "unguarded"
+    db = root / "memory" / "long-term" / "index.db"
+    db.parent.mkdir(parents=True)
+    st = MemoryStorage(db_path=str(db))
+    st.close()
+    conn = sqlite3.connect(str(db))
+    try:
+        for name in GUARD_TRIGGERS:
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(
+        "agent.memory.index_guard.discover_index_roots",
+        lambda extra=None: [str(root)])
+
+    report = Inspector(root).inspect()
+    hits = _sweep_violations(report, "guard-missing")
+    assert hits, "守卫缺失没有被报出来"
+    assert hits[0]["severity"] == "high"
+    assert str(root) == hits[0]["workspace_root"]
+
+
+def test_p022_the_patrol_reports_how_many_rows_were_rewritten(tmp_path,
+                                                               monkeypatch):
+    """巡检常驻报「最近 N 分钟被改写行数」。
+
+    静默丢弃的守卫 = 把旧的静默失败换了个地方继续存在。所以丢弃必须
+    在巡检里看得见 —— 不是作为一条会误报的告警，而是作为一段常驻的
+    数字：这一小时里有多少行被守卫改写了。
+    """
+    from agent.memory.index_guard import GUARD_TRIGGERS
+    from agent.memory.storage import MemoryStorage
+
+    cow = tmp_path / "cow"
+    root = cow / "agents" / "watched"
+    db = root / "memory" / "long-term" / "index.db"
+    db.parent.mkdir(parents=True)
+    st = MemoryStorage(db_path=str(db))
+    try:
+        st.conn.execute(
+            "INSERT INTO chunks (id,user_id,scope,source,path,start_line,"
+            "end_line,text,embedding,hash,metadata,updated_at) "
+            "VALUES ('c1',NULL,'shared','memory','memory/shelf/index.md',1,1,"
+            "?,NULL,'h',NULL,strftime('%s','now'))", ("# 书架\n",))
+        st.conn.commit()
+    finally:
+        st.close()
+
+    monkeypatch.setattr(
+        "agent.memory.index_guard.discover_index_roots",
+        lambda extra=None: [str(root)])
+
+    report = Inspector(root).inspect()
+    guard = report.get("guard") or {}
+    assert guard.get("window_minutes"), guard
+    assert guard.get("blocked_recent") == 1, (
+        f"巡检没有报出最近被改写的行数: {guard}")
+    assert guard.get("blocked_total") == 1, guard
+    assert guard.get("last_at"), guard
+    assert GUARD_TRIGGERS, "守卫触发器名单不见了"
+
+
+def test_f3_the_empty_verdict_covers_a_workspace_without_an_index(tmp_path,
+                                                                  capsys):
+    """F3 补齐：索引文件**根本不存在**时，理由也必须是「库是空的」。
+
+    一个全新 Agent 的工作区在第一次 sync 之前**没有** index.db —— 那是
+    常态，不是特例。旧的 ``empty`` 定义（``exists and rows == 0``）把
+    「没有索引」判成「不空」，于是判据报的是「top1 不是 USER.md」——
+    正是这条判据当初要消灭的那个理由。
+    """
+    from agent.memory.acceptance import Report, fingerprint
+    from agent.memory.acceptance.phase1 import judge_t3_chinese_recall
+
+    ws = tmp_path / "brand-new"
+    (ws / "memory").mkdir(parents=True)
+    fp = fingerprint(str(ws))
+    assert not fp.exists, "这个工作区本来就没有索引"
+    assert fp.empty, "没有索引的工作区必须判为空"
+
+    report = Report()
+
+    class _Mgr:
+        async def search(self, *a, **kw):
+            return []
+
+    ok = judge_t3_chinese_recall(_Mgr(), report, fp, corpus_fp=fp)
+    assert not ok, "空库必须判红"
+    printed = capsys.readouterr().out
+    assert "被测库是空的" in printed, printed
+    assert "0 命中是正确行为" in printed, printed
+    assert "前置条件不成立" not in printed, printed
+    assert "top1 不是 USER.md" not in printed, printed
+
+
+def test_f3_the_phase1_criterion_says_empty_when_there_is_no_index(tmp_path):
+    """F3 补齐（端到端）：phase1.py 在一个**没有索引**的工作区上跑。
+
+    子进程跑，因为要验的是**输出里出现了哪个理由** —— 不是一个可以被
+    import 的函数能回答的。
+    """
+    import re
+    import subprocess
+    import sys as _sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    ws = tmp_path / "brand-new-cow"
+    (ws / "memory").mkdir(parents=True)
+
+    proc = subprocess.run(
+        [_sys.executable, str(repo / "agent" / "memory" / "acceptance" / "phase1.py"),
+         "--workspace", str(ws), "--no-sync"],
+        cwd=str(repo), capture_output=True, text=True, timeout=180)
+    out = proc.stdout or ""
+
+    m = re.search(r"\[(?:PASS|FAIL)\] T3\(REAL\).*?(?=\n  \[(?:PASS|FAIL)\] |\n====|\Z)",
+                  out, re.S)
+    assert m, "T3 段没出现在输出里:\n%s" % out[-2000:]
+    t3 = m.group(0)
+    assert "被测库是空的" in t3, (
+        "没有索引的工作区上没有报『库是空的』理由:\n%s" % t3)
+    assert "前置条件不成立" not in t3, (
+        "没有索引的工作区被报成『前置条件不成立』:\n%s" % t3)
+    assert "top1 不是 USER.md" not in t3, (
+        "没有索引的工作区上混入了另一个失败理由:\n%s" % t3)
+

@@ -1056,3 +1056,195 @@ def test_p021_the_guard_is_installed_on_every_index(tmp_path):
             assert is_installed(conn), f"{root} 的索引没有守卫"
         finally:
             conn.close()
+
+
+# -----------------------------------------------------------------------------
+# P0-22：守卫的丢弃必须可见、可查；守卫必须由机制保证
+# -----------------------------------------------------------------------------
+#
+# 风控对 P0-21 的结论：「静默丢弃零审计痕迹 —— guard_paths.updated_at 重复
+# 丢弃时不动、无日志、巡检第 9 项按构造看不见。」这是把旧的『静默失败』换
+# 了个地方继续存在：RAISE(IGNORE) 是一次无声的操作 —— 写者没收到异常，返回
+# 值正常，而行被悄悄改掉了。
+#
+# 所以本节钉死三件事：
+#   ① 每次丢弃都留下痕迹（计数 + 时间戳 + 事件行）；
+#   ② 运维能问出「这次挡了多少、挡了哪些」；
+#   ③ 守卫是机制不是快照 —— 触发器被删了，下一次 sync 会装回来。
+
+def test_p022_the_guard_records_every_discard(ws):
+    """P0-22：一次丢弃 = 一条事件 + 计数前进 + 时间戳前进。"""
+    from agent.memory.index_guard import (
+        discard_count,
+        last_discard_at,
+        recent_discards,
+    )
+
+    st = _guard_storage(ws)
+    try:
+        assert discard_count(st.conn) == 0
+        assert last_discard_at(st.conn) is None
+
+        _old_build_insert(st, GUARD_DARK_PATH, GUARD_DARK_TEXT)
+
+        assert discard_count(st.conn) == 1, "丢弃没有计数"
+        assert last_discard_at(st.conn), "丢弃没有留下时间戳"
+        events = recent_discards(st.conn, minutes=60)
+        assert len(events) == 1, f"丢弃没有留下事件行: {events}"
+        assert events[0]["path"] == GUARD_DARK_PATH
+        assert events[0]["class"] == "sealed"
+        assert events[0]["op"] == "insert"
+
+        # A second discard moves the counter again — it does not collapse
+        # into "the same thing happened once".
+        _old_build_insert(st, "memory/shelf/index.md", "# 书架\n\nZZ\n",
+                          chunk_id="old-c22")
+        assert discard_count(st.conn) == 2
+        assert len(recent_discards(st.conn, minutes=60)) == 2
+    finally:
+        st.close()
+
+
+def test_p022_the_guard_says_what_it_dropped(ws):
+    """P0-22：「这次 sync 挡了多少行、挡了哪些？」要能被回答。"""
+    from agent.memory.index_guard import guard_report
+
+    st = _guard_storage(ws)
+    try:
+        _old_build_insert(st, GUARD_DARK_PATH, GUARD_DARK_TEXT)
+        _old_build_insert(st, "memory/shelf/index.md", "# 书架\n\nZZ\n",
+                          chunk_id="old-c23")
+        rep = guard_report(st.conn, minutes=60)
+        assert rep["blocked_count"] == 2, rep
+        assert rep["blocked_recent"] == 2, rep
+        assert rep["last_at"], rep
+        paths = {p["path"] for p in rep["paths"]}
+        assert GUARD_DARK_PATH in paths, rep
+        assert "memory/shelf/index.md" in paths, rep
+    finally:
+        st.close()
+
+
+def test_p022_the_manager_reports_the_discards_it_saw(ws):
+    """P0-22：应用层必须把丢弃变成可见事件（不能只靠触发器悄悄做）。
+
+    交办单原话：「不得只靠 SQLite 触发器悄悄做 —— 若必须用，则必须在应用
+    层捕获并转成可见事件。」所以这一条断言的是**管理器**看得见，并且
+    ``guard_report()`` 能回答运维的问题。
+    """
+    mgr = manager_for(ws)
+    try:
+        assert mgr.guard_report()["blocked_count"] == 0
+        # The old build's write goes straight through the guard.
+        _old_build_insert(mgr.storage, GUARD_DARK_PATH, GUARD_DARK_TEXT)
+        rep = mgr.guard_report()
+        assert rep["blocked_count"] == 1, rep
+        assert GUARD_DARK_PATH in {p["path"] for p in rep["paths"]}, rep
+    finally:
+        close_manager(mgr)
+
+
+def test_p022_a_deleted_guard_is_reinstalled_by_the_mechanism(tmp_path):
+    """P0-22：守卫被删掉 → 机制必须把它装回来（自愈）。
+
+    ``CREATE TRIGGER IF NOT EXISTS`` 永不抛异常，所以一个被删了触发器的库
+    会**静默裸奔**：没有任何检测器会说话，直到有人发现泄漏。
+    """
+    import sqlite3
+
+    from agent.memory.index_guard import GUARD_TRIGGERS, is_installed
+    from agent.memory.schema_migrate import ensure_guard_all
+
+    root = tmp_path / "ws"
+    db = root / "memory" / "long-term" / "index.db"
+    db.parent.mkdir(parents=True)
+    st = MemoryStorage(db_path=str(db))
+    st.close()
+
+    conn = sqlite3.connect(str(db))
+    try:
+        for name in GUARD_TRIGGERS:
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        conn.commit()
+        assert not is_installed(conn), "触发器没删掉 —— 测法有问题"
+    finally:
+        conn.close()
+
+    states = ensure_guard_all(roots=[str(root)])
+    assert states[str(root)]["status"] in ("installed", "repaired"), states
+
+    conn = sqlite3.connect(str(db))
+    try:
+        assert is_installed(conn), "机制没有把守卫装回来"
+    finally:
+        conn.close()
+
+
+def test_p022_the_guard_sweep_finds_an_index_the_roster_does_not_name(tmp_path,
+                                                                       monkeypatch):
+    """P0-22：花名册漏一个 = 守卫漏一个 —— 所以机制必须看磁盘。
+
+    ``agents/default`` 不在花名册里，这就是「手工补装的一次性快照」的
+    由来。所以发现索引的依据必须是**磁盘上真实存在的库**，而不只是花名册。
+    """
+    import sqlite3
+
+    from agent.memory.index_guard import (
+        discover_index_roots,
+        is_installed,
+    )
+    from agent.memory.schema_migrate import ensure_guard_all
+
+    shared = tmp_path / "cow"
+    stray = shared / "agents" / "default"
+    db = stray / "memory" / "long-term" / "index.db"
+    db.parent.mkdir(parents=True)
+    st = MemoryStorage(db_path=str(db))
+    st.close()
+
+    # The roster knows nothing about this workspace.
+    monkeypatch.setattr("agent.registry.get_agent_registry", lambda: None)
+    monkeypatch.setattr("common.state_dir.shared_root", lambda: shared)
+
+    roots = discover_index_roots()
+    assert str(stray) in roots, (
+        f"磁盘上存在的索引没有被发现: {roots}")
+
+    states = ensure_guard_all(roots=roots)
+    assert str(stray) in states, states
+    conn = sqlite3.connect(str(db))
+    try:
+        assert is_installed(conn), "花名册之外的索引没有装上守卫"
+    finally:
+        conn.close()
+
+
+def test_p022_ensure_guard_tells_installed_from_failed(tmp_path):
+    """P0-22：「已装」和「装不上」必须是两个答案。"""
+    import sqlite3
+
+    from agent.memory.index_guard import ensure_guard
+
+    db = tmp_path / "index.db"
+    conn = sqlite3.connect(str(db))
+    try:
+        # A database with no chunks table: the guard cannot be installed.
+        state = ensure_guard(conn)
+        assert state["status"] == "failed", state
+        assert state["reason"], "装不上必须给出原因"
+
+        conn.execute("""CREATE TABLE chunks (
+            id TEXT PRIMARY KEY, user_id TEXT, scope TEXT, source TEXT,
+            path TEXT, start_line INT, end_line INT, text TEXT,
+            embedding BLOB, hash TEXT, metadata TEXT, updated_at INT,
+            file_sealed INT DEFAULT 0, element_released INT DEFAULT 0,
+            sealed_owner TEXT)""")
+        conn.commit()
+        first = ensure_guard(conn)
+        assert first["status"] == "installed", first
+        second = ensure_guard(conn)
+        assert second["status"] == "present", (
+            f"已经装好的守卫必须报 present: {second}")
+    finally:
+        conn.close()
+

@@ -207,6 +207,117 @@ class MemoryManager:
             return VIS_RELEASED, None
         return classify_frontmatter(fm), owner_token(fm)
 
+    def _ensure_guards(self) -> Dict[str, Any]:
+        """Make sure EVERY index that exists has the write-side guard (P0-22).
+
+        This is the MECHANISM, not a snapshot: the guard is re-checked
+        before every sync and at startup, over every index that exists on
+        disk — the roster's AND the layout's (``agents/default`` is not in
+        the roster, and a roster-only sweep leaves it unguarded).
+
+        The check is read-only for a healthy index (the trigger body is
+        compared against the current definition), so the common case costs
+        one SELECT per index and writes nothing.
+
+        A failure is LOUD: an index whose guard could not be installed is
+        logged at ERROR level, because that index is one the old desktop
+        build can turn a dark page into a public row.
+        """
+        from agent.memory.schema_migrate import ensure_guard_all
+
+        workspace = self.config.get_workspace()
+        try:
+            states = ensure_guard_all(extra=workspace)
+        except Exception as e:
+            from common.log import logger
+            logger.error(
+                "[MemoryManager] The guard sweep failed: %s: %s",
+                type(e).__name__, e)
+            return {}
+        repaired = {root: state for root, state in states.items()
+                    if state.get("status") in ("installed", "repaired")}
+        failed = {root: state for root, state in states.items()
+                  if state.get("status") == "failed"}
+        if repaired:
+            from common.log import logger
+            for root, state in sorted(repaired.items()):
+                logger.warning(
+                    "[MemoryManager] The write-side guard was %s on %s (%s)",
+                    state.get("status"), root,
+                    state.get("reason") or "no longer the current definition")
+        if failed:
+            from common.log import logger
+            for root, state in sorted(failed.items()):
+                logger.error(
+                    "[MemoryManager] The write-side guard could NOT be "
+                    "installed on %s: %s — rows that must not be public can "
+                    "be written public on that index",
+                    root, state.get("reason"))
+        self._guard_states = states
+        return states
+
+    def guard_report(self, minutes: int = 60) -> Dict[str, Any]:
+        """What did the guard drop? (P0-22)
+
+        The operator-facing answer to "这次 sync 有多少行被守卫挡下了？挡了
+        哪些？": the count, the paths, and the events themselves — read from
+        the index, so the answer does not depend on anybody having been
+        watching the log.
+        """
+        from agent.memory.index_guard import guard_report as _report
+
+        try:
+            return _report(self.storage.conn, minutes=minutes)
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+
+    def _discard_count(self) -> int:
+        """How many writes the guard has dropped on THIS index."""
+        from agent.memory.index_guard import discard_count
+
+        try:
+            return discard_count(self.storage.conn)
+        except Exception:
+            return 0
+
+    def _report_guard_discards(self, before: int) -> Dict[str, Any]:
+        """Say out loud what the guard dropped during this sync (P0-22).
+
+        ``RAISE(IGNORE)`` is a silent operation, and a silent correction
+        is the failure mode the guard itself was created to end. So the
+        delta around the write phase is turned into an ERROR log line and
+        a report the operator can read back — "挡了多少、挡了哪些".
+
+        The log is at ERROR level on purpose: a dropped write means a
+        writer tried to publish something that must not be published, and
+        the reader of the log needs to see it without turning on a filter.
+        """
+        after = self._discard_count()
+        dropped = max(0, after - before)
+        if not dropped:
+            return {"dropped": 0}
+        from agent.memory.index_guard import recent_discards
+        try:
+            events = recent_discards(self.storage.conn, minutes=5, limit=50)
+        except Exception:
+            events = []
+        paths: Dict[str, int] = {}
+        for item in events:
+            paths[item.get("path") or "?"] = paths.get(item.get("path") or "?", 0) + 1
+        try:
+            from common.log import logger
+            logger.error(
+                "[MemoryManager] The write-side guard dropped %d write(s) "
+                "during this sync on %s — the rows that must not be public "
+                "were rewritten (paths: %s). The writer was told nothing; "
+                "the truth layer and the index now agree, but the writer "
+                "does not know it.",
+                dropped, self.config.get_workspace(),
+                ", ".join(sorted(paths)[:10]) or "?")
+        except Exception:
+            pass
+        return {"dropped": dropped, "paths": paths, "events": events}
+
     def _record_guard_paths(self, release_state) -> int:
         """Tell the write-side guard what the truth layer says (P0-21).
 
@@ -657,6 +768,17 @@ class MemoryManager:
         workspace_dir = self.config.get_workspace()
         from common.log import logger
 
+        # P0-22: the guard is re-checked before every sync, over EVERY
+        # index that exists on disk. This is the mechanism that makes the
+        # guard a property of the system rather than a thing somebody did
+        # once: an index whose trigger was deleted (or left over from an
+        # older build) is repaired here, before a single row is written.
+        self._ensure_guards()
+        # The number of writes the guard has dropped SO FAR on this index.
+        # The delta around the write phase below is what this sync
+        # dropped — the answer to "这次 sync 挡了多少行".
+        discards_before = self._discard_count()
+
         # Was the index empty before this sync? Only then can we be sure every
         # chunk came from the CURRENT chunking algorithm (a fresh index, or one
         # cleared by rebuild-index), which is what lets us stamp
@@ -944,6 +1066,10 @@ class MemoryManager:
             # file change.
             self._refresh_release_projection()
             self._dirty = False
+            # Nothing was written, but the guard may still have dropped
+            # something (another writer shares this index), so the delta is
+            # reported here too — a silent drop is a silent drop.
+            self._report_guard_discards(discards_before)
             return
 
         # Pass 2: single batched embed across all pending chunks.
@@ -1064,6 +1190,12 @@ class MemoryManager:
         # bytes never changed) carry the right flags too. Without this the
         # released content would survive in the index until the next edit.
         self._refresh_release_projection()
+
+        # P0-22: what did the guard drop during this sync? Said out loud,
+        # with the paths — the guard corrects the data AFTER the write, so
+        # without this the two sides would hold two different beliefs
+        # about the same row and neither would know.
+        self._report_guard_discards(discards_before)
 
         self._dirty = False
 

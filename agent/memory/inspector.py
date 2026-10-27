@@ -32,7 +32,7 @@ import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -94,6 +94,14 @@ REASON_SCHEMA_DRIFT = "gap-rule:schema-drift"
 # can read it.
 REASON_INDEX_PUBLIC = "gap-rule:index-public-row"
 
+# P0-22: an index whose write-side guard is missing — or is present but
+# is not the CURRENT definition. A database without the guard is a
+# database the old desktop build can turn a dark page into a public row:
+# the leak is not "possible" on such an index, it is only a matter of
+# time. This is the check that makes "the guard is installed" a fact about
+# every index rather than a thing somebody did once.
+REASON_GUARD_MISSING = "gap-rule:guard-missing"
+
 # Short machine codes carried on every violation (the shelf view needs a
 # stable code, not a sentence).
 CODE_SHRUNK = "facts-shrunk"
@@ -104,6 +112,12 @@ CODE_PROJECTION_DEGRADED = "release-projection-degraded"
 CODE_READ_DEGRADED = "read-degraded"
 CODE_SCHEMA_DRIFT = "schema-drift"
 CODE_INDEX_PUBLIC = "index-public-row"
+CODE_GUARD_MISSING = "guard-missing"
+
+# P0-22: how far back the patrol looks when it asks "was anything
+# rewritten lately?". The guard records every discard, so the window is
+# only a question of how much of it to show.
+GUARD_WINDOW_MINUTES = 60
 
 # Path segments the sync scan skips by policy (agent/memory/manager.py).
 # A chunk row under any of them is a policy violation, not a stale page.
@@ -170,6 +184,46 @@ def _iter_facts(root: Path):
                 yield p
 
 
+#: P0-22: the truth layer of every workspace, cached by its signature.
+#:
+#: The sweep resolves one truth layer PER INDEX — each index is judged
+#: against ITS OWN workspace's truth layer, never against this one's. The
+#: resolution is the expensive part (it parses every markdown file), so it
+#: is cached behind the same cheap signature the release-state cache uses:
+#: a workspace whose truth layer did not move is not re-read.
+_TRUTH_LAYER_CACHE: Dict[str, Tuple[Any, Dict[str, str]]] = {}
+
+
+def _guarded_paths_for(root: Path | str) -> Dict[str, str]:
+    """``path -> class`` for the pages one workspace's truth layer hides.
+
+    An empty result means "this workspace hides nothing" — and also "the
+    truth layer could not be resolved". The two are not the same, so the
+    failure is not silent: the caller reports it (the check that uses this
+    says so in its detail), and an unresolvable truth layer never turns
+    into "nothing is hidden".
+    """
+    from agent.memory.release_state import ReleaseStateCache, tree_signature
+
+    key = str(root)
+    try:
+        signature = tree_signature(root)
+    except Exception:
+        signature = None
+    cached = _TRUTH_LAYER_CACHE.get(key)
+    if cached is not None and signature is not None and cached[0] == signature:
+        return cached[1]
+    try:
+        state = ReleaseStateCache(root).get()
+    except Exception:
+        return {}
+    guarded: Dict[str, str] = {p: "sealed" for p in state.sealed_paths}
+    for p in state.released_paths:
+        guarded[p] = "released"
+    _TRUTH_LAYER_CACHE[key] = (signature, guarded)
+    return guarded
+
+
 class Inspector:
     """One workspace's read-only verifier. Construct per workspace root."""
 
@@ -206,10 +260,217 @@ class Inspector:
         self._check_read_degraded(report)
         self._check_schema_drift(report)
         self._check_public_rows(report)
+        # P0-22: the sweep over EVERY index of the family. The checks above
+        # look at THIS workspace; the sweep looks at every index that
+        # exists — including the ones nobody has addressed in a session,
+        # which is exactly where a leak would sit unnoticed.
+        report["index_sweep"] = self._sweep_indexes(report)
+        report["guard"] = report["index_sweep"].get("guard", {})
         if persist_snapshot:
             self._write_snapshot(snapshot)
         self._write_audit(report)
         return report
+
+    # -- the family-wide sweep (P0-22) ---------------------------------------
+
+    def _family_roots(self) -> List[str]:
+        """Every workspace root whose index EXISTS on disk.
+
+        The roster alone is not enough: ``agents/default`` is not in it,
+        and a sweep that only knows the roster leaves that index
+        unexamined. The disk is the ground truth for "which indexes
+        exist"; the roster only says which workspaces are supposed to.
+        """
+        try:
+            from agent.memory.index_guard import discover_index_roots
+
+            return discover_index_roots(extra=self.workspace_root)
+        except Exception:
+            return [str(self.workspace_root)]
+
+    def _sweep_indexes(self, report: Dict[str, Any]) -> Dict[str, Any]:
+        """Walk EVERY index of the family and report what is wrong with it.
+
+        Three things are checked per index, and all three are things a
+        single-workspace inspection cannot see:
+
+        ① an EXCLUDED-LAYER row in a PUBLIC shape (the leak the old
+           desktop build leaves behind — it indexes ``memory/shelf/*.md``
+           as ``scope='shared'`` + ``user_id=NULL``, i.e. readable by
+           every caller);
+        ② the write-side GUARD: missing, or present but not the current
+           definition (an index without the guard is one the old build
+           can turn a dark page into a public row);
+        ③ a PUBLIC row for a page the truth layer says is a dark page or
+           a release — resolved from THAT workspace's own truth layer, not
+           from this one's.
+
+        The result is a separate section of the report (``index_sweep``)
+        rather than a part of ``violations``: the violations of this
+        report belong to THIS workspace, and a machine-wide sweep that
+        mixed the two would make every workspace's report depend on every
+        other workspace's state. The sweep's own findings are still
+        RED — they turn the CLI's exit code and the audit trail — and each
+        one names the workspace it belongs to.
+        """
+        from agent.memory.index_guard import guard_state, guard_report
+
+        roots = self._family_roots()
+        findings: List[Dict[str, Any]] = []
+        guard_sections: List[Dict[str, Any]] = []
+        checked: List[str] = []
+
+        for root in roots:
+            db = self._index_db_path_for(Path(root))
+            if not db.is_file():
+                continue
+            checked.append(str(root))
+            rel_db = self._relative_to_self(root)
+            try:
+                conn = sqlite3.connect(
+                    "file:" + str(db).replace("\\", "/") + "?mode=ro", uri=True)
+            except sqlite3.Error as e:
+                findings.append({
+                    "reason": REASON_INDEX_ORPHAN,
+                    "code": CODE_INDEX_ORPHAN,
+                    "path": rel_db,
+                    "severity": _SEV_MID,
+                    "detail": f"cannot open index read-only: {e}",
+                    "workspace_root": str(root),
+                })
+                continue
+            try:
+                findings.extend(self._sweep_excluded_public(conn, root, rel_db))
+                findings.extend(self._sweep_public_rows(conn, root, rel_db))
+                state = guard_state(conn)
+                if not state.get("installed") or not state.get("current"):
+                    findings.append({
+                        "reason": REASON_GUARD_MISSING,
+                        "code": CODE_GUARD_MISSING,
+                        "path": rel_db,
+                        "severity": _SEV_HIGH,
+                        "detail": (
+                            f"the write-side guard is not in place on this "
+                            f"index ({state.get('reason') or 'unknown'}); "
+                            f"until it is, any writer — including the old "
+                            f"desktop build — can write a row that must not "
+                            f"be public (run a sync: the guard is re-installed "
+                            f"by the mechanism, not by hand)"),
+                        "workspace_root": str(root),
+                        "guard_state": state,
+                    })
+                try:
+                    report_ = guard_report(conn, minutes=GUARD_WINDOW_MINUTES)
+                except Exception as e:
+                    report_ = {"error": f"{type(e).__name__}: {e}"}
+            finally:
+                conn.close()
+            guard_sections.append({"workspace_root": str(root),
+                                   "index": str(db),
+                                   **report_})
+
+        return {
+            "checked": checked,
+            "checked_count": len(checked),
+            "violations": findings,
+            "violation_count": len(findings),
+            "guard": {
+                "window_minutes": GUARD_WINDOW_MINUTES,
+                "indexes": guard_sections,
+                "blocked_recent": sum(
+                    int((g.get("blocked_recent") or 0)) for g in guard_sections),
+                "blocked_total": sum(
+                    int((g.get("blocked_count") or 0)) for g in guard_sections),
+                "last_at": max(
+                    [g.get("last_at") or "" for g in guard_sections] or [""]),
+            },
+        }
+
+    def _sweep_excluded_public(self, conn, root: Path, rel_db: str
+                                ) -> List[Dict[str, Any]]:
+        """Rows under an excluded layer that are in a PUBLIC shape."""
+        try:
+            rows = conn.execute(
+                "SELECT path, scope, user_id, COUNT(*) FROM chunks "
+                "WHERE scope='shared' AND user_id IS NULL "
+                "GROUP BY path, scope, user_id").fetchall()
+        except sqlite3.Error as e:
+            return [{
+                "reason": REASON_INDEX_ORPHAN, "code": CODE_INDEX_ORPHAN,
+                "path": rel_db, "severity": _SEV_MID,
+                "detail": f"cannot read index: {e}",
+                "workspace_root": str(root),
+            }]
+        out: List[Dict[str, Any]] = []
+        for path, scope, user_id, n in rows:
+            segments = list(excluded_segments(path))
+            if not segments:
+                continue
+            out.append({
+                "reason": REASON_INDEX_EXCLUDED,
+                "code": CODE_INDEX_EXCLUDED,
+                "path": path,
+                "severity": _SEV_HIGH,
+                "detail": (
+                    f"{n} chunk row(s) under excluded segment(s) {segments} "
+                    f"are in a PUBLIC shape (scope={scope!r}, "
+                    f"user_id={user_id!r}) — this layer is not indexed by "
+                    f"policy, and a 'shared' row with no owner is readable "
+                    f"by EVERY caller (run a sync: the reconcile drops "
+                    f"excluded paths)"),
+                "workspace_root": str(root),
+                "chunk_count": n, "scope": scope, "user_id": user_id,
+                "excluded_segments": segments,
+            })
+        return out
+
+    def _sweep_public_rows(self, conn, root: Path, rel_db: str
+                           ) -> List[Dict[str, Any]]:
+        """Public rows for pages THIS workspace's truth layer hides."""
+        guarded = _guarded_paths_for(root)
+        if not guarded:
+            return []
+        try:
+            rows = conn.execute(
+                "SELECT path, scope, user_id, file_sealed, element_released, "
+                "COUNT(*) FROM chunks GROUP BY path, scope, user_id, "
+                "file_sealed, element_released").fetchall()
+        except sqlite3.Error as e:
+            return [{
+                "reason": REASON_INDEX_PUBLIC, "code": CODE_INDEX_PUBLIC,
+                "path": rel_db, "severity": _SEV_MID,
+                "detail": f"cannot read index: {e}",
+                "workspace_root": str(root),
+            }]
+        out: List[Dict[str, Any]] = []
+        for path, scope, user_id, file_sealed, element_released, n in rows:
+            klass = guarded.get(path)
+            if klass is None:
+                continue
+            public_shape = (scope == "shared" and not user_id
+                            and not (file_sealed or 0))
+            if klass == "released":
+                bad = not (element_released or 0)
+            else:
+                bad = public_shape
+            if not bad:
+                continue
+            out.append({
+                "reason": REASON_INDEX_PUBLIC, "code": CODE_INDEX_PUBLIC,
+                "path": path, "severity": _SEV_HIGH,
+                "detail": (
+                    f"{n} chunk row(s) for a page the truth layer says is "
+                    f"{klass}, but the index stores it as scope={scope!r}, "
+                    f"user_id={user_id!r}, file_sealed={file_sealed!r}, "
+                    f"element_released={element_released!r} — a 'shared' row "
+                    f"with no owner is readable by EVERY caller, so this row "
+                    f"is a leak (run a sync; the write-side guard stops it "
+                    f"from being written this way again)"),
+                "workspace_root": str(root),
+                "chunk_count": n, "scope": scope, "user_id": user_id,
+                "guard_class": klass,
+            })
+        return out
 
     # -- check 1: markdown body_hash / fm_hash --------------------------------
 
@@ -372,6 +633,10 @@ class Inspector:
         """This workspace's index. One per Agent (common/state_dir.memory_index_db
         puts it at ``<agent_base>/memory/long-term/index.db``)."""
         return self.memory_root / "long-term" / "index.db"
+
+    def _index_db_path_for(self, root: Path) -> Path:
+        """Another workspace's index — the same layout rule."""
+        return Path(root) / "memory" / "long-term" / "index.db"
 
     def _shared_root(self) -> Optional[Path]:
         """The shared root, for knowledge/ paths that live outside this
@@ -820,6 +1085,25 @@ class Inspector:
             "facts_counts": counts,
             "prev_hash": last_hash,
         }
+        # P0-22: the family-wide sweep is part of the patrol, so it belongs
+        # in the trail: how many indexes were checked, what was found, and
+        # how many writes the guard dropped. A sweep that only lived in the
+        # console output would be a sweep nobody can audit later.
+        sweep = report.get("index_sweep") or {}
+        if sweep:
+            entry["index_sweep"] = {
+                "checked_count": sweep.get("checked_count", 0),
+                "violation_count": sweep.get("violation_count", 0),
+                "guard": {
+                    "blocked_recent": (sweep.get("guard") or {}).get(
+                        "blocked_recent", 0),
+                    "blocked_total": (sweep.get("guard") or {}).get(
+                        "blocked_total", 0),
+                    "last_at": (sweep.get("guard") or {}).get("last_at", ""),
+                    "window_minutes": (sweep.get("guard") or {}).get(
+                        "window_minutes", GUARD_WINDOW_MINUTES),
+                },
+            }
         if getattr(self, "_tampered_snapshot", None):
             entry["snapshot_tampered"] = self._tampered_snapshot
             self._tampered_snapshot = None
@@ -854,7 +1138,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         for item in v:
             print(f"  [{item['severity']}] {item['reason']} {item['path']}: "
                   f"{item['detail']}")
-    return 1 if report["violations"] else 0
+        # P0-22: the family-wide sweep — every index that exists, not only
+        # this workspace's. Its findings are RED too: the exit code below
+        # counts them.
+        sweep = report.get("index_sweep") or {}
+        if sweep:
+            print(f"[sweep] 已巡检索引 {sweep.get('checked_count', 0)} 个，"
+                  f"违例 {sweep.get('violation_count', 0)} 条")
+            for item in sweep.get("violations", []):
+                print(f"  [{item['severity']}] {item['reason']} "
+                      f"{item.get('workspace_root', '')} :: {item['path']}: "
+                      f"{item['detail']}")
+            guard = sweep.get("guard") or {}
+            print(f"[guard] 最近 {guard.get('window_minutes', 0)} 分钟被守卫"
+                  f"改写的行数: {guard.get('blocked_recent', 0)}"
+                  f"（累计 {guard.get('blocked_total', 0)}，"
+                  f"最后一次 {guard.get('last_at') or '无'}）")
+            for item in guard.get("indexes", []):
+                if int(item.get("blocked_recent") or 0) or \
+                        int(item.get("blocked_count") or 0):
+                    print(f"  - {item.get('workspace_root')}: "
+                          f"累计 {item.get('blocked_count')}，"
+                          f"最近 {item.get('blocked_recent')}，"
+                          f"路径 {[p.get('path') for p in item.get('paths', [])][:5]}")
+    return 1 if (report["violations"]
+                 or (report.get("index_sweep") or {}).get("violation_count")) else 0
 
 
 if __name__ == "__main__":

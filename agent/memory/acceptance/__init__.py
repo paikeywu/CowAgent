@@ -113,8 +113,23 @@ class IndexFingerprint:
 
     @property
     def empty(self) -> bool:
-        """True when the index has no rows — the corpus cannot answer."""
-        return self.exists and self.rows == 0
+        """True when the index has no rows — the corpus cannot answer.
+
+        P0-22: a MISSING index file is empty too. The old definition was
+        ``exists and rows == 0``, so a workspace that has no index at all
+        was not "empty" — it was "absent", and the criterion reported
+        "top1 is not USER.md" for a workspace that simply has no corpus
+        yet. A brand-new Agent's workspace has NO index before its first
+        sync, so that is the normal case, not an exotic one.
+
+        "Empty" and "absent" are different FACTS (one has a file with no
+        rows, the other has no file), and the fingerprint still says
+        which: ``exists`` is False in the second case. What they SHARE is
+        the answer to the question the criterion asks: there is no corpus,
+        so a zero-hit result is correct behaviour and not a retrieval
+        failure.
+        """
+        return (not self.exists) or self.rows == 0
 
     def render(self) -> str:
         """One line, short enough to print under every criterion."""

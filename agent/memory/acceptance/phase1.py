@@ -391,23 +391,30 @@ def judge_t3_chinese_recall(manager, report, fp, corpus_fp=None):
     """
     detail, ok = [], True
 
-    if fp is None or not fp.exists:
-        detail.append("被测库不存在 —— 前置条件不成立，无法判定召回质量")
+    # P0-22: the emptiness verdict comes FIRST, and it covers the case
+    # where the index file does not exist at all. The old order reported
+    # "the measured index does not exist — the precondition does not
+    # hold" for a brand-new workspace, and a brand-new workspace has no
+    # index before its first sync: that is the NORMAL case, not an exotic
+    # one. And the old `empty` property said "not empty" for a missing
+    # file, so the verdict could not be "the corpus is empty" even when
+    # that was exactly the truth.
+    corpus = corpus_fp if corpus_fp is not None else fp
+    if corpus is not None and corpus.empty:
+        if not corpus.exists:
+            detail.append("被测库是空的（索引文件根本不存在，0 行）—— "
+                          "语料不存在，0 命中是正确行为")
+        else:
+            detail.append("被测库是空的（0 行）—— 语料不存在，0 命中是正确行为")
+        detail.append("这不是召回失败。请指向一个有语料的工作区，或先同步语料。")
+        if fp is not None and fp.exists and fp.rows != corpus.rows:
+            detail.append(f"（本次同步后被测库有 {fp.rows} 行，但同步前是 "
+                          f"{corpus.rows} 行 —— 空库判定以同步前为准）")
         return report.judge("T3(REAL)", "中文召回（真实工作区）",
                             False, "\n".join(detail), fingerprint=fp)
-    # P0-21 F3: the emptiness verdict is about the corpus as the
-    # workspace HANDED IT OVER, so it is taken from the pre-sync
-    # fingerprint. With the default run (sync ON) the sync fills an empty
-    # workspace, and a verdict taken afterwards would no longer be about
-    # emptiness: it would drift into "the top hit is not USER.md", which
-    # is exactly the reason this verdict exists.
-    corpus = corpus_fp if corpus_fp is not None else fp
-    if corpus.empty:
-        detail.append("被测库是空的（0 行）—— 语料不存在，0 命中是正确行为")
-        detail.append("这不是召回失败。请指向一个有语料的工作区，或先同步语料。")
-        if fp.rows != corpus.rows:
-            detail.append(f"（本次同步后被测库有 {fp.rows} 行，但同步前是 0 行 —— "
-                          f"空库判定以同步前为准）")
+
+    if fp is None or not fp.exists:
+        detail.append("被测库不存在 —— 前置条件不成立，无法判定召回质量")
         return report.judge("T3(REAL)", "中文召回（真实工作区）",
                             False, "\n".join(detail), fingerprint=fp)
 

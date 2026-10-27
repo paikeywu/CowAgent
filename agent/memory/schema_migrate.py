@@ -160,6 +160,22 @@ def backfill_sealed_owner(db_path: Union[str, Path]) -> int:
         conn.close()
 
 
+def guard_roots(extra: Optional[Union[str, Path]] = None) -> List[str]:
+    """Every workspace root whose index ACTUALLY EXISTS on disk.
+
+    P0-22: the roster is not the ground truth for "which indexes exist" —
+    ``agents/default`` is not in it, and a roster-only sweep leaves that
+    index unguarded and unexamined. The disk is: every index that is
+    there gets the guard, whether or not anybody remembered to list it.
+    """
+    from agent.memory.index_guard import discover_index_roots
+
+    try:
+        return discover_index_roots(extra=extra)
+    except Exception:
+        return workspace_roots(extra)
+
+
 def install_guard_on(db_path: Union[str, Path]) -> bool:
     """Install the write-side guard (P0-21) on one index. True when done.
 
@@ -195,6 +211,47 @@ def install_guard_on(db_path: Union[str, Path]) -> bool:
         conn.close()
 
 
+def ensure_guard_all(roots: Optional[List[str]] = None,
+                     extra: Optional[Union[str, Path]] = None
+                     ) -> Dict[str, Dict[str, object]]:
+    """Make sure EVERY index that exists has the guard — and say which.
+
+    Returns ``{workspace root: {"status": ..., "reason": ...}}`` for every
+    index that exists on disk. The statuses are:
+
+    * ``present``  — the guard is there and is the current definition;
+    * ``installed``— it was not there and now is;
+    * ``repaired`` — it was there but stale (the body did not match);
+    * ``failed``   — it could not be installed, with the reason.
+
+    "Already installed" and "could not be installed" must never be the
+    same answer — the first is a fact about an index, the second is a fact
+    about the system's safety.
+    """
+    from agent.memory.index_guard import ensure_guard
+
+    if roots is None:
+        roots = guard_roots(extra)
+    out: Dict[str, Dict[str, object]] = {}
+    for root in roots:
+        db = index_path(root)
+        if not db.is_file():
+            continue
+        try:
+            conn = sqlite3.connect(str(db))
+        except sqlite3.Error as e:
+            out[str(root)] = {"status": "failed", "reason": str(e)}
+            continue
+        try:
+            out[str(root)] = ensure_guard(conn)
+        except Exception as e:
+            out[str(root)] = {"status": "failed",
+                              "reason": f"{type(e).__name__}: {e}"}
+        finally:
+            conn.close()
+    return out
+
+
 def install_guard_all(roots: Optional[List[str]] = None,
                       extra: Optional[Union[str, Path]] = None
                       ) -> Dict[str, bool]:
@@ -202,9 +259,14 @@ def install_guard_all(roots: Optional[List[str]] = None,
 
     Returns ``{workspace root: installed}`` for the workspaces that
     actually have an index file.
+
+    P0-22: with no explicit ``roots`` the sweep covers EVERY index that
+    exists on disk (roster AND layout), not only the roster's — a guard
+    that is a hand-made snapshot is a guard that is one forgotten
+    workspace away from being useless.
     """
     if roots is None:
-        roots = workspace_roots(extra)
+        roots = guard_roots(extra)
     out: Dict[str, bool] = {}
     for root in roots:
         db = index_path(root)
@@ -302,6 +364,11 @@ def run_startup_migration(extra: Optional[Union[str, Path]] = None
     query.
     """
     migrated, failed = migrate_all(extra=extra)
+    # P0-22: the guard is a MECHANISM, not a snapshot. The startup path
+    # re-checks every index that exists on disk and repairs the ones whose
+    # guard is missing or stale — and says which, because "the guard is
+    # installed" is a claim that has to be checked, not assumed.
+    guard_states = ensure_guard_all(extra=extra)
     try:
         from common.log import logger
 
@@ -321,6 +388,18 @@ def run_startup_migration(extra: Optional[Union[str, Path]] = None
                 logger.error(
                     "[Memory] Could not migrate the index schema for %s: %s "
                     "(retrieval against it will fail)", root, reason)
+        for root, state in sorted(guard_states.items()):
+            status = state.get("status")
+            if status in ("installed", "repaired"):
+                logger.warning(
+                    "[Memory] The write-side guard was %s on %s (%s)",
+                    status, root,
+                    state.get("reason") or "no longer the current definition")
+            elif status == "failed":
+                logger.error(
+                    "[Memory] The write-side guard could NOT be installed on "
+                    "%s: %s — rows that must not be public can be written "
+                    "public on that index", root, state.get("reason"))
     except Exception:
         pass
     return migrated, failed
