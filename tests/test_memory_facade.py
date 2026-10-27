@@ -1288,6 +1288,10 @@ def test_r4_reverse_a_non_structural_error_is_not_wrapped(tmp_path):
 
     Wrapping it would tell the caller "the index is broken" when the
     index is fine, and would send the caller looking in the wrong place.
+
+    P0-19 自报：这条用例原来的输入 ``["not-a-number"]`` **根本不抛
+    异常**——向量后端逐行容错，把坏元素丢掉就返回了。它只能证明
+    "没被误包装"，证不了"非结构错误会抛出来"。
     """
     db = tmp_path / "index.db"
     storage = MemoryStorage(db)
@@ -1299,6 +1303,55 @@ def test_r4_reverse_a_non_structural_error_is_not_wrapped(tmp_path):
                 "a malformed embedding was reported as a schema error: %s" % e)
         except Exception:
             pass  # any non-schema exception is acceptable here
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize("bad_kwargs", [
+    {"limit": None},
+    {"limit": "x"},
+    {"scopes": 42},
+])
+def test_r4_reverse_a_real_non_structural_error_is_not_wrapped(tmp_path,
+                                                               bad_kwargs):
+    """3.2: 一个**真的**会抛出来的非结构异常，不得被包装成 schema 错误。
+
+    P0-19 补的强度用例。原来那条 ``["not-a-number"]`` 的输入压根不抛
+    （向量后端逐行容错），所以它证明不了"非结构错误一定抛出"。这里的
+    三个输入是**实测**会抛 ``TypeError`` 的：``limit`` 传 None / 字符串、
+    ``scopes`` 传整数。
+
+    判据有两层，缺一不可：
+      ① 异常**真的抛出来了**（不是"没有异常所以通过"）；
+      ② 它**不是** ``MemorySchemaError``——它不是结构问题，索引是好的。
+    """
+    db = tmp_path / "index.db"
+    storage = MemoryStorage(db)
+    try:
+        with pytest.raises(Exception) as excinfo:
+            storage.search_vector([0.1, 0.2], **bad_kwargs)
+        assert not isinstance(excinfo.value, MemorySchemaError), (
+            "a non-structural error was reported as a schema error: %s"
+            % excinfo.value)
+    finally:
+        storage.close()
+
+
+def test_r4_reverse_the_schema_error_still_wraps_a_real_structural_failure(
+        tmp_path):
+    """3.2 的对照面：结构错误**必须**仍然被包装。
+
+    上一条只说"非结构的别包装"；这一条说"结构的还是要包装"。两条合
+    起来才是完整的契约——只有第二条时，判据会在"什么都不抛"的世界里
+    变绿。
+    """
+    db = tmp_path / "index.db"
+    storage = MemoryStorage(db)
+    try:
+        storage.conn.execute("DROP TABLE chunks")
+        storage.conn.commit()
+        with pytest.raises(MemorySchemaError):
+            storage.search_vector([0.1, 0.2], scopes=["shared"])
     finally:
         storage.close()
 

@@ -889,8 +889,56 @@ class WriteFacade:
                     f"{sorted(HUMAN_PROFILE_SUBJECTS)}, got {subject!r}"
                 )
         layer = LAYER_BY_CONTAINER[container]
-        occurred_at = carry.get("occurred_at") or _utc8_now()
+        # P0-19 · 双时间轴（候选 A）: ``occurred_at`` 是**事情发生的时间**，
+        # ``recorded_at`` 是**被记下来的时间**（03 §5.2 / 06 §3.1）。
+        # 今天两者都等于写入时刻，于是 ``occurred_at`` 与 ``recorded_at``
+        # 语义重复，而 ``date=`` 表达的"这事发生在那天"只落到目录路径上
+        # ——目录说 2026-10-27，by-day 却按 ``occurred_at[:10]`` 分组说
+        # 2026-10-28。
+        #
+        # 裁决：``date=`` 显式给出时，``occurred_at`` 取**那一天**的写入
+        # 时刻（日期用 ``date``，时刻用"现在"）；未给出时取写入时刻。
+        # ``recorded_at`` 始终是真实的写入时刻。两者从此**语义不同**：
+        # 补记昨天的事 → occurred_at 在昨天，recorded_at 在今天；
+        # 记今天的事 → 两者同日但仍是两个不同时刻。
+        #
+        # 为什么不是"当天 00:00:00"：by-day 页有一列「时间」，设计文档
+        # 06 §2.2 的样例写的是 10:12 / 10:31 这种**真实时刻**。把
+        # occurred_at 压成 00:00 会让那一整列退化成 00:00，人读不出
+        # "那天几点"。日期来自 ``date``，时刻来自现在——两者各取所长。
+        #
+        # 为什么 carry 优先：``carry`` 是 revise / release 的可信通道，
+        # 改版和释放必须保留**原来**的发生时间，不能被新的目录日期改写。
         rec = recorded_at or _utc8_now()
+        if carry.get("occurred_at"):
+            occurred_at = carry["occurred_at"]
+        elif date:
+            # P0-19: ``date`` now feeds ``occurred_at``, so a malformed date
+            # would land in the front-matter as a malformed timestamp. The
+            # check lives HERE, in the single choke point every element-
+            # creating entry funnels through, so no entry can smuggle a bad
+            # date past it.
+            #
+            # Two levels: the SHAPE (``_DATE_RE``) and the VALUE (a real
+            # calendar date). ``2026-13-45`` passes the shape check but is
+            # not a date — without the value check it would only be caught
+            # by WR-10, and only because it happens to be in the future.
+            # ``2026-02-30`` would sail straight through.
+            if not _DATE_RE.match(date):
+                raise FacadeError(
+                    f"date must be YYYY-MM-DD, got {date!r} — it becomes "
+                    f"the date part of occurred_at"
+                )
+            try:
+                datetime.strptime(date, "%Y-%m-%d")
+            except ValueError:
+                raise FacadeError(
+                    f"date must be a real calendar date, got {date!r} — it "
+                    f"becomes the date part of occurred_at"
+                ) from None
+            occurred_at = f"{date}T{rec[11:19]}+08:00"
+        else:
+            occurred_at = _utc8_now()
         # WR-10 internal assertions (facade self-checks, a failure = our bug).
         if occurred_at > rec:
             raise FacadeError(

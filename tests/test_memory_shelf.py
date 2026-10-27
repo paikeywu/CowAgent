@@ -19,6 +19,7 @@ import pytest
 import yaml
 
 from agent.memory.facade import (
+    FacadeError,
     RecordingConfirmationChannel,
     WriteFacade,
     split_frontmatter,
@@ -382,16 +383,103 @@ def test_sh8_by_day_covers_every_event(ws, cow):
 
 
 def test_sh8_reverse_missing_day_page_is_detected(ws, cow):
-    """反向用例：删掉某天的 by-day 页 → 判定必须失败。"""
+    """反向用例：删掉某天的 by-day 页 → 判定必须失败。
+
+    P0-19 修复：这条用例从 P0-8 写出来那天起就**从未被验证过**——
+    它删的是写死的 ``2026-10-27.md``，而查找用的是
+    ``occurred_at[:10]``。``date=`` 当时只决定目录路径，``occurred_at``
+    却是写入时刻，于是目录说 10-27、by-day 说 10-28，测试在**除
+    2026-10-27 当天以外的每一天都必然失败**。它一直混在"环境性失败"
+    里躲了六轮。
+
+    修复后：被删的页由**事件的 ``occurred_at``** 推出，不再写死日期；
+    而且断言的语义**没有变弱**——它仍然证明"少了 by-day 页，判定必须
+    失败"，并且额外断言"删之前那一页确实存在"（否则这个用例会因为
+    "本来就没有那一页"而空转通过）。
+    """
     f, paths = build(ws, cow, events=2)
     rebuild(ws)
-    page = shelf(ws) / "by-day" / "2026-10-27.md"
+    days = {split_frontmatter(p.read_text(encoding="utf-8"))[0]["occurred_at"][:10]
+            for p in paths}
+    assert len(days) == 1, f"这些事件应落在同一天，实际 {days}"
+    day = days.pop()
+    page = shelf(ws) / "by-day" / f"{day}.md"
+    assert page.is_file(), f"删之前 {day} 页必须存在，否则本用例空转"
     page.unlink()
     missing = [p for p in paths
                if not (shelf(ws) / "by-day" /
                        f"{split_frontmatter(p.read_text(encoding='utf-8'))[0]['occurred_at'][:10]}.md"
                        ).is_file()]
     assert missing
+
+
+def test_sh8_by_day_grouping_is_independent_of_the_wall_clock(ws, cow):
+    """判据③：SH-8 不得依赖"运行当天是几号"。
+
+    用一个**伪造的过去日期**写事件，然后检查 by-day 分组落在那一天，
+    而不是落在"今天"。这条用例在 2026-10-27 当天跑和在这一天之后的
+    任何一天跑，结论必须完全一样。
+    """
+    past = "2020-03-17"
+    f = WriteFacade(ws, actor=ACTOR, cow_root=cow,
+                     channel=RecordingConfirmationChannel())
+    p = f.write_event("evt-past", "过去的事件", "正文", date=past)
+    fm, _ = split_frontmatter(p.read_text(encoding="utf-8"))
+    assert fm["occurred_at"][:10] == past, (
+        f"occurred_at 的日期必须取 date= 给的那一天，实际 {fm['occurred_at']}")
+    rebuild(ws)
+    page = shelf(ws) / "by-day" / f"{past}.md"
+    assert page.is_file(), f"缺少 {past} 页"
+    assert "过去的事件" in page.read_text(encoding="utf-8")
+
+
+def test_sh8_occurred_at_and_recorded_at_are_semantically_distinct(ws, cow):
+    """判据⑤：``date=`` 显式给出时，两个时间戳必须语义不同。
+
+    ``occurred_at`` = 事情发生的时间（那天），``recorded_at`` = 被记下来
+    的时间（今天）。补记昨天的事，两个戳必须分开——否则"发生 ≠ 记录"
+    这条契约就只剩一个字段（P0-1 九要素 / 03 §5.2）。
+    """
+    past = "2020-03-17"
+    f = WriteFacade(ws, actor=ACTOR, cow_root=cow,
+                     channel=RecordingConfirmationChannel())
+    p = f.write_event("evt-backfill", "补记", "正文", date=past)
+    fm, _ = split_frontmatter(p.read_text(encoding="utf-8"))
+    assert fm["occurred_at"][:10] == past
+    assert fm["recorded_at"][:10] != past, (
+        "recorded_at 是写入时刻，不该等于补记的那一天")
+    assert fm["occurred_at"] <= fm["recorded_at"], "WR-10：发生不得晚于记录"
+
+
+def test_sh8_future_date_is_rejected_by_wr10(ws, cow):
+    """反向用例：把 ``date=`` 指到未来 → 必须被 WR-10 拒绝。
+
+    ``occurred_at`` 晚于 ``recorded_at`` 是记账错误（03 §5.2 的判据）。
+    补记过去合法，写未来不合法——这条用例证明 WR-10 在新语义下**仍然
+    成立**，而不是因为两个戳恒等才"永远通过"。
+    """
+    f = WriteFacade(ws, actor=ACTOR, cow_root=cow,
+                     channel=RecordingConfirmationChannel())
+    with pytest.raises(FacadeError):
+        f.write_event("evt-future", "未来的事", "正文", date="2099-01-01")
+    # 补记过去必须仍然合法（WR-10 只拒未来）
+    p = f.write_event("evt-past", "过去的事", "正文", date="2020-03-17")
+    assert p.is_file()
+
+
+def test_sh8_a_malformed_date_is_rejected(ws, cow):
+    """反向用例：``date=`` 格式非法 → 必须被拒绝。
+
+    P0-19 引入的风险面：``date`` 现在会拼进 ``occurred_at``，所以一个
+    写坏的日期会变成一个写坏的时间戳落进 front-matter。校验放在
+    ``_new_element`` 这一个收口点，任何入口都绕不过去。
+    """
+    f = WriteFacade(ws, actor=ACTOR, cow_root=cow,
+                     channel=RecordingConfirmationChannel())
+    for bad in ("2026-13-45", "2026/10/27", "not-a-date", "20261027",
+                "2026-02-30", "2026-00-10", "2026-10-32"):
+        with pytest.raises(FacadeError):
+            f.write_event("evt-bad", "坏日期", "正文", date=bad)
 
 
 def test_sh9_by_entity_covers_every_entity_slug(ws, cow):
