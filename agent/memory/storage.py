@@ -20,7 +20,7 @@ from agent.memory.vector_backend import (
     VectorBackend,
     VectorRecord,
 )
-from agent.memory.visibility import visibility_clause
+from agent.memory.visibility import SCOPE_SEALED, visibility_clause
 
 try:
     import numpy as np
@@ -1067,16 +1067,20 @@ class MemoryStorage:
         query_embedding: List[float],
         user_id: Optional[str] = None,
         scopes: List[str] = None,
-        limit: int = 10
+        limit: int = 10,
+        identities: Optional[List[str]] = None,
     ) -> List[SearchResult]:
         """Search the configured vector backend."""
         if scopes is None:
             scopes = ["shared"]
-            if user_id:
+            if user_id or identities:
                 scopes.append("user")
+                scopes.append("sealed")
         metadata_filter = {"scopes": scopes}
         if user_id:
             metadata_filter["user_id"] = user_id
+        if identities:
+            metadata_filter["identities"] = list(identities)
         matches = self.vector_backend.search(
             query_embedding,
             limit=limit,
@@ -1100,7 +1104,8 @@ class MemoryStorage:
         query: str,
         user_id: Optional[str] = None,
         scopes: List[str] = None,
-        limit: int = 10
+        limit: int = 10,
+        identities: Optional[List[str]] = None,
     ) -> List[SearchResult]:
         """
         Keyword search using FTS5 + LIKE fallback
@@ -1110,11 +1115,17 @@ class MemoryStorage:
         2. Always fall back to LIKE for CJK queries
         3. If FTS5 fails OR returns empty for non-CJK, also try LIKE so a
            broken FTS5 shadow table doesn't silently kill keyword search.
+
+        ``identities`` are the caller's other identity tokens (the ambient
+        agent id among them). They join the visibility predicate's identity
+        branch, so a dark page — indexed under its owner's agent token — is
+        visible to the agent that wrote it and to nobody else.
         """
         if scopes is None:
             scopes = ["shared"]
-            if user_id:
+            if user_id or identities:
                 scopes.append("user")
+                scopes.append("sealed")
 
         # Step 1: Standard FTS5 (unicode61) — pure ASCII queries only.
         # Skipped when query contains any CJK characters: unicode61 tokenises CJK
@@ -1127,7 +1138,8 @@ class MemoryStorage:
                 and not MemoryStorage._contains_cjk(query)
                 and MemoryStorage._build_fts_query(query)):
             fts1_attempted = True
-            fts_results = self._search_fts5(query, user_id, scopes, limit)
+            fts_results = self._search_fts5(query, user_id, scopes, limit,
+                                            identities)
             if fts_results:
                 return fts_results
 
@@ -1137,7 +1149,8 @@ class MemoryStorage:
         if self.trigram_fts5_available and (
             MemoryStorage._contains_cjk(query) or fts1_attempted
         ):
-            trigram_results = self._search_fts5_trigram(query, user_id, scopes, limit)
+            trigram_results = self._search_fts5_trigram(
+                query, user_id, scopes, limit, identities)
             if trigram_results:
                 return trigram_results
 
@@ -1146,7 +1159,7 @@ class MemoryStorage:
         if (not self.fts5_available
                 or MemoryStorage._contains_cjk(query)
                 or fts1_attempted):
-            return self._search_like(query, user_id, scopes, limit)
+            return self._search_like(query, user_id, scopes, limit, identities)
 
         return []
     
@@ -1155,7 +1168,8 @@ class MemoryStorage:
         query: str,
         user_id: Optional[str],
         scopes: List[str],
-        limit: int
+        limit: int,
+        identities: Optional[List[str]] = None,
     ) -> List[SearchResult]:
         """FTS5 full-text search"""
         fts_query = self._build_fts_query(query)
@@ -1165,7 +1179,8 @@ class MemoryStorage:
         scope_placeholders = ','.join('?' * len(scopes))
         vis_sql, vis_params = visibility_clause(
             user_id, "chunks.scope", "chunks.user_id",
-            "chunks.element_released", "chunks.file_sealed")
+            "chunks.element_released", "chunks.file_sealed",
+            identities=identities)
         sql_query = f"""
             SELECT chunks.*, bm25(chunks_fts) as rank
             FROM chunks_fts
@@ -1253,7 +1268,8 @@ class MemoryStorage:
         query: str,
         user_id: Optional[str],
         scopes: List[str],
-        limit: int
+        limit: int,
+        identities: Optional[List[str]] = None,
     ) -> List[SearchResult]:
         """LIKE-based search.
 
@@ -1284,7 +1300,7 @@ class MemoryStorage:
 
         where_clause, params = _build_where(groups)
         params.extend(scopes)
-        vis_sql, vis_params = visibility_clause(user_id)
+        vis_sql, vis_params = visibility_clause(user_id, identities=identities)
         params.extend(vis_params)
         params.append(limit)
         sql_query = f"""
@@ -1327,7 +1343,7 @@ class MemoryStorage:
                 # a page matching only one part of a three-part question
                 # still scores lower than one matching more of it.
                 results = self._search_like_relaxed(
-                    groups, user_id, scopes, limit
+                    groups, user_id, scopes, limit, identities
                 )
 
             results.sort(key=lambda r: r.score, reverse=True)
@@ -1342,7 +1358,8 @@ class MemoryStorage:
         groups: List[QueryGroup],
         user_id: Optional[str],
         scopes: List[str],
-        limit: int
+        limit: int,
+        identities: Optional[List[str]] = None,
     ) -> List[SearchResult]:
         """Per-group LIKE search, used when the ANDed query matched nothing.
 
@@ -1361,7 +1378,8 @@ class MemoryStorage:
                 alternatives.append("LOWER(text) LIKE ?")
                 params.append(f'%{window.lower()}%')
             where_clause = "(" + " OR ".join(alternatives) + ")"
-            vis_sql, vis_params = visibility_clause(user_id)
+            vis_sql, vis_params = visibility_clause(user_id,
+                                                    identities=identities)
             sql = f"""
                 SELECT * FROM chunks
                 WHERE {where_clause}
@@ -1480,7 +1498,9 @@ class MemoryStorage:
         return [row['path'] for row in rows]
 
     def apply_release_projection(self, released_paths: set,
-                                 sealed_paths: set) -> int:
+                                 sealed_paths: set,
+                                 sealed_owner: Optional[Dict[str, str]] = None
+                                 ) -> int:
         """Re-stamp the release flags of every indexed row from the truth layer.
 
         P0-11 P-2 (RR-04): the flags on a chunk row are a PROJECTION of the
@@ -1495,34 +1515,75 @@ class MemoryStorage:
         So the flags are refreshed from the DISK (the authority) against the
         rows that exist, and only rows whose flag actually changed are
         written. Returns the number of rows changed.
+
+        P0-14 L-2: a DARK PAGE is re-owned here as well. Its row must carry
+        the owner's token under its own scope, otherwise the predicate
+        cannot tell "the owner" from "everybody" — and a dark page indexed
+        as a shared row would be public.
         """
         try:
             rows = self.conn.execute(
-                "SELECT DISTINCT path, element_released, file_sealed FROM chunks"
+                "SELECT DISTINCT path, element_released, file_sealed, scope, "
+                "user_id FROM chunks"
             ).fetchall()
         except Exception:
             return 0
+        owners = sealed_owner or {}
         updates = []
+        scope_updates = []
         for row in rows:
             path = row["path"]
             want_released = 1 if path in released_paths else 0
             want_sealed = 1 if path in sealed_paths else 0
             if (int(row["element_released"] or 0) == want_released
                     and int(row["file_sealed"] or 0) == want_sealed):
+                # The flags are right — but a dark page must also carry its
+                # owner, and a page that used to be sealed may have been
+                # re-opened on disk.
+                want_scope, want_user = self._ownership_for(
+                    path, want_sealed, owners)
+                if want_scope is not None and (
+                        row["scope"] != want_scope
+                        or (row["user_id"] or "") != want_user):
+                    scope_updates.append((want_scope, want_user, path))
                 continue
             updates.append((want_released, want_sealed, path))
-        if not updates:
+            want_scope, want_user = self._ownership_for(
+                path, want_sealed, owners)
+            if want_scope is not None and (
+                    row["scope"] != want_scope
+                    or (row["user_id"] or "") != want_user):
+                scope_updates.append((want_scope, want_user, path))
+        if not updates and not scope_updates:
             return 0
         with self._lock:
             try:
-                self.conn.executemany(
-                    "UPDATE chunks SET element_released = ?, file_sealed = ? "
-                    "WHERE path = ?", updates)
+                if updates:
+                    self.conn.executemany(
+                        "UPDATE chunks SET element_released = ?, file_sealed = ? "
+                        "WHERE path = ?", updates)
+                if scope_updates:
+                    self.conn.executemany(
+                        "UPDATE chunks SET scope = ?, user_id = ? "
+                        "WHERE path = ?", scope_updates)
                 self.conn.commit()
             except Exception:
                 self.conn.rollback()
                 raise
-        return len(updates)
+        return len(updates) + len(scope_updates)
+
+    @staticmethod
+    def _ownership_for(path: str, sealed: int,
+                       owners: Dict[str, str]) -> Tuple[Optional[str], str]:
+        """``(scope, user_id)`` a row must carry, or ``(None, "")`` to leave it.
+
+        A dark page carries its own scope and its owner's token. A page that
+        is NOT a dark page keeps whatever scope it had — the projection
+        must not rewrite the ownership of ordinary rows.
+        """
+        if not sealed:
+            return None, ""
+        return SCOPE_SEALED, owners.get(path) or ""
 
     def update_file_metadata(self, path: str, source: str, file_hash: str, mtime: int, size: int):
         """Update file metadata"""
@@ -1659,7 +1720,8 @@ class MemoryStorage:
         query: str,
         user_id: Optional[str],
         scopes: List[str],
-        limit: int
+        limit: int,
+        identities: Optional[List[str]] = None,
     ) -> List[SearchResult]:
         """Trigram FTS5 search — handles CJK and mixed queries with BM25 ranking."""
         trigram_query = self._build_trigram_query(query)
@@ -1669,7 +1731,8 @@ class MemoryStorage:
         scope_placeholders = ','.join('?' * len(scopes))
         vis_sql, vis_params = visibility_clause(
             user_id, "chunks.scope", "chunks.user_id",
-            "chunks.element_released", "chunks.file_sealed")
+            "chunks.element_released", "chunks.file_sealed",
+            identities=identities)
         sql = f"""
             SELECT chunks.*, bm25(chunks_fts_trigram) as rank
             FROM chunks_fts_trigram

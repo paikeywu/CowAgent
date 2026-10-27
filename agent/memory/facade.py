@@ -49,6 +49,16 @@ from agent.memory.facts_refs import (
     feeling_run_id,
 )
 from agent.memory.frontmatter import split_frontmatter
+from agent.memory.visibility import (
+    READ_RELEASED,
+    READ_SEALED,
+    SEALED_PLACEHOLDER,
+    VIS_RELEASED,
+    VIS_SEALED,
+    agent_owner_token,
+    classify_frontmatter,
+    owner_token,
+)
 
 # ---------------------------------------------------------------------------
 # Exceptions (P0-3 §0 名词约定 — exact names, do not rename)
@@ -320,6 +330,9 @@ class WriteFacade:
         self._clock = clock or time.monotonic
         self._pending: Dict[str, Dict[str, Any]] = {}
         self._consumed_tokens: set[str] = set()
+        # The truth layer's release state (P0-14 L-1/L-2): the read exits
+        # must ask the truth layer, not the file's own front-matter.
+        self._release_cache = None
 
     # -- audit ------------------------------------------------------------
 
@@ -994,12 +1007,58 @@ class WriteFacade:
 
     # -- read with re-verification (RR-01..04) --------------------------------
 
+    def _owner_tokens(self) -> set:
+        """The identity tokens this facade speaks for.
+
+        A facade is constructed over ONE agent's own memory root, so the
+        reads it serves are 本视角 (that viewpoint) — and, through it, the
+        主人格 who reads that agent's memory. The cross-view case (the
+        master reading ANOTHER agent's dark page) is the borrowing desk,
+        which is not implemented yet.
+        """
+        tokens = set()
+        for candidate in (self.actor, self.workspace_root.name):
+            token = agent_owner_token(candidate)
+            if token:
+                tokens.add(token)
+        return tokens
+
+    def _state(self):
+        """The truth layer's release state (the authority for reads).
+
+        Cached behind its own signature, so a repeated read does not
+        re-read every markdown file.
+        """
+        if self._release_cache is None:
+            from agent.memory.release_state import ReleaseStateCache
+            self._release_cache = ReleaseStateCache(self.workspace_root)
+        return self._release_cache.get()
+
+    @staticmethod
+    def _state_key(relpath: str) -> str:
+        """The truth-layer key of a path, the way the state speaks it."""
+        key = str(relpath or "").replace("\\", "/").lstrip("/")
+        if not key.startswith("memory/"):
+            key = "memory/" + key
+        return key
+
     def read(self, relpath: str) -> Tuple[Dict[str, Any], str]:
         """Read a truth-layer file with RR-01/02/03/04 re-verification.
 
         Raises PathEscapeError (RR-01/02), FrontmatterTamperError (RR-03).
         A released element is not returned as trusted memory (RR-04): the
         caller gets an empty result, and no 'filtered N items' signal.
+
+        P0-14 L-2: a DARK PAGE (``visibility: sealed``) is NOT a release.
+        Its body is open to its owner and closed to everybody else, so a
+        read that does not hold the owner's token gets the placeholder +
+        access entry (06 §B1) — never the body, never a count of what was
+        withheld.
+
+        The release state — not the file's own front-matter — decides
+        whether an element was released: a released element keeps its old
+        bytes (WR-11), so the original version still says ``status: active``
+        and only the tombstone knows the truth.
         """
         real = self._resolve(relpath)
         if not real.is_file():
@@ -1014,8 +1073,26 @@ class WriteFacade:
                     f"modified outside the facade"
                 )
                 raise self._reject(e, "read", relpath)
-            if fm.get("status") == "released":
+            kind = classify_frontmatter(fm)
+            if kind == VIS_RELEASED:
                 return {}, ""  # RR-04: released leaves the trusted result set
+            if kind == VIS_SEALED:
+                owner = owner_token(fm)
+                if owner and owner not in self._owner_tokens():
+                    return {}, SEALED_PLACEHOLDER
+        # The tombstone knows what the file's own bytes cannot say.
+        try:
+            state = self._state()
+        except Exception as e:
+            raise FacadeError(
+                f"the release state could not be resolved ({e}); refusing to "
+                f"serve the file (fail closed).") from e
+        decision, _reason = state.decide(
+            self._state_key(relpath), self._owner_tokens())
+        if decision == READ_RELEASED:
+            return {}, ""
+        if decision == READ_SEALED:
+            return {}, SEALED_PLACEHOLDER
         return fm, body
 
     # -- revise = new version, old bytes untouched (WR-11) ---------------------
@@ -1130,7 +1207,7 @@ class WriteFacade:
                     f"only the memory owner may initiate release; subject is "
                     f"{subject!r}, actor is {self.actor!r} (WR-19)"
                 )
-            if fm.get("status") == "released":
+            if classify_frontmatter(fm) == VIS_RELEASED:
                 raise FacadeError("already released")
             if not human:
                 # Own memory: release executes immediately (no WR-20).

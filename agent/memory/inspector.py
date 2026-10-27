@@ -68,6 +68,11 @@ REASON_SNAPSHOT_TAMPER = "gap-rule:snapshot-hash-mismatch"
 # and are therefore visible to EVERY caller (V2-Q-01).
 REASON_INDEX_EXCLUDED = "gap-rule:index-excluded-path"
 REASON_INDEX_ORPHAN = "gap-rule:index-orphan"
+# P0-13 L-3: the release projection could not be refreshed, so the
+# retrieval exits were failing closed. The marker the manager leaves behind
+# is what turns "it broke once" into "it is still broken" — a degradation
+# nobody can find is a degradation that stays.
+REASON_PROJECTION_DEGRADED = "gap-rule:release-projection-degraded"
 
 # Short machine codes carried on every violation (the shelf view needs a
 # stable code, not a sentence).
@@ -75,6 +80,7 @@ CODE_SHRUNK = "facts-shrunk"
 CODE_HISTORY = "history-rewritten"
 CODE_INDEX_EXCLUDED = "index-excluded-path"
 CODE_INDEX_ORPHAN = "index-orphan"
+CODE_PROJECTION_DEGRADED = "release-projection-degraded"
 
 # Path segments the sync scan skips by policy (agent/memory/manager.py).
 # A chunk row under any of them is a policy violation, not a stale page.
@@ -173,6 +179,7 @@ class Inspector:
         snapshot = self._check_facts(report, prev_snapshot)
         self._check_naming(report)
         self._check_index_hygiene(report)
+        self._check_projection_degraded(report)
         if persist_snapshot:
             self._write_snapshot(snapshot)
         self._write_audit(report)
@@ -431,6 +438,36 @@ class Inspector:
                     f"disk — the row outlived its page",
                     _SEV_MID, code=CODE_INDEX_ORPHAN,
                     chunk_count=n, scope=scope, user_id=user_id)
+
+    # -- check 6: the release projection's health (P0-13 L-3) -----------------
+
+    def _check_projection_degraded(self, report: Dict[str, Any]) -> None:
+        """Report a release projection that could not be refreshed.
+
+        The manager leaves a marker behind whenever the projection refresh
+        fails, and removes it on the next success. While the marker is
+        there, the retrieval exits are FAILING CLOSED (they refuse rather
+        than serve a stale "nothing is released" view) — which is the right
+        behaviour and a broken system at the same time. The inspector is
+        where the second half gets said out loud.
+        """
+        marker = self.audit_dir / "release_projection.json"
+        if not marker.is_file():
+            return
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            payload = {"error": f"unreadable marker: {e}"}
+        rel = marker.relative_to(self.workspace_root).as_posix()
+        self._violation(
+            report, REASON_PROJECTION_DEGRADED, rel,
+            f"the release projection could not be refreshed "
+            f"(stage={payload.get('stage')!r}, at={payload.get('at')!r}, "
+            f"error={payload.get('error')!r}); the retrieval exits are "
+            f"failing closed until a refresh succeeds",
+            _SEV_HIGH, code=CODE_PROJECTION_DEGRADED,
+            stage=payload.get("stage"), at=payload.get("at"),
+            error=payload.get("error"))
 
     # -- snapshots -------------------------------------------------------------
 

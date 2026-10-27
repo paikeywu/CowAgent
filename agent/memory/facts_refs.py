@@ -22,6 +22,24 @@ Two shapes of ref are understood, because the ecosystem has produced both:
 
 A ref that resolves to neither is DANGLING, and the shelf reports it as a
 gap (INV-1). Nothing here guesses: the id must match a row that exists.
+
+TWO ID SPACES, ONE DIGEST — read this before you "fix" an id (P0-14 附带):
+
+``fact_element_id(c)`` and ``feeling_element_id(c)`` hash the SAME content
+with the SAME sha256 and take the SAME first 20 hex digits. They differ
+only in the prefix::
+
+    fact    = f_909a65ef96c3c090a8ab
+    feeling = f_feeling_909a65ef96c3c090a8ab
+
+So a feeling row and a plain fact row carrying the SAME text are
+**twins at the digest level**. The two id spaces cannot collide as ids
+(``f_feeling_`` is not a legal ``f_`` id — ``g``/``l``/``i``/``n`` are not
+hex characters, so ``f_<20 hex>`` never matches a feeling id), and
+``FactsIndex`` keys on the full id, so the rows never overwrite each
+other. But if anyone ever strips the prefix to match ids, a feeling row and
+its twin fact row WILL look like the same element. Strip prefixes only
+when you also compare the prefix namespace.
 """
 
 from __future__ import annotations

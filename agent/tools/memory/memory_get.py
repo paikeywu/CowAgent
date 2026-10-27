@@ -8,6 +8,7 @@ import os
 
 from agent.tools.base_tool import BaseTool
 from agent.tools.utils.credentials import DENIED_MESSAGE, is_credential_path
+from agent.memory.visibility import RELEASED_PLACEHOLDER, SEALED_PLACEHOLDER
 
 
 class MemoryGetTool(BaseTool):
@@ -98,6 +99,7 @@ class MemoryGetTool(BaseTool):
             # here, which is how such an Agent used to lose every knowledge
             # page it had just been told about (#3175 follow-up).
             allowed_roots = [workspace_dir]
+            knowledge_root = None
             if path.startswith('knowledge/'):
                 from common import state_dir
                 knowledge_root = state_dir.knowledge_dir(base=workspace_dir)
@@ -127,7 +129,33 @@ class MemoryGetTool(BaseTool):
 
             if not file_path.is_file():
                 return ToolResult.fail(f"Error: {path} is not a regular file")
-            
+
+            # P0-13 L-1: this tool IS a read exit, and it used to be the
+            # one that leaked — it read the file straight off the disk,
+            # bypassing the retrieval predicate, so a released body came
+            # back in full. Every read exit now asks the SAME judgement
+            # (agent.memory.visibility / the manager's release state).
+            #
+            # P0-13 L-3: if the truth layer cannot be resolved, the read
+            # FAILS. An unknown release state must not serve content.
+            key = self._visibility_key(file_path, workspace_dir,
+                                       knowledge_root=knowledge_root)
+            decide = getattr(self.memory_manager, "read_decision", None)
+            if decide is not None:
+                try:
+                    decision, _reason = decide(key)
+                except Exception as e:
+                    return ToolResult.fail(
+                        f"Error: the release state could not be resolved "
+                        f"({e}); refusing to serve the file (fail closed)."
+                    )
+                if decision == "released":
+                    return ToolResult.fail(RELEASED_PLACEHOLDER)
+                if decision == "sealed":
+                    return ToolResult.fail(SEALED_PLACEHOLDER)
+            # A manager with no truth layer at all (a stub) has nothing that
+            # could be released, so there is nothing to judge.
+
             content = file_path.read_text(encoding='utf-8')
             lines = content.split('\n')
             
@@ -160,3 +188,20 @@ class MemoryGetTool(BaseTool):
             
         except Exception as e:
             return ToolResult.fail(f"Error reading memory file: {str(e)}")
+
+    @staticmethod
+    def _visibility_key(file_path, workspace_dir, knowledge_root=None) -> str:
+        """The index key of a file — the key the release state speaks in.
+
+        The release state is keyed by the same workspace-relative POSIX
+        strings ``chunks.path`` carries, so the read exit has to speak the
+        same key. A knowledge file lives under the shared knowledge root
+        and is keyed ``knowledge/<relative>``, exactly as the scan keys it.
+        """
+        try:
+            if knowledge_root is not None:
+                rel = file_path.relative_to(knowledge_root).as_posix()
+                return f"knowledge/{rel}"
+            return file_path.relative_to(workspace_dir).as_posix()
+        except ValueError:
+            return file_path.as_posix()

@@ -4,6 +4,7 @@ Memory manager for AgentMesh
 Provides high-level interface for memory operations
 """
 
+import json
 import os
 from typing import List, Optional, Dict, Any, Sequence, Tuple
 from pathlib import Path
@@ -18,6 +19,24 @@ from agent.memory.layers import excluded_segments
 from agent.memory.release_state import ReleaseStateCache
 from agent.memory.reranker import Reranker
 from agent.memory.summarizer import MemoryFlushManager, create_memory_files_if_needed
+from agent.memory.visibility import (
+    READ_ALLOW,
+    SCOPE_SEALED,
+    VIS_OPEN,
+    VIS_RELEASED,
+    VIS_SEALED,
+    ambient_identities,
+    classify_frontmatter,
+    identity_tokens,
+    owner_token,
+)
+
+
+def _utc8_now() -> str:
+    """Local timestamp for the audit trail (UTC+8, the workspace's clock)."""
+    from datetime import timezone, timedelta
+    return datetime.now(timezone(timedelta(hours=8))).strftime(
+        "%Y-%m-%dT%H:%M:%S+08:00")
 
 
 def _real(path: Path) -> Path:
@@ -160,30 +179,31 @@ class MemoryManager:
         create_memory_files_if_needed(workspace_dir)
     
     @staticmethod
-    def _file_seals_itself(content: str) -> bool:
-        """True when the file's own front-matter seals it.
+    def _file_visibility(content: str) -> Tuple[str, Optional[str]]:
+        """``(visibility_class, owner_token)`` for a scanned file.
 
-        ``visibility: sealed`` or ``status: released`` — the two states
-        P0-1 §4.1 defines and the shelf's SH-7 filter already honours.
-        Such a file is not part of the shared retrieval surface.
+        ``visibility_class`` is one of open / released / sealed; the owner
+        token is only meaningful for a dark page (it names the agent that
+        wrote it, and only that agent may read it).
 
-        The front-matter is read with the SHARED parser (not a regex), so
-        the rule here and the rule in the shelf cannot drift apart. A
-        malformed front-matter is NOT treated as sealed: it is the
-        inspector's violation to report, and failing closed here would
-        silently drop a file from the index.
+        P0-14 L-2: the rule is the ONE in ``agent.memory.visibility``. The
+        old local rule ("visibility: sealed OR status: released → not part
+        of the shared retrieval surface") treated every dark page as a
+        release, so a dark page was invisible even to the agent that wrote
+        it — directly against 06 §5.2 ("正文只对本视角与主人格开放").
+
+        A file whose front-matter cannot be parsed is treated as RELEASED:
+        we cannot read its visibility, and "cannot tell" must not mean
+        "serve it" (P0-13 L-3: fail closed).
         """
         if not content.startswith("---\n"):
-            return False
+            return VIS_OPEN, None
         try:
             from agent.memory.frontmatter import split_frontmatter
             fm, _body = split_frontmatter(content)
         except Exception:
-            return False
-        if not fm:
-            return False
-        return (fm.get("visibility") == "sealed"
-                or fm.get("status") == "released")
+            return VIS_RELEASED, None
+        return classify_frontmatter(fm), owner_token(fm)
 
     def _refresh_release_projection(self) -> None:
         """Re-stamp the release flags of the index from the truth layer.
@@ -196,32 +216,113 @@ class MemoryManager:
         actually moved (the refresh itself is a write).
 
         This is a PROJECTION refresh, not a repair: it only sets the two
-        release flags, and only on rows that already exist. It never
-        deletes, never rewrites content, and never touches the truth layer.
+        release flags (and re-owns the dark pages), and only on rows that
+        already exist. It never deletes, never rewrites content, and never
+        touches the truth layer.
+
+        P0-13 L-3 — FAIL CLOSED. When the truth layer cannot be resolved,
+        this RAISES instead of continuing with the stale marker. The old
+        behaviour (swallow the error, keep the stale flags, warn in the
+        log) meant that a refresh failure right after a release served the
+        released body again — a privacy control that breaks open, silently.
+        The failure is loud: an error log, an audit line, and a marker file
+        the inspector reports.
         """
         try:
-            state = self._release_state.get()
+            cache = getattr(self, "_release_state", None)
+            if cache is None:
+                # A manager built without a truth layer (a stub in a unit
+                # test): there is nothing that could be released, so there
+                # is nothing to judge. Not a fail-open hole — a real
+                # manager always has the cache.
+                return
+            state = cache.get()
         except Exception as e:
-            from common.log import logger
-            logger.warning(
-                "[MemoryManager] Cannot resolve the release state: %s", e)
-            return
+            self._report_projection_failure("resolve", e)
+            raise
+        # The state is known again — the retrieval is no longer degraded,
+        # so the marker goes away even when nothing had to be re-stamped.
+        self._clear_projection_failure()
         if state.signature == self._release_signature:
             return
         try:
             changed = self.storage.apply_release_projection(
-                set(state.released_paths), set(state.sealed_paths))
+                set(state.released_paths), set(state.sealed_paths),
+                dict(state.sealed_owner))
         except Exception as e:
-            from common.log import logger
-            logger.warning(
-                "[MemoryManager] Cannot apply the release projection: %s", e)
-            return
+            self._report_projection_failure("apply", e)
+            raise
         self._release_signature = state.signature
         if changed:
             from common.log import logger
             logger.info(
                 "[MemoryManager] Release projection refreshed: %d path(s) "
                 "re-flagged", changed)
+
+    # -- the fail-closed marker (P0-13 L-3) ---------------------------------
+
+    @property
+    def _projection_failure_marker(self) -> Path:
+        """Where the degraded-projection marker lives (audit layer)."""
+        return self.config.get_memory_dir() / ".audit" / "release_projection.json"
+
+    def _report_projection_failure(self, stage: str, error: Exception) -> None:
+        """Record a failed projection refresh — loudly, and where a巡检 finds it.
+
+        Three places, because "a log line nobody reads" is not a signal:
+        the error log, an audit file under ``memory/.audit/`` (excluded from
+        the index by policy), and a marker file the inspector turns into a
+        red report.
+        """
+        from common.log import logger
+        logger.error(
+            "[MemoryManager] Release projection %s FAILED: %s — the "
+            "retrieval exits fail closed until it succeeds", stage, error)
+        marker = None
+        try:
+            marker = self._projection_failure_marker
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(json.dumps({
+                "stage": stage,
+                "error": str(error),
+                "at": _utc8_now(),
+                "effect": "retrieval exits fail closed",
+            }, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8", newline="\n")
+        except Exception as e:      # the marker must never mask the failure
+            logger.error("[MemoryManager] Cannot write the projection "
+                         "failure marker: %s", e)
+
+    def _clear_projection_failure(self) -> None:
+        """Remove the degraded marker after a successful refresh."""
+        try:
+            self._projection_failure_marker.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    # -- the shared read decision (P0-13 L-1) --------------------------------
+
+    def release_state(self):
+        """The truth layer's release state — the authority for every read.
+
+        Read exits must not each re-derive "is this released / sealed" —
+        that is how ``memory_get`` came to hand out a released body in
+        full while every retrieval path filtered it (P0-13 L-1).
+        """
+        return self._release_state.get()
+
+    def read_decision(self, rel_path: str) -> Tuple[str, str]:
+        """``(decision, reason)`` for a read exit, under the ambient identity.
+
+        Raises when the truth layer cannot be resolved: an unknown release
+        state must fail the read, not serve the content (P0-13 L-3).
+        """
+        cache = getattr(self, "_release_state", None)
+        if cache is None:
+            return READ_ALLOW, ""
+        state = cache.get()
+        tokens = identity_tokens(None, ambient_identities())
+        return state.decide(rel_path, tokens)
 
     async def search(
         self,
@@ -261,12 +362,22 @@ class MemoryManager:
             except Exception:
                 pass
 
+        # P0-14 L-2: the caller's FULL token set. The end user and the
+        # agent are both identities the caller holds; the agent's token is
+        # the owner token a dark page is indexed under, so without it the
+        # agent could not read its own dark pages (06 §5.2).
+        identities = ambient_identities()
+        tokens = identity_tokens(user_id, identities)
+
         # Determine scopes
         scopes = []
         if include_shared:
             scopes.append("shared")
-        if user_id:
+        if tokens:
+            # 'user' rows belong to an end user; 'sealed' rows are dark
+            # pages, and only their owner's token can match them.
             scopes.append("user")
+            scopes.append(SCOPE_SEALED)
         
         if not scopes:
             return []
@@ -300,6 +411,7 @@ class MemoryManager:
                     query_embedding=query_embedding,
                     user_id=user_id,
                     scopes=scopes,
+                    identities=identities,
                     limit=max_results * 2  # Get more candidates for merging
                 )
                 logger.info(f"[MemoryManager] Vector search found {len(vector_results)} results for query: {query}")
@@ -313,6 +425,7 @@ class MemoryManager:
             query=query,
             user_id=user_id,
             scopes=scopes,
+            identities=identities,
             limit=max_results * 2
         )
         logger.info(f"[MemoryManager] Keyword search found {len(keyword_results)} results for query: {query}")
@@ -607,11 +720,11 @@ class MemoryManager:
                 logger.warning(f"[MemoryManager] Skipping {file_path}: cannot read it ({e})")
                 continue
             file_hash = MemoryStorage.compute_hash(content)
-            # P0-11 P-2 / G4-e: a file that seals ITSELF does not belong in
-            # the shared index at all. The release event carries the
-            # consent_ref and the release metadata in its body, and a
-            # release record is the owner's business — indexing it made
-            # every release's metadata anonymously readable (V2-Q-01).
+            # P0-11 P-2 / G4-e: a file that IS a release does not belong in
+            # the index at all. The release event carries the consent_ref
+            # and the release metadata in its body, and a release record is
+            # the owner's business — indexing it made every release's
+            # metadata anonymously readable (V2-Q-01).
             #
             # The check is on the FILE's own front-matter, so it is a
             # property of the disk, not of the index. A file that is
@@ -622,9 +735,18 @@ class MemoryManager:
             #
             # The path is removed from the scan set, so the reconcile drops
             # any rows an older build left for it.
-            if self._file_seals_itself(content):
+            #
+            # P0-14 L-2: a DARK PAGE (visibility: sealed, not a release) is
+            # NOT a release. It stays in the index under its own scope
+            # with its owner recorded, so the owner can read it and nobody
+            # else can (06 §5.2).
+            visibility, sealed_owner = self._file_visibility(content)
+            if visibility == VIS_RELEASED:
                 scanned.get(source, set()).discard(rel_path)
                 continue
+            if visibility == VIS_SEALED:
+                scope = SCOPE_SEALED
+                user_id = sealed_owner
             previous_hash = self.storage.get_file_hash(rel_path)
             if previous_hash == file_hash:
                 continue

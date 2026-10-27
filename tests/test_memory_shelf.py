@@ -317,38 +317,54 @@ def test_sh6_reverse_tombstone_without_consent_is_detected(ws, cow):
 
 
 # -- SH-7 · 可见性过滤 -------------------------------------------------------
+#
+# P0-14 L-2 改了这条规则：``visibility: sealed``（暗页）**不是**释放。
+# 06 §5.3 说主人格视角 = 白页 + 暗页，所以本视角自己的暗页必须出现在
+# 书架上（带 🔒 标记）；释放件永不进；draft 不进。
 
-def test_sh7_only_active_and_open_events_are_listed(ws, cow):
-    """SH-7: 只有 status=active 且 visibility=open 的事件进「我记得的」。"""
+def _set_visibility(path, value):
+    text = path.read_text(encoding="utf-8")
+    path.write_text(text.replace("visibility: open", f"visibility: {value}"),
+                    encoding="utf-8", newline="\n")
+
+
+def test_sh7_the_owners_shelf_lists_open_and_dark_pages(ws, cow):
+    """SH-7（P0-14 口径）：白页与**本视角的暗页**都进「我记得的」，
+    暗页带 🔒 标记；draft 不进。"""
     f = facade_for(ws, cow)
     f.write_event("open-evt", "可见", "b", date="2026-10-27")
-    sealed = f.write_event("sealed-evt", "不可见", "b", date="2026-10-27")
-    # 手工把 sealed 事件改成 visibility: sealed（facade 不允许改 fm）
-    text = sealed.read_text(encoding="utf-8")
-    sealed.write_text(text.replace("visibility: open", "visibility: sealed"),
-                      encoding="utf-8", newline="\n")
+    sealed = f.write_event("sealed-evt", "暗页", "b", date="2026-10-27")
+    _set_visibility(sealed, "sealed")
+    draft = f.write_event("draft-evt", "草稿", "b", date="2026-10-27")
+    _set_visibility(draft, "draft")
     rebuild(ws)
     text = read(ws, "index.md")
     section = text.split("## 我记得的")[1].split("##")[0]
     assert "可见" in section
-    assert "不可见" not in section
+    assert "暗页" in section, "本视角自己的暗页必须出现在书架上（06 §5.3）"
+    assert "🔒" in section, "暗页必须带锁定标记"
+    assert "草稿" not in section
 
 
-def test_sh7_reverse_a_leaked_sealed_event_is_detected(ws, cow):
-    """反向用例：把 sealed 事件塞进「我记得的」→ 判定必须失败。"""
+def test_sh7_reverse_another_viewpoints_dark_page_never_leaks(ws, cow):
+    """反向用例：别的视角的暗页 + 释放件 → 判定必须失败。
+
+    借阅台（跨视角读取）还没实现，所以别人的暗页在本书架上必须完全不
+    出现；释放件在任何视角下都不出现。
+    """
+    other = WriteFacade(ws, actor="other-view", cow_root=cow,
+                        channel=RecordingConfirmationChannel())
+    sealed = other.write_event("sealed-evt", "别人的暗页", "b",
+                               date="2026-10-27")
+    _set_visibility(sealed, "sealed")
     f = facade_for(ws, cow)
-    sealed = f.write_event("sealed-evt", "不可见", "b", date="2026-10-27")
-    text = sealed.read_text(encoding="utf-8")
-    sealed.write_text(text.replace("visibility: open", "visibility: sealed"),
-                      encoding="utf-8", newline="\n")
+    rel = f.write_event("open-evt", "可见", "b", date="2026-10-27")
+    ref = f.channel.register_consent(ACTOR, "open-evt")
+    f.initiate_release(rel.relative_to(ws).as_posix(), consent_ref=ref)
     rebuild(ws)
     index = read(ws, "index.md")
-    leaked = []
-    for p in (ws / "memory" / "markdown" / "events").rglob("*.md"):
-        fm, _ = split_frontmatter(p.read_text(encoding="utf-8"))
-        if fm.get("visibility") != "open" and fm.get("title") in index:
-            leaked.append(fm.get("title"))
-    assert leaked == []
+    assert "别人的暗页" not in index, "别的视角的暗页泄漏进了本书架"
+    assert "可见" not in index, "已释放的条目出现在了书架上"
 
 
 # -- SH-8/9/10 · 三种聚合完整性 ---------------------------------------------

@@ -6,28 +6,28 @@ what "released" meant at retrieval time: the storage layer only had
 scope + user_id, the tool layer had no filter at all, and ``chunks.metadata``
 was always None.
 
-The rules this module implements (SEED 裁决 2026-10-27):
+The rules this module implements (SEED 裁决 2026-10-27, P0-14 L-2/L-3):
 
   * The TRUTH layer keeps the content — release is not deletion (遗忘伦理).
     The PROJECTION layer must hide it.
   * The authority is the DISK: ``memory/markdown/_tombstones/*.tombstone.md``
     plus the front-matter of the released file's new version
-    (``status=released`` / ``visibility=sealed``). Whatever the index says
-    is only a projection, and it has to be correct again after a rebuild.
-  * Two DISTINCT exclusions, because they are two different facts:
-      1. the ELEMENT is released → the whole element leaves the result set,
-         including the version whose own front-matter still says ``active``
-         (WR-11 keeps the old bytes untouched, so the old file cannot know
-         by itself that it was released);
-      2. the FILE seals itself → ``visibility=sealed`` / ``status=released``
-         (the release event, the released version).
+    (``status=released`` / ``type=release``). Whatever the index says is
+    only a projection, and it has to be correct again after a rebuild.
+  * TWO DISTINCT exclusions, because they are two different facts:
+      1. the ELEMENT is released → the whole element leaves every read
+         exit, for every identity, including the owner's;
+      2. the FILE is a DARK PAGE (``visibility: sealed`` and NOT a
+         release) → it stays in the index under its own scope, and only
+         its owner may read it.
+  * A file whose front-matter cannot be read at all is treated as
+    RELEASED (hidden). We cannot know whether it was released, and
+    "cannot tell" must not mean "serve it" (P0-13 L-3: fail closed).
 
-Why the element case needs the supersedes chain: releasing element E
-produces ``E-v2`` with ``supersedes: [E-v1]`` and a tombstone naming
-``E-v1``. A later revision of ``E-v2`` carries the same body and does NOT
-carry ``status=released`` — the facade creates revisions with the default
-status. So released-ness has to travel along the chain, otherwise a revised
-released element walks straight back into the index.
+P0-13 L-3: this module FAILS LOUDLY. A truth-layer file that cannot be read
+raises — the caller (the manager) then fails the retrieval instead of
+falling back to a stale projection. A privacy control that breaks open is
+worse than one that breaks shut.
 
 Everything here is read-only. It reads files; it never writes, and it never
 edits the index (that is the manager's job, and the inspector's is only to
@@ -37,15 +37,34 @@ report).
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, FrozenSet, List, Set, Tuple
+from typing import Dict, FrozenSet, List, Mapping, Optional, Set, Tuple
 
 from agent.memory.frontmatter import split_frontmatter
+from agent.memory.visibility import (
+    READ_ALLOW,
+    READ_RELEASED,
+    READ_SEALED,
+    VIS_OPEN,
+    VIS_RELEASED,
+    VIS_SEALED,
+    classify_frontmatter,
+    owner_token,
+)
 
 # The truth layer's markdown root, relative to the memory root.
 _MARKDOWN_DIR = "markdown"
 _TOMBSTONE_DIR = "_tombstones"
+
+
+class ReleaseStateError(RuntimeError):
+    """The truth layer could not be resolved.
+
+    Raised instead of a silent "nothing is released" — the caller decides
+    what to do, and the only safe thing to do with an unknown release
+    state is to serve nothing.
+    """
 
 
 @dataclass(frozen=True)
@@ -53,7 +72,10 @@ class ReleaseState:
     """Which index paths must not be returned by the regular retrieval exit.
 
     ``released_paths`` — the element behind this path was released.
-    ``sealed_paths``  — this path seals itself (front-matter).
+                    Invisible to EVERY identity, on every read exit.
+    ``sealed_paths``  — this path is a DARK PAGE (暗页). It stays in the
+                    index; only the owner may read it.
+    ``sealed_owner``  — path → owner token for the dark pages.
 
     Both sets hold INDEX KEYS: workspace-relative POSIX paths, exactly the
     strings ``chunks.path`` carries.
@@ -61,7 +83,15 @@ class ReleaseState:
 
     released_paths: FrozenSet[str] = frozenset()
     sealed_paths: FrozenSet[str] = frozenset()
+    sealed_owner: Mapping[str, str] = field(default_factory=dict)
     signature: Tuple = ()
+
+    def __hash__(self) -> int:
+        # The owner map is a dict (unhashable), so the hash is taken over
+        # the sets only — the state is used as a cache value, never as a
+        # dict key, but a frozen dataclass must still be hashable to be
+        # usable in one.
+        return hash((self.released_paths, self.sealed_paths, self.signature))
 
     def element_released(self, path: str) -> bool:
         return path in self.released_paths
@@ -69,10 +99,28 @@ class ReleaseState:
     def file_sealed(self, path: str) -> bool:
         return path in self.sealed_paths
 
+    def owner_for(self, path: str) -> Optional[str]:
+        return (self.sealed_owner or {}).get(path)
+
     def flags_for(self, path: str) -> Tuple[int, int]:
         """``(element_released, file_sealed)`` as 0/1 for the chunk columns."""
         return (1 if self.element_released(path) else 0,
                 1 if self.file_sealed(path) else 0)
+
+    def decide(self, path: str, tokens) -> Tuple[str, str]:
+        """``(decision, reason)`` for a read exit — one derivation, no drift.
+
+        ``READ_ALLOW`` / ``READ_RELEASED`` / ``READ_SEALED``.
+        """
+        from agent.memory.visibility import decide_read
+
+        return decide_read(
+            path,
+            released_paths=self.released_paths,
+            sealed_paths=self.sealed_paths,
+            sealed_owner=self.sealed_owner,
+            tokens=tokens,
+        )
 
 
 def _norm_key(path: str) -> str:
@@ -151,6 +199,10 @@ def resolve(workspace_root: Path | str) -> ReleaseState:
 
     Paths are returned as workspace-relative POSIX keys — the same strings
     ``chunks.path`` carries, so the caller can filter the index directly.
+
+    Fail-closed (P0-13 L-3): a truth-layer file that cannot be READ
+    raises. The caller must fail the retrieval rather than serve content
+    under a stale "nothing is released" marker.
     """
     workspace = Path(workspace_root)
     memory_root = _memory_root(workspace)
@@ -159,19 +211,29 @@ def resolve(workspace_root: Path | str) -> ReleaseState:
     supersedes_of: Dict[str, List[str]] = {}
     directly_released: Set[str] = set()
     sealed: Set[str] = set()
+    sealed_owner: Dict[str, str] = {}
     status_released: Set[str] = set()
 
     for p in _iter_markdown(memory_root):
         key = _norm_key(p.relative_to(workspace).as_posix())
+        # A file we cannot read is a file whose visibility we cannot know.
+        # Treating it as released is the only safe reading (fail closed).
         try:
             text = p.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
+        except (OSError, UnicodeDecodeError) as e:
+            raise ReleaseStateError(
+                f"cannot read the truth-layer file {key!r}: {e}") from e
         try:
             fm, _body = split_frontmatter(text)
         except Exception:
-            continue  # malformed YAML: the inspector reports it, we skip it
+            # Malformed YAML: we cannot read its visibility either, so it
+            # is treated as released (hidden) — the inspector reports the
+            # malformed front-matter separately.
+            fm = None
         if not fm:
+            if text.startswith("---\n"):
+                # The file CLAIMS to have front-matter we cannot parse.
+                status_released.add(key)
             continue
         eid = str(fm.get("id") or "")
         if eid:
@@ -179,11 +241,16 @@ def resolve(workspace_root: Path | str) -> ReleaseState:
             sups = fm.get("supersedes")
             if isinstance(sups, list):
                 supersedes_of[eid] = [str(s) for s in sups if s]
-        if fm.get("status") == "released" or fm.get("released") is True:
-            directly_released.add(eid)
+        kind = classify_frontmatter(fm)
+        if kind == VIS_RELEASED:
+            if eid:
+                directly_released.add(eid)
             status_released.add(key)
-        if fm.get("visibility") == "sealed":
+        elif kind == VIS_SEALED:
             sealed.add(key)
+            owner = owner_token(fm)
+            if owner:
+                sealed_owner[key] = owner
 
     # The tombstone names the ORIGINAL path of the released element. That
     # file's own front-matter still says active (WR-11), so this is one of
@@ -192,11 +259,14 @@ def resolve(workspace_root: Path | str) -> ReleaseState:
     for p in _iter_tombstones(memory_root):
         try:
             text = p.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
+        except (OSError, UnicodeDecodeError) as e:
+            raise ReleaseStateError(
+                f"cannot read the tombstone {p.name!r}: {e}") from e
         try:
             fm, _body = split_frontmatter(text)
         except Exception:
+            continue
+        if not fm:
             continue
         original = str(fm.get("original_path") or "")
         if not original:
@@ -231,16 +301,28 @@ def resolve(workspace_root: Path | str) -> ReleaseState:
         if key:
             released_paths.add(key)
 
-    # A released file seals itself too: the rule says a file whose
-    # front-matter says status=released OR visibility=sealed leaves the
-    # result set.
-    sealed_paths = set(sealed) | set(status_released)
+    # A released file is never a dark page: the release wins. (P0-13 L-2:
+    # treating every sealed file as a release is what hid dark pages from
+    # their own owner.)
+    sealed_paths = {p for p in sealed if p not in released_paths}
+    sealed_owner = {k: v for k, v in sealed_owner.items()
+                    if k in sealed_paths}
 
     return ReleaseState(
         released_paths=frozenset(released_paths),
         sealed_paths=frozenset(sealed_paths),
+        sealed_owner=sealed_owner,
         signature=tree_signature(workspace),
     )
+
+
+class ReleaseStateError(RuntimeError):
+    """The truth layer could not be resolved.
+
+    Raised instead of a silent "nothing is released" — the caller decides
+    what to do, and the only safe thing to do with an unknown release
+    state is to serve nothing.
+    """
 
 
 class ReleaseStateCache:
@@ -265,6 +347,7 @@ class ReleaseStateCache:
             self._state = ReleaseState(
                 released_paths=state.released_paths,
                 sealed_paths=state.sealed_paths,
+                sealed_owner=state.sealed_owner,
                 signature=signature,
             )
         return self._state

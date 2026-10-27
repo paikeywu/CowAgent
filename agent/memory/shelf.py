@@ -41,6 +41,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from agent.memory.facade import split_frontmatter  # noqa: E402
 from agent.memory.facts_refs import build_facts_index  # noqa: E402
 from agent.memory.inspector import Inspector  # noqa: E402
+from agent.memory.visibility import (  # noqa: E402
+    VIS_RELEASED,
+    VIS_SEALED,
+    agent_owner_token,
+    classify_frontmatter,
+    owner_token,
+)
 
 _CST = timezone(timedelta(hours=8))
 GENERATOR_ID = "shelf_generator/1.0"
@@ -109,6 +116,8 @@ class ShelfGenerator:
         # re-reading every facts file for every event turned a full rebuild
         # into O(events x facts) file reads.
         self._facts_index = None
+        # The released paths (from the truth layer), filled by rebuild().
+        self._released: set = set()
 
     def _facts(self):
         """The workspace's facts index, built once per rebuild."""
@@ -116,12 +125,74 @@ class ShelfGenerator:
             self._facts_index = build_facts_index(self.workspace_root)
         return self._facts_index
 
+    def _owns(self, fm: Dict[str, Any]) -> bool:
+        """True when THIS viewpoint owns the page.
+
+        A dark page belongs to the agent that wrote it
+        (``author_viewpoint``). The shelf is built for one viewpoint, so the
+        owner's dark pages are this shelf's pages; another viewpoint's dark
+        pages are not — the cross-view 借阅台 is not implemented yet, and a
+        shelf that showed them would be a leak with a door in it.
+        """
+        owner = owner_token(fm)
+        if not owner:
+            return False
+        return owner in {agent_owner_token(self.agent_id),
+                         agent_owner_token(self.workspace_root.name)}
+
+    def _state_key(self, path: Path) -> str:
+        """The truth-layer key of a file — the way the state speaks it.
+
+        The release state is keyed by workspace-relative POSIX paths (the
+        same strings ``chunks.path`` carries); the shelf's own ``rel`` is
+        memory-relative (its links are ``../markdown/...``). The two are
+        not the same string, and mistaking one for the other is how a
+        released original stays on the shelf.
+        """
+        try:
+            return path.relative_to(self.workspace_root).as_posix()
+        except ValueError:
+            return path.as_posix()
+
+    def _resolve_released_paths(self) -> set:
+        """The paths the truth layer says are released.
+
+        Read from the DISK (the authority), not from the index and not
+        from a file's own front-matter: a released element keeps its old
+        bytes (WR-11), so the original version still says
+        ``status: active`` and only the tombstone knows the truth.
+
+        P0-13 L-3: when the truth layer cannot be resolved, the rebuild
+        FAILS rather than rendering a shelf from an unknown state.
+        """
+        from agent.memory.release_state import ReleaseStateCache
+
+        try:
+            state = ReleaseStateCache(self.workspace_root).get()
+        except Exception as e:
+            raise RuntimeError(
+                f"[shelf] the release state could not be resolved ({e}); "
+                f"refusing to rebuild the shelf from an unknown state "
+                f"(fail closed).") from e
+        return set(state.released_paths)
+
+    @staticmethod
+    def _title(ev: Dict[str, Any]) -> str:
+        """The title cell — a dark page carries the 🔒 marker (06 §5.2)."""
+        title = _esc(ev.get("title") or "")
+        return f"🔒 {title}" if ev.get("sealed") else title
+
     # -- public entry --------------------------------------------------------
 
     def rebuild(self) -> Dict[str, Any]:
         """Full rebuild. Runs the inspector first (trigger point 1 of 3)."""
         self._inspection = Inspector(self.workspace_root).inspect(
             trigger="shelf-rebuild")
+        # P0-14 L-2: the release state decides what may be shown, and the
+        # file's own front-matter is NOT enough: a released element keeps
+        # its old bytes (WR-11), so the original version still says
+        # ``status: active`` — only the tombstone knows it was released.
+        self._released = self._resolve_released_paths()
         events, skipped_events = self._collect_markdown("events")
         letters, skipped_letters = self._collect_markdown("letters")
         entities, skipped_entities = self._collect_entities()
@@ -200,9 +271,34 @@ class ShelfGenerator:
             if missing:
                 skipped.append(self._skip_entry(p, rel, INVALID_FM, missing))
                 continue
-            if fm.get("status") != "active" or fm.get("visibility") != "open":
-                # SH-7 filter: legitimately invisible (draft/sealed/released),
-                # NOT a defect — not reported as skipped.
+            # P0-14 L-2: the visibility rule is the ONE in
+            # agent.memory.visibility, and it separates two things the old
+            # filter merged:
+            #
+            #   * a RELEASE (status=released / type=release) never
+            #     contributes content to any view — the tombstone is the
+            #     only source for 你释放的 (SH-5 / Q3);
+            #   * a DARK PAGE (visibility=sealed) is not a release. The
+            #     owner's own shelf shows it, marked 🔒 (06 §5.3: the
+            #     master's view is 白页 + 暗页); a dark page belonging to
+            #     another viewpoint is not this shelf's page — the
+            #     cross-view view (借阅台) is not implemented yet.
+            kind = classify_frontmatter(fm)
+            sealed = False
+            if kind == VIS_RELEASED:
+                continue
+            if rel in self._released or self._state_key(p) in self._released:
+                # The ORIGINAL version of a released element: its bytes are
+                # untouched (WR-11), so its own front-matter still says
+                # active. Only the tombstone knows — and the tombstone wins.
+                continue
+            if kind == VIS_SEALED:
+                if not self._owns(fm):
+                    continue
+                sealed = True
+            elif fm.get("status") != "active" or fm.get("visibility") != "open":
+                # SH-7 filter: legitimately invisible (draft), NOT a
+                # defect — not reported as skipped.
                 continue
             # P0-11 门禁④ (呈现侧): the event's ``refs`` are resolved against
             # the evidence room, so a 感受 can be drilled down to its 原话
@@ -217,6 +313,7 @@ class ShelfGenerator:
                 "rel_truth": rel,                       # from memory/
                 "link": self._rel_link(p),              # from shelf/<view>
                 "title": str(fm.get("title", fm.get("slug", p.stem))),
+                "sealed": sealed,                       # 暗页: own view only
                 "type": str(fm.get("type", "conversation")),
                 "occurred_at": str(fm.get("occurred_at", "")),
                 "date": str(fm.get("occurred_at", ""))[:10],
@@ -654,7 +751,7 @@ class ShelfGenerator:
             facts_cell = self._facts_cell(ev.get("facts_links") or [])
             rows.append(
                 f"| {ev['date']} | {_esc(ev['type'])} | "
-                f"[{_esc(ev['title'])}]({ev['link']}) | "
+                f"[{self._title(ev)}]({ev['link']}) | "
                 f"{facts_cell} | [→]({ev['link']}) |")
         remembered = ("| 日期 | 类型 | 标题 | 感受 | 下钻 |\n"
                       "|:--|:--|:--|:--|:--|\n"
@@ -724,7 +821,7 @@ class ShelfGenerator:
 
         def ev_rows(items):
             return ("\n".join(
-                f"| {e['date']} | {_esc(e['title'])} | {_esc(e['type'])} |"
+                f"| {e['date']} | {self._title(e)} | {_esc(e['type'])} |"
                 for e in items)) if items else "（暂无）"
 
         def gap_rows(items):
@@ -830,7 +927,7 @@ class ShelfGenerator:
                     self.shelf_root / "by-day")
                 rows.append(
                     f"| {ev['time']} | {_esc(ev['type'])} | "
-                    f"[{_esc(ev['title'])}]({link}) | [→]({link}) |")
+                    f"[{self._title(ev)}]({link}) | [→]({link}) |")
             day_gaps = gaps_by_date.get(date, [])
             grows = [f"| {g['date']} | `{_esc(g['reason'])}` | "
                      f"{self._gap_cell(g)} |" for g in day_gaps]
@@ -870,7 +967,7 @@ class ShelfGenerator:
                     self.shelf_root / "by-entity")
                 rows.append(
                     f"| {ev['date']} | {_esc(ev['type'])} | "
-                    f"[{_esc(ev['title'])}]({link}) | [→]({link}) |")
+                    f"[{self._title(ev)}]({link}) | [→]({link}) |")
             profile_note = ""
             if slug in entities:
                 plink = self._posix_relpath(
@@ -908,7 +1005,7 @@ class ShelfGenerator:
                     self.shelf_root / "by-tag")
                 rows.append(
                     f"| {ev['date']} | {_esc(ev['type'])} | "
-                    f"[{_esc(ev['title'])}]({link}) | [→]({link}) |")
+                    f"[{self._title(ev)}]({link}) | [→]({link}) |")
             body = f"""# #{tag} · {self.agent_id}
 
 > 带标签 #{tag} 的全部事件（按 occurred_at 倒序）。

@@ -134,10 +134,17 @@ class MemoryService:
         :param category: ``"memory"``, ``"dream"`` or ``"evolution"``
         :return: dict with ``filename``, ``rel_path`` and ``content``
         :raises FileNotFoundError: if the file does not exist
+        :raises PermissionError: if the file is released or sealed away
         """
         path = self._resolve_path(filename, category)
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Memory file not found: {filename}")
+
+        # P0-13 L-1: this is a READ EXIT too (the web console reads the
+        # truth layer through it), so it asks the SAME judgement as
+        # memory_get and the retrieval predicate. It used to serve any file
+        # under memory/ verbatim.
+        self._assert_readable(path)
 
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
@@ -150,6 +157,44 @@ class MemoryService:
             "rel_path": self._to_rel(path),
             "content": content,
         }
+
+    def _assert_readable(self, path: str) -> None:
+        """Raise when the truth layer says this file must not be served.
+
+        Only the truth layer (``memory/markdown/``) carries released and
+        sealed elements; the daily files and MEMORY.md are the agent's own
+        working memory and are not part of this rule.
+
+        P0-13 L-3: when the release state cannot be resolved, the read
+        FAILS — an unknown state must not serve content.
+        """
+        rel = self._to_rel(path)
+        if not rel.startswith("memory/markdown/"):
+            return
+        from agent.memory.release_state import resolve
+        from agent.memory.visibility import (
+            READ_ALLOW,
+            ambient_identities,
+            identity_tokens,
+        )
+
+        try:
+            state = resolve(self.workspace_root)
+        except Exception as e:
+            raise PermissionError(
+                f"the release state could not be resolved ({e}); refusing to "
+                f"serve the file (fail closed).") from e
+        tokens = identity_tokens(None, ambient_identities())
+        decision, _reason = state.decide(rel, tokens)
+        if decision == READ_ALLOW:
+            return
+        if decision == "released":
+            raise PermissionError(
+                "[released] This memory was released; the released body is "
+                "not served on any read exit, to anyone.")
+        raise PermissionError(
+            "[sealed] This is a dark page; its body is open to the owning "
+            "viewpoint and the master only.")
 
     # ------------------------------------------------------------------
     # dispatch — single entry point for protocol messages
