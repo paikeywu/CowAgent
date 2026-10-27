@@ -160,6 +160,60 @@ def backfill_sealed_owner(db_path: Union[str, Path]) -> int:
         conn.close()
 
 
+def install_guard_on(db_path: Union[str, Path]) -> bool:
+    """Install the write-side guard (P0-21) on one index. True when done.
+
+    The guard lives in the index file itself, so it protects the index no
+    matter which build opens it — including the old desktop build that is
+    still running against the same file and knows nothing about
+    ``visibility: sealed``.
+
+    Idempotent, and safe on a database that predates the projection
+    columns: the guard adds them when they are missing, because a trigger
+    that names a column the database does not have cannot be installed at
+    all, and a guard that cannot be installed is a guard that does not
+    exist.
+    """
+    from agent.memory.index_guard import install_guard
+
+    path = Path(db_path)
+    if not path.is_file():
+        return False
+    try:
+        conn = sqlite3.connect(str(path))
+    except sqlite3.Error:
+        return False
+    try:
+        return bool(install_guard(conn))
+    except Exception:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        return False
+    finally:
+        conn.close()
+
+
+def install_guard_all(roots: Optional[List[str]] = None,
+                      extra: Optional[Union[str, Path]] = None
+                      ) -> Dict[str, bool]:
+    """Install the guard on every workspace's index.
+
+    Returns ``{workspace root: installed}`` for the workspaces that
+    actually have an index file.
+    """
+    if roots is None:
+        roots = workspace_roots(extra)
+    out: Dict[str, bool] = {}
+    for root in roots:
+        db = index_path(root)
+        if not db.is_file():
+            continue
+        out[str(root)] = install_guard_on(db)
+    return out
+
+
 def migrate_all(roots: Optional[List[str]] = None,
                 extra: Optional[Union[str, Path]] = None
                 ) -> Tuple[Dict[str, List[str]], Dict[str, str]]:
@@ -204,6 +258,11 @@ def migrate_all(roots: Optional[List[str]] = None,
             continue
         migrated[str(root)] = added
     backfill_all(roots=roots)
+    # P0-21: the guard is installed on EVERY index, not only on the ones
+    # whose schema was behind. The old desktop build writes to the same
+    # files, so an index without the guard is an index it can turn a dark
+    # page into a public row.
+    install_guard_all(roots=roots)
     return migrated, failed
 
 

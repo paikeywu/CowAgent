@@ -743,3 +743,316 @@ def test_l2_reverse_a_real_open_page_is_not_mistaken_for_a_dark_page():
                 f"白页带上了归属令牌: {row['sealed_owner']!r}")
     finally:
         close_manager(mgr)
+
+
+# ---------------------------------------------------------------------------
+# P0-21 · 写侧守卫：暗页不能被写成公开行 —— 哪怕写它的是不认识 visibility 的旧版
+# ---------------------------------------------------------------------------
+#
+# 实测（P0-21）：2026-10-13 打包的桌面版**还在跑**，而且和源码版**共用同一个
+# index.db**。它的 sync 不认识 `visibility: sealed`，把 memory/ 下的每个 md
+# 都写成 `scope='shared'` + `user_id=NULL` —— 正是匿名可读的形状。
+# 在隔离工作区用旧版代码实测：它自己的匿名检索返回了暗页的 front-matter 和正文。
+#
+# 旧版是已打包的 exe，改不了它。所以不变量只能在**数据库的写入边界**上强制：
+# 一个触发器，谁写都得过。守卫只会让行**更不可见**，从不放宽访问。
+
+GUARD_DARK_TEXT = (
+    "---\n"
+    "element_id: guard-dark--00000000\n"
+    "type: event\n"
+    "status: active\n"
+    "visibility: sealed\n"
+    "author_viewpoint: tester\n"
+    "---\n\n"
+    "# 暗页\n\n正文标记 ZZGUARDDARK9911。\n"
+)
+GUARD_OPEN_TEXT = (
+    "---\n"
+    "element_id: guard-open--00000000\n"
+    "type: event\n"
+    "status: active\n"
+    "visibility: open\n"
+    "---\n\n"
+    "# 白页\n\n正文标记 ZZGUARDOPEN9911。\n"
+)
+GUARD_DARK_PATH = "memory/markdown/events/2026-10-27/guard-dark--00000000.md"
+GUARD_OPEN_PATH = "memory/markdown/events/2026-10-27/guard-open--00000000.md"
+
+
+def _guard_storage(ws):
+    """A storage whose index directory exists.
+
+    The ``ws`` fixture creates the truth-layer directories but not the
+    index directory, and SQLite refuses to create a database in a
+    directory that is not there.
+    """
+    db = ws / "memory" / "long-term" / "index.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    return MemoryStorage(db_path=str(db))
+
+
+def _old_build_insert(storage, path, text, chunk_id="old-c1"):
+    """Exactly what the 2026-10-13 desktop build does.
+
+    It names no visibility at all and puts the row in the shared scope —
+    the shape an anonymous caller reads. It writes through raw SQL, so
+    nothing in this build's own write path can stand in its way.
+    """
+    storage.conn.execute("DELETE FROM chunks WHERE id = ?", (chunk_id,))
+    storage.conn.execute(
+        "INSERT INTO chunks (id,user_id,scope,source,path,start_line,end_line,"
+        "text,embedding,hash,metadata,updated_at) "
+        "VALUES (?,NULL,'shared','memory',?,1,1,?,NULL,'h',NULL,strftime('%s','now'))",
+        (chunk_id, path, text))
+    storage.conn.commit()
+
+
+def _row_for(storage, path):
+    return storage.conn.execute(
+        "SELECT scope, user_id, file_sealed, element_released, sealed_owner "
+        "FROM chunks WHERE path = ?", (path,)).fetchone()
+
+
+def test_p021_the_guard_seals_a_dark_page_written_by_the_old_build(ws):
+    """P0-21：旧版写的暗页不能是公开行。
+
+    这条是本轮的核心：旧版的 sync 会把暗页写成 ``scope='shared'`` +
+    ``user_id=NULL``，而那正是匿名可读的形状。守卫把它挡住。
+    """
+    st = _guard_storage(ws)
+    try:
+        _old_build_insert(st, GUARD_DARK_PATH, GUARD_DARK_TEXT)
+        row = _row_for(st, GUARD_DARK_PATH)
+        assert row is not None, "旧版写入的行不见了 —— 测法有问题"
+        assert row["scope"] != "shared", (
+            f"暗页被写成了公开行: scope={row['scope']!r} —— 这就是泄漏")
+        assert row["scope"] == SCOPE_SEALED, (
+            f"暗页没有落到自己的 scope: {row['scope']!r}")
+        assert row["user_id"] is None, (
+            f"暗页的端用户轴不该有值: {row['user_id']!r}")
+        assert row["file_sealed"], "暗页没有打上 sealed 标志"
+
+        # 匿名检索读不到它 —— 这才是判据
+        hits_anon = st.search_keyword(query="ZZGUARDDARK9911", user_id=None,
+                                      scopes=["shared"], limit=20)
+        assert not any("ZZGUARDDARK9911" in (h.snippet or "") for h in hits_anon), (
+            "匿名检索拿到了暗页正文 —— 泄漏")
+    finally:
+        st.close()
+
+
+def test_p021_reverse_the_guard_leaves_an_open_page_public(ws):
+    """P0-21 反向用例：白页不得被守卫误伤。
+
+    没有这条，上一条可能只是「全都变暗了」—— 一个把整库封死的守卫同样
+    能让上一条变绿，而那不是修复。
+    """
+    st = _guard_storage(ws)
+    try:
+        _old_build_insert(st, GUARD_OPEN_PATH, GUARD_OPEN_TEXT,
+                          chunk_id="old-c2")
+        row = _row_for(st, GUARD_OPEN_PATH)
+        assert row["scope"] == "shared", (
+            f"白页被守卫封了: scope={row['scope']!r} —— 守卫把整库变暗页了")
+        assert not row["file_sealed"], "白页被打上了 sealed 标志"
+        hits_anon = st.search_keyword(query="ZZGUARDOPEN9911", user_id=None,
+                                      scopes=["shared"], limit=20)
+        assert any("ZZGUARDOPEN9911" in (h.snippet or "") for h in hits_anon), (
+            "白页对匿名不可见 —— 守卫把正常内容也吃了")
+    finally:
+        st.close()
+
+
+def test_p021_the_guard_keeps_the_owner_the_truth_layer_recorded(ws):
+    """P0-21：真源层登记了归属，守卫就要把它带上。
+
+    守卫的 front-matter 兜底**故意不猜**归属（猜错就是隐私事故），所以
+    没有真源层登记时暗页对谁都不可见 —— 安全但不可用。真源层登记之后，
+    归属必须回到行上，否则主人格永远看不见自己的暗页。
+    """
+    from agent.memory.index_guard import CLASS_SEALED, record_paths
+
+    st = _guard_storage(ws)
+    try:
+        record_paths(st.conn, [(GUARD_DARK_PATH, CLASS_SEALED,
+                                "agent--tester")])
+        _old_build_insert(st, GUARD_DARK_PATH, GUARD_DARK_TEXT,
+                          chunk_id="old-c3")
+        row = _row_for(st, GUARD_DARK_PATH)
+        assert row["sealed_owner"] == "agent--tester", (
+            f"暗页丢了归属: {row['sealed_owner']!r} —— 主人格看不见自己的暗页")
+        assert row["scope"] == SCOPE_SEALED
+    finally:
+        st.close()
+
+
+def test_p021_the_guard_covers_a_chunk_without_frontmatter(ws):
+    """P0-21：一个文件切成多块时，只有第一块带 front-matter。
+
+    旧版把第一块封住之后，剩下几块如果没有登记就会落回公开形状 ——
+    而它们和第一块是同一个文件。
+    """
+    from agent.memory.index_guard import CLASS_SEALED, record_paths
+
+    st = _guard_storage(ws)
+    try:
+        record_paths(st.conn, [(GUARD_DARK_PATH, CLASS_SEALED, None)])
+        _old_build_insert(st, GUARD_DARK_PATH,
+                          "# 第二块，没有 front-matter\n\nZZGUARDDARK9911 还在。\n",
+                          chunk_id="old-c4")
+        row = _row_for(st, GUARD_DARK_PATH)
+        assert row["scope"] != "shared", (
+            f"没有 front-matter 的块落成了公开行: {row['scope']!r}")
+        hits_anon = st.search_keyword(query="ZZGUARDDARK9911", user_id=None,
+                                      scopes=["shared"], limit=20)
+        assert not any("ZZGUARDDARK9911" in (h.snippet or "") for h in hits_anon)
+    finally:
+        st.close()
+
+
+def test_p021_the_guard_covers_the_excluded_layers(ws):
+    """P0-21：排除层（书架/事实层/墓碑）同样不能被写成公开行。
+
+    书架里是「我记得的 / 我没记住的 / 你释放的」—— 索引它等于把记忆的
+    目录公开。实测旧版会把 57 个书架文件全部索引成 shared。
+    """
+    st = _guard_storage(ws)
+    try:
+        _old_build_insert(st, "memory/shelf/index.md",
+                          "# 书架\n\nZZGUARDOPEN9911\n", chunk_id="old-c5")
+        row = _row_for(st, "memory/shelf/index.md")
+        assert row is not None
+        assert row["scope"] != "shared", (
+            f"排除层被写成了公开行: {row['scope']!r}")
+        hits_anon = st.search_keyword(query="ZZGUARDOPEN9911", user_id=None,
+                                      scopes=["shared"], limit=20)
+        assert not any("ZZGUARDOPEN9911" in (h.snippet or "") for h in hits_anon)
+    finally:
+        st.close()
+
+
+def test_p021_the_guard_survives_the_upsert_path(ws):
+    """P0-21：旧版的 save_chunk 走 UPSERT（ON CONFLICT DO UPDATE）。
+
+    只测 INSERT 是不够的：UPSERT 走的是 UPDATE 分支，守卫必须也在那里。
+    """
+    st = _guard_storage(ws)
+    try:
+        st.conn.execute(
+            "INSERT INTO chunks (id,user_id,scope,source,path,start_line,end_line,"
+            "text,embedding,hash,metadata,updated_at) "
+            "VALUES ('old-c6',NULL,'shared','memory',?,1,1,?,NULL,'h',NULL,"
+            "strftime('%s','now')) ON CONFLICT(id) DO UPDATE SET "
+            "scope=excluded.scope, text=excluded.text",
+            (GUARD_DARK_PATH, GUARD_DARK_TEXT))
+        st.conn.commit()
+        row = _row_for(st, GUARD_DARK_PATH)
+        assert row["scope"] != "shared", (
+            f"UPSERT 路径绕过了守卫: {row['scope']!r}")
+    finally:
+        st.close()
+
+
+def test_p021_the_guard_leaves_the_fts_index_intact(ws):
+    """P0-21：守卫不能把 FTS5 索引搞坏。
+
+    实测过一个更朴素的写法（AFTER 触发器里 UPDATE chunks）：FTS5 的同步
+    触发器会去删一条还不存在的 FTS 行，结果是 ``database disk image is
+    malformed``。守卫改成 BEFORE 触发器 + RAISE(IGNORE)，就不碰那个顺序。
+    """
+    st = _guard_storage(ws)
+    try:
+        _old_build_insert(st, GUARD_DARK_PATH, GUARD_DARK_TEXT)
+        _old_build_insert(st, GUARD_OPEN_PATH, GUARD_OPEN_TEXT,
+                          chunk_id="old-c7")
+        integrity = st.conn.execute("PRAGMA integrity_check").fetchone()[0]
+        assert integrity == "ok", f"FTS5 索引被守卫搞坏了: {integrity}"
+        n = st.conn.execute(
+            "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'ZZGUARDOPEN9911'"
+        ).fetchone()[0]
+        assert n == 1, f"FTS5 索引里的白页不见了（{n} 行）"
+    finally:
+        st.close()
+
+
+def test_p021_the_guard_does_not_depend_on_the_trigger_order():
+    """P0-21：守卫与 FTS5 触发器的先后顺序无关。
+
+    实测：AFTER 触发器里改行，只有在守卫比 FTS 触发器**旧**的时候才安全
+    —— 而 FTS 触发器会被重建，重建后它就更新了，守卫随即失效并损坏索引。
+    BEFORE 触发器不依赖顺序，所以这条把它钉死。
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("""CREATE TABLE chunks (
+            id TEXT PRIMARY KEY, user_id TEXT, scope TEXT, source TEXT,
+            path TEXT, start_line INT, end_line INT, text TEXT,
+            embedding BLOB, hash TEXT, metadata TEXT, updated_at INT,
+            file_sealed INT DEFAULT 0, element_released INT DEFAULT 0,
+            sealed_owner TEXT)""")
+        conn.execute("""CREATE VIRTUAL TABLE chunks_fts USING fts5(
+            text, id, user_id, path, source, scope,
+            content='chunks', content_rowid='rowid')""")
+        # FTS 触发器先建（守卫后建）—— 也就是「最坏的那种顺序」
+        conn.execute("""CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
+            INSERT INTO chunks_fts(rowid, text, id, user_id, path, source, scope)
+            VALUES (new.rowid, new.text, new.id, new.user_id, new.path,
+                    new.source, new.scope);
+        END""")
+        conn.execute("""CREATE TRIGGER chunks_au AFTER UPDATE ON chunks BEGIN
+            INSERT INTO chunks_fts(chunks_fts, rowid, text, id, user_id, path, source, scope)
+            VALUES ('delete', old.rowid, old.text, old.id, old.user_id, old.path, old.source, old.scope);
+            INSERT INTO chunks_fts(rowid, text, id, user_id, path, source, scope)
+            VALUES (new.rowid, new.text, new.id, new.user_id, new.path, new.source, new.scope);
+        END""")
+        from agent.memory.index_guard import install_guard
+        install_guard(conn)
+        conn.execute(
+            "INSERT INTO chunks (id,user_id,scope,source,path,start_line,end_line,"
+            "text,embedding,hash,metadata,updated_at) "
+            "VALUES ('x',NULL,'shared','memory','memory/markdown/events/d.md',1,1,"
+            "?,NULL,'h',NULL,strftime('%s','now'))", (GUARD_DARK_TEXT,))
+        conn.commit()
+        row = conn.execute("SELECT scope FROM chunks WHERE id='x'").fetchone()
+        assert row[0] != "shared", "守卫在「后建」顺序下没生效"
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        assert integrity == "ok", f"FTS5 索引被搞坏了: {integrity}"
+    finally:
+        conn.close()
+
+
+def test_p021_the_guard_is_installed_on_every_index(tmp_path):
+    """P0-21：守卫要装到**每一个**工作区的索引上。
+
+    桌面版用的是实例根（``~/cow``）那个库 —— 源码版一个都没寻址过的工作区，
+    它的库就停在旧 schema。守卫同理：只装到被打开过的库上，等于没装。
+    """
+    import sqlite3
+
+    from agent.memory.index_guard import is_installed
+    from agent.memory.schema_migrate import install_guard_all
+
+    roots = []
+    for name in ("a", "b"):
+        root = tmp_path / name
+        db = root / "memory" / "long-term" / "index.db"
+        db.parent.mkdir(parents=True)
+        st = MemoryStorage(db_path=str(db))
+        st.close()
+        roots.append(str(root))
+    # A third index that does not exist yet must not break the sweep.
+    roots.append(str(tmp_path / "missing"))
+
+    result = install_guard_all(roots=roots)
+    assert set(result) == {roots[0], roots[1]}, result
+    assert all(result.values()), f"有索引没装上守卫: {result}"
+    for root in roots[:2]:
+        conn = sqlite3.connect(
+            str(tmp_path / root / "memory" / "long-term" / "index.db"))
+        try:
+            assert is_installed(conn), f"{root} 的索引没有守卫"
+        finally:
+            conn.close()

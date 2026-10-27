@@ -80,17 +80,27 @@ class IndexFingerprint:
     """Which index a criterion actually read.
 
     A criterion that cannot say which index it read is not a criterion:
-    it is a claim. The four fields together are enough to tell two runs
+    it is a claim. The fields together are enough to tell two runs
     apart — the path says WHICH index, the row count says whether the
-    corpus changed, the mtime says WHEN it changed, and the digest says
-    WHETHER THE BYTES changed.
+    corpus changed, the mtime says WHEN it changed, and the digests say
+    WHETHER THE CONTENT changed.
 
     P0-20 S-1: the digest was added because a criterion that MODIFIES the
     object it measures cannot be trusted, and rows+mtime cannot prove it
     did not: a search rewrites ``hit_count`` on the rows it matched, which
-    changes the bytes WITHOUT changing the row count. The digest is what
-    makes "the criterion changed the index" a checkable statement instead
-    of an opinion.
+    changes the content WITHOUT changing the row count.
+
+    P0-21 F2: the digest was a digest of the FILE's BYTES, and the index
+    runs in WAL mode — a write goes to ``index.db-wal`` and the main file
+    does not move until a checkpoint. So the byte digest saw a search that
+    wrote ``hit_count`` as "nothing happened": a false green. The digest
+    is now a CONTENT digest computed from the rows, read THROUGH SQLite —
+    which merges the committed WAL frames, so the sidecar is covered
+    without the false positives a raw byte hash of the sidecar would
+    produce (a checkpoint moves bytes without changing content).
+
+    The file-level digests are kept for forensics: they say WHICH bytes
+    moved, and the report prints them when something did.
     """
 
     path: str
@@ -98,6 +108,8 @@ class IndexFingerprint:
     mtime: float
     exists: bool = True
     sha256: str = ""
+    file_sha256: str = ""
+    wal_sha256: str = ""
 
     @property
     def empty(self) -> bool:
@@ -108,21 +120,23 @@ class IndexFingerprint:
         """One line, short enough to print under every criterion."""
         if not self.exists:
             return "%s (不存在 / absent)" % self.path
-        return "%s（%d 行, mtime=%s, sha256=%s）" % (
+        return "%s（%d 行, mtime=%s, sha256=%s%s）" % (
             self.path,
             self.rows,
             _mtime_stamp(self.mtime),
             self.sha256[:16] if self.sha256 else "-",
+            ", wal=%s" % (self.wal_sha256[:8] if self.wal_sha256 else "-"),
         )
 
     def render_en(self) -> str:
         if not self.exists:
             return "%s (absent)" % self.path
-        return "%s (%d rows, mtime=%s, sha256=%s)" % (
+        return "%s (%d rows, mtime=%s, sha256=%s, wal=%s)" % (
             self.path,
             self.rows,
             _mtime_stamp(self.mtime),
             self.sha256[:16] if self.sha256 else "-",
+            self.wal_sha256[:8] if self.wal_sha256 else "-",
         )
 
     def differs_from(self, other: "IndexFingerprint") -> List[str]:
@@ -130,7 +144,13 @@ class IndexFingerprint:
 
         Returns a LIST of the differing field names, so the report can say
         WHICH thing moved instead of only that something did. An empty list
-        means the index is byte-identical.
+        means the index's CONTENT is identical.
+
+        The comparison is on the CONTENT digest. The file-level digests
+        are reported too, but a difference there alone is not a violation:
+        a WAL checkpoint moves bytes without changing a single row, and
+        treating that as "the criterion modified the index" would make the
+        check cry wolf on a perfectly healthy database.
         """
         out: List[str] = []
         if self.path != other.path:
@@ -165,12 +185,7 @@ def index_path_for(workspace: str) -> Path:
 
 
 def sha256_of(path: Path) -> str:
-    """The digest of the index file's BYTES.
-
-    P0-20 S-1: the row count cannot prove the criterion did not modify
-    the index — a search rewrites ``hit_count`` on the rows it matched,
-    which changes the bytes and leaves the row count alone. The digest is
-    the only field that sees that.
+    """The digest of a file's BYTES.
 
     Read in chunks: the index is tens of megabytes on a real workspace,
     and reading it whole would be a memory spike in a probe.
@@ -181,6 +196,43 @@ def sha256_of(path: Path) -> str:
             for block in iter(lambda: f.read(1 << 20), b""):
                 h.update(block)
     except OSError:
+        return ""
+    return h.hexdigest()
+
+
+#: The columns whose VALUE decides whether the index's content changed.
+#:
+#: ``hash`` is the per-chunk content digest, so the body does not have to
+#: be hashed again. ``hit_count`` / ``last_hit_at`` are in: a search that
+#: rewrites them DID modify the index, and a criterion that hides that is
+#: the false green P0-21 F2 is about.
+_CONTENT_COLUMNS = (
+    "id", "path", "scope", "user_id", "start_line", "end_line", "hash",
+    "file_sealed", "element_released", "sealed_owner",
+    "hit_count", "last_hit_at",
+)
+
+
+def content_digest(conn: sqlite3.Connection) -> str:
+    """The digest of the index's CONTENT, read through SQLite.
+
+    P0-21 F2: reading the rows (rather than hashing the file) is what
+    makes the WAL sidecar count. SQLite merges the committed WAL frames
+    into what it serves, so a write that only ever reached
+    ``index.db-wal`` is visible here — and a checkpoint, which moves bytes
+    without changing a row, is not.
+    """
+    h = hashlib.sha256()
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(chunks)")}
+        if not cols:
+            return ""
+        wanted = [c for c in _CONTENT_COLUMNS if c in cols]
+        sql = ("SELECT %s FROM chunks ORDER BY id" % ", ".join(wanted))
+        for row in conn.execute(sql):
+            h.update(repr(tuple(row)).encode("utf-8", "replace"))
+            h.update(b"\x00")
+    except sqlite3.Error:
         return ""
     return h.hexdigest()
 
@@ -202,16 +254,21 @@ def fingerprint(workspace: str) -> IndexFingerprint:
     try:
         row = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
         rows = int(row[0]) if row else 0
+        digest = content_digest(conn)
     except sqlite3.Error:
         rows = 0
+        digest = ""
     finally:
         conn.close()
     try:
         mtime = db.stat().st_mtime
     except OSError:
         mtime = 0.0
+    wal = Path(str(db) + "-wal")
     return IndexFingerprint(path=str(db), rows=rows, mtime=mtime,
-                            exists=True, sha256=sha256_of(db))
+                            exists=True, sha256=digest,
+                            file_sha256=sha256_of(db),
+                            wal_sha256=sha256_of(wal) if wal.is_file() else "")
 
 
 # ---------------------------------------------------------------------------

@@ -88,6 +88,12 @@ REASON_READ_DEGRADED = "gap-rule:read-degraded"
 # turns it into something a human can act on.
 REASON_SCHEMA_DRIFT = "gap-rule:schema-drift"
 
+# P0-21: a page the truth layer says is a dark page (or a release), whose
+# index row still has a PUBLIC shape. The row is the leak: the truth
+# layer is right, the projection is wrong, and every anonymous caller
+# can read it.
+REASON_INDEX_PUBLIC = "gap-rule:index-public-row"
+
 # Short machine codes carried on every violation (the shelf view needs a
 # stable code, not a sentence).
 CODE_SHRUNK = "facts-shrunk"
@@ -97,6 +103,7 @@ CODE_INDEX_ORPHAN = "index-orphan"
 CODE_PROJECTION_DEGRADED = "release-projection-degraded"
 CODE_READ_DEGRADED = "read-degraded"
 CODE_SCHEMA_DRIFT = "schema-drift"
+CODE_INDEX_PUBLIC = "index-public-row"
 
 # Path segments the sync scan skips by policy (agent/memory/manager.py).
 # A chunk row under any of them is a policy violation, not a stale page.
@@ -198,6 +205,7 @@ class Inspector:
         self._check_projection_degraded(report)
         self._check_read_degraded(report)
         self._check_schema_drift(report)
+        self._check_public_rows(report)
         if persist_snapshot:
             self._write_snapshot(snapshot)
         self._write_audit(report)
@@ -456,6 +464,106 @@ class Inspector:
                     f"disk — the row outlived its page",
                     _SEV_MID, code=CODE_INDEX_ORPHAN,
                     chunk_count=n, scope=scope, user_id=user_id)
+
+    # -- check 9: a guarded page whose index row is still public (P0-21) -------
+
+    def _check_public_rows(self, report: Dict[str, Any]) -> None:
+        """Report index rows that are PUBLIC although the truth layer says
+        they must not be.
+
+        P0-21: the desktop build of 2026-10-13 is still running against
+        these very index files. Its sync does not know about ``visibility:
+        sealed`` and writes every markdown file under ``memory/`` as
+        ``scope='shared'`` with ``user_id=NULL`` — the shape an anonymous
+        caller reads. Measured on a throwaway workspace: the old build's
+        own anonymous search returned a dark page's front-matter and body.
+
+        This check is the one place that can SEE that: the truth layer
+        says which pages are dark or released, and the index says how
+        they are stored. Where they disagree, the row is the leak.
+
+        REPORT-ONLY, like every other check: the write-side guard
+        (``agent.memory.index_guard``) stops the row from being written
+        public, and a sync re-stamps the ones that already are. The
+        inspector never edits the database.
+
+        A row that is properly sealed is NOT reported — the reverse case
+        is the one that must not produce noise, because a check that
+        cries wolf about correct rows gets switched off.
+        """
+        db = self._index_db_path()
+        if not db.is_file():
+            return
+        # The truth layer: which paths are dark pages, which are
+        # released. Resolved from the DISK (the authority).
+        try:
+            from agent.memory.release_state import ReleaseStateCache
+
+            state = ReleaseStateCache(self.workspace_root).get()
+        except Exception as e:
+            self._violation(
+                report, REASON_INDEX_PUBLIC,
+                self._index_db_path().relative_to(self.workspace_root).as_posix(),
+                f"cannot resolve the truth layer, so no page can be judged: {e}",
+                _SEV_MID, code=CODE_INDEX_PUBLIC)
+            return
+        guarded = {}
+        for path in state.sealed_paths:
+            guarded[path] = "sealed"
+        for path in state.released_paths:
+            guarded[path] = "released"
+        if not guarded:
+            return
+        try:
+            conn = sqlite3.connect(
+                "file:" + str(db).replace("\\", "/") + "?mode=ro", uri=True)
+        except sqlite3.Error as e:
+            self._violation(
+                report, REASON_INDEX_PUBLIC,
+                db.relative_to(self.workspace_root).as_posix(),
+                f"cannot open index read-only: {e}", _SEV_MID,
+                code=CODE_INDEX_PUBLIC)
+            return
+        try:
+            rows = conn.execute(
+                "SELECT path, scope, user_id, file_sealed, element_released, "
+                "COUNT(*) FROM chunks GROUP BY path, scope, user_id, "
+                "file_sealed, element_released").fetchall()
+        except sqlite3.Error as e:
+            self._violation(
+                report, REASON_INDEX_PUBLIC,
+                db.relative_to(self.workspace_root).as_posix(),
+                f"cannot read index: {e}", _SEV_MID, code=CODE_INDEX_PUBLIC)
+            return
+        finally:
+            conn.close()
+
+        for path, scope, user_id, file_sealed, element_released, n in rows:
+            klass = guarded.get(path)
+            if klass is None:
+                continue
+            # A released element must carry the release flag; a dark page
+            # must not be a public row. Anything else is a leak.
+            public_shape = (scope == "shared" and not user_id
+                            and not (file_sealed or 0))
+            if klass == "released":
+                bad = not (element_released or 0)
+            else:
+                bad = public_shape
+            if not bad:
+                continue
+            self._violation(
+                report, REASON_INDEX_PUBLIC, path,
+                f"{n} chunk row(s) for a page the truth layer says is "
+                f"{klass}, but the index stores it as scope={scope!r}, "
+                f"user_id={user_id!r}, file_sealed={file_sealed!r}, "
+                f"element_released={element_released!r} — a 'shared' row "
+                f"with no owner is readable by EVERY caller, so this row "
+                f"is a leak (run a sync; the write-side guard stops it "
+                f"from being written this way again)",
+                _SEV_HIGH, code=CODE_INDEX_PUBLIC,
+                chunk_count=n, scope=scope, user_id=user_id,
+                guard_class=klass)
 
     # -- check 6: the release projection's health (P0-13 L-3) -----------------
 

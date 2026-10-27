@@ -382,7 +382,7 @@ def judge_t2b_reranker_down(report):
 # ---------------------------------------------------------------------------
 # T3 中文召回（真实工作区）
 # ---------------------------------------------------------------------------
-def judge_t3_chinese_recall(manager, report, fp):
+def judge_t3_chinese_recall(manager, report, fp, corpus_fp=None):
     """Retrieval quality against a REAL corpus.
 
     P0-18: the corpus is asserted to be NON-EMPTY first. A zero-hit result
@@ -395,9 +395,19 @@ def judge_t3_chinese_recall(manager, report, fp):
         detail.append("被测库不存在 —— 前置条件不成立，无法判定召回质量")
         return report.judge("T3(REAL)", "中文召回（真实工作区）",
                             False, "\n".join(detail), fingerprint=fp)
-    if fp.empty:
+    # P0-21 F3: the emptiness verdict is about the corpus as the
+    # workspace HANDED IT OVER, so it is taken from the pre-sync
+    # fingerprint. With the default run (sync ON) the sync fills an empty
+    # workspace, and a verdict taken afterwards would no longer be about
+    # emptiness: it would drift into "the top hit is not USER.md", which
+    # is exactly the reason this verdict exists.
+    corpus = corpus_fp if corpus_fp is not None else fp
+    if corpus.empty:
         detail.append("被测库是空的（0 行）—— 语料不存在，0 命中是正确行为")
         detail.append("这不是召回失败。请指向一个有语料的工作区，或先同步语料。")
+        if fp.rows != corpus.rows:
+            detail.append(f"（本次同步后被测库有 {fp.rows} 行，但同步前是 0 行 —— "
+                          f"空库判定以同步前为准）")
         return report.judge("T3(REAL)", "中文召回（真实工作区）",
                             False, "\n".join(detail), fingerprint=fp)
 
@@ -655,12 +665,12 @@ def main() -> int:
 
     report = Report()
 
-    def guarded(fn, *args):
+    def guarded(fn, *args, **kwargs):
         """A criterion that raises IS a failure — on the baseline a missing
         function or a missing parameter is exactly the evidence of
         "fails before the fix"."""
         try:
-            return fn(*args)
+            return fn(*args, **kwargs)
         except Exception as e:
             import traceback
             return report.judge(
@@ -678,24 +688,34 @@ def main() -> int:
     # T3/T6 need a real corpus and a real reranker service.
     from agent.memory.config import MemoryConfig
     from agent.memory.manager import MemoryManager
+    # P0-21 F1/F3: the pre-sync fingerprint is taken BEFORE the manager is
+    # built, because the manager's construction can fail and the failure
+    # path needs a fingerprint to print. (It used to reference ``fp``,
+    # which is only assigned further down — a NameError on the error path
+    # is a bad way to report a different error.)
+    fp_pre_sync = fingerprint(workspace)
     try:
         cfg = MemoryConfig(workspace_root=workspace, sync_on_search=False)
         manager = MemoryManager(cfg, embedding_provider=None, reranker=None)
     except Exception as e:
         report.judge("T3(REAL)", "中文召回", False,
-                     f"管理器构造失败: {type(e).__name__}: {e}", fingerprint=fp)
+                     f"管理器构造失败: {type(e).__name__}: {e}",
+                     fingerprint=fp_pre_sync)
         report.judge("T6(REAL)", "reranker 端到端", False, "管理器构造失败，跳过",
-                     fingerprint=fp)
+                     fingerprint=fp_pre_sync)
         report.summary()
         return 1
 
-    # P0-20 S-1: the index BEFORE the real-corpus criteria ran. The
-    # criteria are about to search the index, and a search rewrites
-    # ``hit_count`` — so the digest taken afterwards is compared against
-    # this one, and any difference is REPORTED even when every criterion
-    # is green.
-    fp_before = fingerprint(workspace)
-
+    # P0-21 F1: the baseline is taken AFTER the sync, which is where the
+    # code's own docstring said it was taken. It was taken BEFORE, so the
+    # comparison blamed the sync (the corpus being brought up to date)
+    # for a change the criteria did not make — the code and the document
+    # said different things about the same baseline.
+    #
+    # It is also taken BEFORE the sync for a second reason (F3): whether
+    # the corpus EXISTS is a fact about the workspace as it was handed
+    # over, and the sync is what fills an empty one. An emptiness verdict
+    # taken after the sync cannot be about emptiness.
     try:
         if not ARGS.no_sync:
             print("[sync] 同步真实工作区索引 …")
@@ -707,7 +727,22 @@ def main() -> int:
             # the one they started from.
             fp = fingerprint(workspace)
             print(f"[sync] 同步后被测库: {fp.render()}\n")
-        guarded(judge_t3_chinese_recall, manager, report, fp)
+        else:
+            fp = fp_pre_sync
+        # P0-21 F1: the S-1 baseline is the index as the criteria will
+        # MEASURE it — that is, after the sync. Taken before, the
+        # comparison blames the sync for a change the criteria did not
+        # make, and the code's own docstring already said the baseline
+        # was taken after the sync.
+        fp_before = fingerprint(workspace)
+        # P0-21 F3: the emptiness verdict comes from the PRE-sync
+        # fingerprint. With the default run (sync ON) an empty workspace
+        # is filled by the sync, so a verdict taken afterwards would no
+        # longer be about emptiness — it would drift into "the top hit is
+        # not USER.md", which is the reason this verdict exists to
+        # eliminate.
+        guarded(judge_t3_chinese_recall, manager, report, fp,
+                corpus_fp=fp_pre_sync)
         guarded(judge_t6_reranker_e2e, manager, report, fp)
     finally:
         manager.storage.close()

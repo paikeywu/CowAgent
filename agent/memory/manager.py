@@ -207,6 +207,52 @@ class MemoryManager:
             return VIS_RELEASED, None
         return classify_frontmatter(fm), owner_token(fm)
 
+    def _record_guard_paths(self, release_state) -> int:
+        """Tell the write-side guard what the truth layer says (P0-21).
+
+        The guard is a database trigger: it keeps a row that must not be
+        public from being written public, whoever writes it — including
+        the old desktop build that knows nothing about ``visibility:
+        sealed``. For that it needs to know which paths are sealed, which
+        are released, and who owns a dark page.
+
+        The truth layer is the authority for all three, and this is the
+        one place in the write path that has it in hand. The guard's own
+        front-matter fallback covers the window before the first sync
+        (the old build indexing a dark page this build has never seen),
+        but it deliberately does not guess an owner: a dark page whose
+        owner is unknown is invisible to everybody, and the next sync
+        fills the owner in.
+
+        Returns the number of paths recorded.
+        """
+        from agent.memory.index_guard import (
+            CLASS_RELEASED,
+            CLASS_SEALED,
+            record_paths,
+        )
+
+        entries = []
+        owners = dict(release_state.sealed_owner or {})
+        for path in release_state.sealed_paths:
+            entries.append((path, CLASS_SEALED, owners.get(path)))
+        for path in release_state.released_paths:
+            entries.append((path, CLASS_RELEASED, None))
+        if not entries:
+            return 0
+        try:
+            return record_paths(self.storage.conn, entries)
+        except Exception as e:
+            # The guard is a safety net, not the primary mechanism: the
+            # primary one is that the scan never writes a dark page as a
+            # shared row in the first place. A failure here must not stop
+            # the sync, but it must be loud — a guard that is silently not
+            # installed is a guard that does not exist.
+            from common.log import logger
+            logger.warning(
+                f"[MemoryManager] Could not record the guarded paths: {e}")
+            return 0
+
     def _refresh_release_projection(self) -> None:
         """Re-stamp the release flags of the index from the truth layer.
 
@@ -941,6 +987,13 @@ class MemoryManager:
         except Exception as e:
             logger.warning(f"[MemoryManager] Cannot resolve the release state: {e}")
             release_state = None
+
+        # P0-21: record the truth layer's verdict in the guard table BEFORE
+        # the rows go in. The guard is what the old desktop build's writes
+        # go through, and the owner token is known here — the guard's
+        # front-matter fallback deliberately does not guess one.
+        if release_state is not None:
+            self._record_guard_paths(release_state)
 
         for entry in pending:
             n = len(entry["texts"])

@@ -705,32 +705,43 @@ def test_b3_schema_drift_never_repairs_the_index(tmp_path):
 # 本文件是「检查器那一层」的测试，所以 S-1 和 L-1 的判据本身放在这里。
 
 def test_s1_the_fingerprint_carries_a_digest_not_just_a_row_count(tmp_path):
-    """S-1：指纹必须带 sha256 —— 行数看不出字节变了。
+    """S-1：指纹必须带摘要 —— 行数看不出内容变了。
 
-    检索会回写 ``hit_count``：行数不变，字节变了。只比行数的检查器看不见
+    检索会回写 ``hit_count``：行数不变，内容变了。只比行数的检查器看不见
     判据改了自己的被测对象。
+
+    P0-21 F2：摘要的**口径**从「文件字节」改成了「内容」——
+    库是 WAL 模式，写只落进 ``index.db-wal``，主库字节不动；按字节算的
+    摘要把一次真实的写入读成「没变」（假绿）。内容摘要从**行**算，经
+    SQLite 读，WAL 已提交的内容自然在内；而 checkpoint（只搬字节不改行）
+    不会误报。文件级摘要保留为取证字段。
     """
+    import sqlite3
+
     from agent.memory.acceptance import fingerprint
 
     db = tmp_path / "memory" / "long-term" / "index.db"
     db.parent.mkdir(parents=True)
-    import sqlite3
     conn = sqlite3.connect(db)
-    conn.execute("CREATE TABLE chunks (id TEXT)")
+    conn.execute("""CREATE TABLE chunks (
+        id TEXT PRIMARY KEY, scope TEXT, path TEXT, hit_count INT)""")
+    conn.execute("INSERT INTO chunks VALUES ('c1','shared','p1',0)")
     conn.commit()
     conn.close()
 
     first = fingerprint(str(tmp_path))
-    assert first.exists and first.rows == 0
+    assert first.exists and first.rows == 1
     assert first.sha256, "指纹没有摘要 —— 判据改了库也看不出来"
 
-    # 改一个字节：行数不变，摘要必须变
-    data = bytearray(db.read_bytes())
-    data[-1] = (data[-1] + 1) % 256
-    db.write_bytes(bytes(data))
+    # 改一行：行数不变，内容变了
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE chunks SET hit_count = hit_count + 1")
+    conn.commit()
+    conn.close()
+
     second = fingerprint(str(tmp_path))
     assert second.rows == first.rows, "行数不该变（这条前提错了，测法有问题）"
-    assert second.sha256 != first.sha256, "字节变了但摘要没变 —— 指纹是假的"
+    assert second.sha256 != first.sha256, "内容变了但摘要没变 —— 指纹是假的"
     assert "sha256" in second.differs_from(first)
 
 
@@ -881,3 +892,377 @@ def test_l1_the_phase1_criterion_refuses_the_source_tree(tmp_path):
     assert not (repo / "memory" / "long-term" / "index.db").exists(), \
         "拒绝执行却把索引写进了源码树"
 
+
+
+# ---------------------------------------------------------------------------
+# P0-21 · 巡检第 9 项：暗页的索引行还是公开形状 → 报红
+# ---------------------------------------------------------------------------
+#
+# P0-21 实测：2026-10-13 打包的桌面版还在跑，和源码版共用同一个 index.db。
+# 它的 sync 不认识 `visibility: sealed`，把暗页写成 `scope='shared'` +
+# `user_id=NULL` —— 匿名可读的形状。实测它自己的匿名检索返回了暗页正文。
+#
+# 守卫（agent/memory/index_guard）在写入边界挡住这件事；巡检是**第二道**：
+# 万一有一行已经落成公开形状（守卫装上之前写的、或者别的路径写的），
+# 巡检必须报出来 —— 而且只报红，不自动修（门禁③）。
+
+def _public_row_violations(report):
+    return [v for v in report["violations"]
+            if v.get("code") == "index-public-row"]
+
+
+def _make_dark_page(ws, cow, slug="p021-inspect-dark"):
+    """Write a dark page AND put it in the index.
+
+    The facade only writes the truth layer; the index is the projection,
+    so the criterion needs a sync before the row exists to be judged.
+    """
+    import asyncio
+
+    from agent.memory.config import MemoryConfig
+    from agent.memory.manager import MemoryManager
+
+    f = facade_for(ws, cow)
+    f.write_event(slug, "P0-21 巡检暗页", "# 暗页\n\n正文。\n",
+                  date="2026-10-27", visibility="sealed")
+    cfg = MemoryConfig(workspace_root=str(ws), sync_on_search=False)
+    mgr = MemoryManager(cfg, embedding_provider=None, reranker=None)
+    try:
+        asyncio.run(mgr.sync())
+    finally:
+        try:
+            mgr.storage.close()
+        except Exception:
+            pass
+    return f
+
+
+def _dark_rel(storage):
+    """The index path of the dark page the facade wrote.
+
+    The file name carries a content hash (``<slug>--<hash8>.md``), so it
+    is looked up by prefix rather than written out.
+    """
+    rows = storage.conn.execute(
+        "SELECT path FROM chunks WHERE path LIKE '%p021-inspect-dark--%'"
+    ).fetchall()
+    assert rows, "暗页没进索引 —— 测法有问题"
+    return rows[0][0]
+
+
+def _index_row(ws, rel):
+    import sqlite3
+
+    db = ws / "memory" / "long-term" / "index.db"
+    if not db.is_file():
+        return None
+    conn = sqlite3.connect("file:%s?mode=ro" % db.as_posix(), uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(
+            "SELECT scope, user_id, file_sealed FROM chunks WHERE path = ?",
+            (rel,)).fetchone()
+    finally:
+        conn.close()
+
+
+def _legacy_index(ws, rel, scope="shared"):
+    """An index WITHOUT the guard, holding one row for ``rel``.
+
+    The guard (P0-21) makes a public row for a dark page UNREACHABLE:
+    a write that tries it is sealed on the spot. So the state this check
+    looks for can only exist in an index written BEFORE the guard — which
+    is exactly the state the check has to be able to see.
+    """
+    import sqlite3
+
+    db = ws / "memory" / "long-term" / "index.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db))
+    # Dropping the table takes the guard's triggers with it — which is
+    # the point: this index is a BEFORE-guard one.
+    conn.execute("DROP TABLE IF EXISTS chunks")
+    conn.execute("DROP TABLE IF EXISTS files")
+    conn.execute("""CREATE TABLE chunks (
+        id TEXT PRIMARY KEY, user_id TEXT, scope TEXT, source TEXT,
+        path TEXT, start_line INT, end_line INT, text TEXT, hash TEXT,
+        metadata TEXT, updated_at INT, file_sealed INT DEFAULT 0,
+        element_released INT DEFAULT 0, sealed_owner TEXT,
+        hit_count INT DEFAULT 0, last_hit_at INT)""")
+    conn.execute("""CREATE TABLE files (
+        path TEXT PRIMARY KEY, source TEXT, hash TEXT, mtime INT,
+        size INT, updated_at INT)""")
+    conn.execute(
+        "INSERT INTO chunks (id,user_id,scope,source,path,start_line,end_line,"
+        "text,hash,metadata,updated_at,file_sealed,element_released) "
+        "VALUES ('c1',NULL,?,'memory',?,1,1,'暗页正文','h',NULL,"
+        "strftime('%s','now'),?,?)",
+        (scope, rel, 1 if scope != "shared" else 0, 0))
+    conn.execute(
+        "INSERT INTO files (path,source,hash,mtime,size,updated_at) "
+        "VALUES (?,'memory','h',0,0,strftime('%s','now'))", (rel,))
+    conn.commit()
+    conn.close()
+    return rel
+
+
+def _dark_page_rel(ws):
+    """The truth-layer path of the dark page the facade wrote."""
+    hits = sorted((ws / "memory" / "markdown" / "events").rglob("*.md"))
+    assert hits, "暗页没写出来 —— 测法有问题"
+    return hits[0].relative_to(ws).as_posix()
+
+
+def test_p021_the_inspector_reports_a_public_row_for_a_dark_page(ws, cow):
+    """P0-21：暗页的索引行是公开形状 → 巡检报红。
+
+    这行就是泄漏本身：真源层说它是暗页，索引说它公开，而匿名可读。
+    """
+    _make_dark_page(ws, cow)
+    rel = _dark_page_rel(ws)
+    _legacy_index(ws, rel, scope="shared")
+
+    report = Inspector(ws).inspect(trigger="manual")
+    hits = _public_row_violations(report)
+    assert hits, "暗页的公开行没有被报出来 —— 这一行就是泄漏"
+    assert any(rel in (v.get("path") or "") for v in hits), hits
+
+
+def test_p021_reverse_a_correctly_sealed_row_is_not_reported(ws, cow):
+    """P0-21 反向用例：正常封好的暗页不得被误报。
+
+    一个对正确行也喊狼来了的检查，最后只会被关掉 —— 那时候它连真正
+    的泄漏也一起关了。
+    """
+    _make_dark_page(ws, cow)
+    rel = _dark_page_rel(ws)
+    _legacy_index(ws, rel, scope="sealed")
+
+    report = Inspector(ws).inspect(trigger="manual")
+    assert not _public_row_violations(report), (
+        f"封好的暗页被误报了: {_public_row_violations(report)}")
+
+
+def test_p021_the_inspector_does_not_repair_the_row_it_reported(ws, cow):
+    """P0-21：巡检只报红，不自动修（门禁③）。
+
+    一个会自己修的检查器会让删除变得不可追溯 —— 而且这里修的是一行
+    **正在泄漏**的数据，谁改的、改成了什么，都得留在审计里。
+    """
+    _make_dark_page(ws, cow)
+    rel = _dark_page_rel(ws)
+    _legacy_index(ws, rel, scope="shared")
+
+    Inspector(ws).inspect(trigger="manual")
+    row = _index_row(ws, rel)
+    assert row is not None
+    assert row["scope"] == "shared", (
+        f"巡检把行改了: scope={row['scope']!r} —— 巡检只该报红")
+
+
+# ---------------------------------------------------------------------------
+# P0-21 · F1 / F2 / F3：判据自己不能说谎
+# ---------------------------------------------------------------------------
+#
+# F1  S1 的基线取在 sync 之前，而 docstring 写的是「基线取在 sync 之后」——
+#     代码与文档自相矛盾（实测：执行前 201 行 / 执行后 205 行，理由漂移成
+#     「rows 变化 = 语料行数变了」）。
+# F2  库是 WAL 模式，指纹只哈希主库文件，漏了 -wal 边车 —— 检索把 hit_count
+#     0→1，主库字节不变而 -wal 变了，S1 报绿（假绿）。
+# F3  「空库报『库是空的』」只在 --no-sync 下成立；默认跑法（带 sync）会把
+#     共享知识库灌进空工作区，理由漂移成「top1 不是 USER.md」—— 正是这条
+#     判据当初要消灭的那个理由。
+
+def _make_index(tmp_path, rows=1):
+    """A tiny index the fingerprint can read."""
+    import sqlite3
+
+    db = tmp_path / "memory" / "long-term" / "index.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db))
+    conn.execute("""CREATE TABLE IF NOT EXISTS chunks (
+        id TEXT PRIMARY KEY, user_id TEXT, scope TEXT, path TEXT,
+        start_line INT, end_line INT, hash TEXT, file_sealed INT,
+        element_released INT, sealed_owner TEXT, hit_count INT,
+        last_hit_at INT)""")
+    for i in range(rows):
+        conn.execute(
+            "INSERT INTO chunks (id,scope,path,start_line,end_line,hash,"
+            "file_sealed,element_released,hit_count) "
+            "VALUES (?,?,?,1,1,?,0,0,0)", ("c%d" % i, "shared", "p%d" % i, "h"))
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_f2_the_fingerprint_sees_a_write_that_only_reached_the_wal(tmp_path):
+    """F2：只写进 WAL 边车的改动，指纹必须看得见。
+
+    旧版指纹只哈希主库文件，而库是 WAL 模式 —— 写进 ``index.db-wal`` 的
+    改动，主库字节不动，指纹报「没变」：假绿。
+    """
+    import sqlite3
+
+    from agent.memory.acceptance import fingerprint
+
+    db = _make_index(tmp_path)
+    first = fingerprint(str(tmp_path))
+    assert first.exists
+
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("UPDATE chunks SET hit_count = hit_count + 1")
+        conn.commit()
+    finally:
+        conn.close()
+
+    second = fingerprint(str(tmp_path))
+    assert second.rows == first.rows, "行数不该变（这条前提错了，测法有问题）"
+    assert second.sha256 != first.sha256, (
+        "只写进 WAL 的改动指纹没看见 —— S1 是假绿")
+    assert "sha256" in second.differs_from(first)
+
+
+def test_f2_reverse_an_unchanged_index_reports_no_difference(tmp_path):
+    """F2 反向用例：没变就报没变。
+
+    指纹如果什么都报「变了」，它就等于没有 —— 而一个永远报红的检查器
+    会被关掉。
+    """
+    from agent.memory.acceptance import fingerprint
+
+    _make_index(tmp_path)
+    first = fingerprint(str(tmp_path))
+    second = fingerprint(str(tmp_path))
+    assert second.differs_from(first) == [], (
+        f"同一个库两次指纹报了差异: {second.differs_from(first)}")
+
+
+def test_f1_the_s1_baseline_is_taken_after_the_sync(tmp_path, monkeypatch):
+    """F1：S1 的基线必须在 sync **之后**取 —— 代码与 docstring 一致。
+
+    基线取在前面时，同步带来的语料变化被算到判据头上，理由漂移成
+    「rows 变化 = 语料行数变了」—— 而同步不是判据干的。
+    """
+    import agent.memory.acceptance.phase1 as phase1
+
+    calls = []
+
+    class _Fp:
+        def __init__(self, order):
+            self.order = order
+            self.path = "x"
+            self.rows = order
+            self.mtime = 0.0
+            self.exists = True
+            self.sha256 = "d"
+
+        def render(self):
+            return f"fake#{self.order}"
+
+    def _fake_fingerprint(workspace):
+        calls.append(workspace)
+        return _Fp(len(calls))
+
+    monkeypatch.setattr(phase1, "fingerprint", _fake_fingerprint)
+
+    class _Mgr:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def sync(self):
+            calls.append("sync")
+
+        @property
+        def storage(self):
+            class _S:
+                def close(self):
+                    pass
+            return _S()
+
+    import agent.memory.manager as _mgr_mod
+    monkeypatch.setattr(_mgr_mod, "MemoryManager", lambda *a, **kw: _Mgr())
+    monkeypatch.setattr(phase1, "judge_t3_chinese_recall",
+                        lambda *a, **kw: True)
+    monkeypatch.setattr(phase1, "judge_t6_reranker_e2e",
+                        lambda *a, **kw: True)
+    monkeypatch.setattr(phase1, "judge_t1a_single_predicate",
+                        lambda *a, **kw: True)
+    monkeypatch.setattr(phase1, "judge_t1b_ab_visibility",
+                        lambda *a, **kw: True)
+    monkeypatch.setattr(phase1, "judge_t1c_identity", lambda *a, **kw: True)
+    monkeypatch.setattr(phase1, "judge_t2_degradation_status",
+                        lambda *a, **kw: True)
+    monkeypatch.setattr(phase1, "judge_t2b_reranker_down",
+                        lambda *a, **kw: True)
+    monkeypatch.setattr(phase1, "judge_t4_namespace", lambda *a, **kw: True)
+
+    seen = {}
+
+    def _s1(report, workspace, fp_before):
+        seen["fp_before"] = fp_before
+        return True
+
+    monkeypatch.setattr(phase1, "judge_s1_index_untouched", _s1)
+    monkeypatch.setattr(phase1, "resolve_workspace",
+                        lambda explicit: (str(tmp_path), "test"))
+    monkeypatch.setattr(phase1, "assert_not_source_tree",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(phase1, "sys", phase1.sys)
+
+    phase1.main()
+
+    assert "sync" in calls, "同步没有发生 —— 测法有问题"
+    sync_at = calls.index("sync")
+    # The baseline the S-1 criterion receives must come from a
+    # fingerprint taken AFTER the sync. The fake fingerprint counts its
+    # own calls, so the ORDER of the call that produced it is what the
+    # assertion is about.
+    assert seen["fp_before"].order > sync_at, (
+        "S1 拿到的基线取自同步之前 —— 代码与 docstring 说的相反（F1）")
+
+
+def test_f3_the_empty_verdict_comes_from_the_pre_sync_fingerprint(tmp_path):
+    """F3：空库判定必须取**同步前**的指纹。
+
+    默认跑法带 sync，会把共享知识库灌进空工作区；判定若取同步后的
+    指纹，就不再是「空库」的判定，理由会漂移成「top1 不是 USER.md」。
+    """
+    from agent.memory.acceptance import Report, fingerprint
+
+    # An index that EXISTS and has no rows: "empty" is a fact about the
+    # corpus, not about a missing file.
+    db = tmp_path / "memory" / "long-term" / "index.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    import sqlite3
+    conn = sqlite3.connect(str(db))
+    conn.execute("""CREATE TABLE chunks (
+        id TEXT PRIMARY KEY, user_id TEXT, scope TEXT, path TEXT,
+        start_line INT, end_line INT, hash TEXT, file_sealed INT,
+        element_released INT, sealed_owner TEXT, hit_count INT,
+        last_hit_at INT)""")
+    conn.commit()
+    conn.close()
+
+    empty_before = fingerprint(str(tmp_path))
+    assert empty_before.exists and empty_before.empty
+
+    # The workspace is filled afterwards — as the sync would.
+    _make_index(tmp_path, rows=3)
+    filled_after = fingerprint(str(tmp_path))
+    assert not filled_after.empty
+
+    report = Report()
+    from agent.memory.acceptance.phase1 import judge_t3_chinese_recall
+
+    class _Mgr:
+        async def search(self, *a, **kw):
+            return []
+
+    ok = judge_t3_chinese_recall(_Mgr(), report, filled_after,
+                                 corpus_fp=empty_before)
+    assert not ok, "空库必须判红"
+    detail = "\n".join(report.rows[0][1] if len(report.rows[0]) > 1 else "")
+    printed = [r for r in report.rows]
+    assert printed, "没有判据结果"

@@ -603,6 +603,25 @@ class MemoryStorage:
         # time — instead of returning empty results for every later query.
         self._verify_schema()
 
+        # P0-21: the write-side guard. A row that must not be public
+        # cannot become public — not by this build, and not by the old
+        # desktop build that is still running against the same file.
+        # The guard is a BEFORE trigger, so it does not depend on the
+        # order the FTS5 sync triggers happen to fire in.
+        try:
+            from agent.memory.index_guard import install_guard
+
+            install_guard(self.conn)
+        except Exception as e:
+            # A guard that cannot be installed is a guard that does not
+            # exist, so this is loud rather than a silent skip.
+            from common.log import logger
+            logger.error(
+                f"[MemoryStorage] Index guard could not be installed on "
+                f"{self.db_path}: {e}"
+            )
+            raise
+
         # Create indexes
         self.conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_chunks_user 
