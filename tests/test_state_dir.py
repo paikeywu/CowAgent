@@ -58,8 +58,13 @@ def test_user_scoped_paths_collapse_onto_the_root_without_a_user(registry, tmp_p
 
 def test_user_scoped_paths_split_once_a_user_is_present(registry, tmp_path):
     with identity_scope(agent_id="alpha", user_id="u1"):
-        assert state_dir.memory_dir() == tmp_path / "alpha" / "users" / "u1" / "memory"
-        assert state_dir.runs_dir() == tmp_path / "alpha" / "users" / "u1" / "runs"
+        # P0-17: the user's directory segment carries a ``user--`` prefix
+        # (``agent.memory.identity_ns.user_dir_name``), so the path is
+        # ``users/user--u1`` — NOT ``users/u1``. The raw id must never be a
+        # path segment: ':' is drive syntax on Windows and a raw id with
+        # one makes the path unparseable.
+        assert state_dir.memory_dir() == tmp_path / "alpha" / "users" / "user--u1" / "memory"
+        assert state_dir.runs_dir() == tmp_path / "alpha" / "users" / "user--u1" / "runs"
         # agent assets stay shared across users
         assert state_dir.skills_dir() == tmp_path / "alpha" / "skills"
         assert state_dir.mcp_config_file() == tmp_path / "alpha" / "mcp.json"
@@ -71,7 +76,7 @@ def test_the_index_stays_one_database_while_its_content_splits(registry, tmp_pat
     into a fan-out. The memory files it indexes do follow the user."""
     with identity_scope(agent_id="alpha", user_id="u1"):
         assert state_dir.memory_dir(ensure=False) == (
-            tmp_path / "alpha" / "users" / "u1" / "memory"
+            tmp_path / "alpha" / "users" / "user--u1" / "memory"
         )
         assert state_dir.memory_index_db(ensure=False) == (
             tmp_path / "alpha" / "memory" / "long-term" / "index.db"
@@ -82,8 +87,8 @@ def test_a_user_sits_beside_the_agents_not_under_one(registry, tmp_path):
     """The same person talking to two Agents has one profile, not two. Both
     resolve into the shared area, which is the default Agent's workspace."""
     with identity_scope(agent_id="beta", user_id="u1"):
-        assert state_dir.user_root() == tmp_path / "alpha" / "users" / "u1"
-        assert state_dir.memory_file() == tmp_path / "alpha" / "users" / "u1" / "MEMORY.md"
+        assert state_dir.user_root() == tmp_path / "alpha" / "users" / "user--u1"
+        assert state_dir.memory_file() == tmp_path / "alpha" / "users" / "user--u1" / "MEMORY.md"
         # ...while what makes beta a different Agent stays with beta
         assert state_dir.tmp_dir(ensure=False) == tmp_path / "beta" / "tmp"
 
