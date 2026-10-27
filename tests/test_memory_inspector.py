@@ -792,15 +792,53 @@ def test_l1_an_empty_index_reports_the_empty_reason_not_another(tmp_path):
     风控抓到的那一轮：判据红了，但报的理由是「top1 不是 USER.md」——
     红的理由和它设计的理由不是一回事。判据红了但理由不对，等于判据
     在说谎：读的人不知道它到底测了什么。
-    """
-    from agent.memory.acceptance import Report, fingerprint
 
-    report = Report()
-    fp = fingerprint(str(tmp_path))       # 不存在 -> exists=False
-    ok = report.judge("T3(REAL)", "中文召回", False,
-                      "被测库不存在 —— 前置条件不成立，无法判定召回质量",
-                      fingerprint=fp)
-    assert not ok
+    这条跑的是 phase1.py 本身（子进程），因为要验的是**输出里出现了哪
+    个理由**，而那不是一个可以被 import 的函数能回答的。
+    """
+    import re
+    import subprocess
+    import sys as _sys
+    from pathlib import Path
+
+    from agent.memory.storage import MemoryStorage
+
+    repo = Path(__file__).resolve().parents[1]
+    ws = tmp_path / "cow"
+    (ws / "memory" / "long-term").mkdir(parents=True)
+    # A REAL, EMPTY index — the full schema, zero rows. A hand-made
+    # ``CREATE TABLE chunks (id TEXT)`` is not a valid index, and the
+    # manager would reject it with a schema error — a DIFFERENT reason,
+    # and one that would mask the reason under test.
+    db = ws / "memory" / "long-term" / "index.db"
+    storage = MemoryStorage(db)
+    try:
+        assert storage.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0
+    finally:
+        storage.close()
+
+    proc = subprocess.run(
+        [_sys.executable, str(repo / "agent" / "memory" / "acceptance" / "phase1.py"),
+         "--workspace", str(ws), "--no-sync"],
+        cwd=str(repo), capture_output=True, text=True, timeout=180)
+    out = proc.stdout or ""
+
+    m = re.search(r"\[(?:PASS|FAIL)\] T3\(REAL\).*?(?=\n  \[(?:PASS|FAIL)\] |\n====|\Z)",
+                  out, re.S)
+    assert m, "T3 段没出现在输出里:\n%s" % out[-2000:]
+    t3 = m.group(0)
+
+    # The reason it was designed to give.
+    assert "被测库是空的" in t3, (
+        "空库上没有报『库是空的』理由:\n%s" % t3)
+    assert "0 命中是正确行为" in t3, (
+        "理由没有说清『0 命中是正确行为』:\n%s" % t3)
+    # And NOT the reason it drifted to.
+    assert "top1 不是 USER.md" not in t3, (
+        "空库上混入了另一个失败理由:\n%s" % t3)
+    # And not the "no index at all" reason either — the index EXISTS here.
+    assert "前置条件不成立" not in t3, (
+        "空库被误报成『库不存在』:\n%s" % t3)
 
 
 def test_l1_the_phase1_criterion_runs_end_to_end_on_a_workspace(tmp_path, monkeypatch):
