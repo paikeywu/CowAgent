@@ -13,6 +13,10 @@ nohup.out
 tmp
 plugins.json
 *.log
+# 日志轮转出来的备份（如 run.log.pre-fix-20261028-062031）。
+# `*.log` 盖不住 `*.log.<后缀>` 这种形式，轮转备份会变成未跟踪文件，
+# 把「工作区干净」这条部署判据顶红 —— 仓库里不该出现任何运行产物。
+*.log.*
 logs/
 /workspace
 config.yaml
