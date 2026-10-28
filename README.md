@@ -102,8 +102,7 @@ Once started, open `http://localhost:9899` to access the **Web console** — you
 
 After installation, manage the service with the [cow CLI](https://docs.cowagent.ai/cli/index):
 
-```bash
-cow start | stop | restart        # service control
+```textcow start | stop | restart        # service control
 cow status | logs                  # status and logs
 cow update                         # pull latest code and restart
 cow skill install <name>           # install a skill
@@ -158,10 +157,16 @@ git rev-parse HEAD                  # record this -- it is the commit you deploy
 **not** the branch these steps were written against — `--branch live-memory` is
 what puts the deployed code on disk. The deployment was verified against commit
 `5df9d27052996923fa05d1cd3c4c6c98ec1bc297`; the hash printed above is whatever
-`live-memory` points at right now. As of this writing the only commit after the
-verified one is `42ca91ab`, which adds these instructions and changes no code —
-so the steps still describe the code you are about to run. If the two differ by
-more than a documentation commit, read the diff before trusting the steps.
+`live-memory` points at right now. Four commits landed on this branch after the
+verified one, and one of them (`025e80af`) changes `config.py` — it reworks
+credential masking in the startup log. Read the diff before trusting the steps:
+
+```bash
+git diff 5df9d27052996923fa05d1cd3c4c6c98ec1bc297..HEAD -- config.py
+```
+
+The commands in the steps below are unchanged by those commits, but the
+password-masking behaviour described in step 4 is.
 
 `python3-venv` is in that package list because Ubuntu ships the system
 interpreter without it. Without the package, `python3 -m venv` in step 2 fails
@@ -284,10 +289,13 @@ key in its `available_setting` table replaces the value from `config.json`.
 `config.json`. Check before you hand the password out:
 
 ```bash
-env | grep -E '^(WEB_PASSWORD|WEB_PORT|AGENT_WORKSPACE|MODEL|BOT_TYPE|COW_LANG)='
+env | grep -E '^(WEB_PASSWORD|WEB_PORT|WEB_HOST|AGENT_WORKSPACE|MODEL|BOT_TYPE|COW_LANG)='
 ```
 
-`web_host` is not in the table, so `WEB_HOST` does not override anything.
+`web_host` is in that table as well, so `WEB_HOST` overrides the bind address
+in `config.json`. If it is set to `127.0.0.1` the console listens on the local
+interface only — the deployment looks healthy but the console is unreachable
+from another machine.
 
 > The MiniMax endpoint is `api.minimaxi.com`. `api.minimax.com` does not
 > resolve.
@@ -362,12 +370,14 @@ after a reboot.** The two deployment paths differ in more than that:
 | :--- | :--- | :--- |
 | Survives a reboot | no | yes - `systemd`, enabled at boot |
 | Re-runnable | no - every step again | yes - idempotent by design |
-| Result verified | by hand | 9 checks; the exit code is non-zero if any fails |
+| Result verified | by hand | 12 checks (9 fail the run; 3 report status only) |
 | Needs the script on the server | no | yes - copy it over first |
 
-The script is a standalone file, not part of this repository. Copy it to the
-server, keep its line endings as LF, and run it **as the user that will own
-the service**:
+The script is a standalone file, not part of this repository. Its single source
+of truth is `~/cow/scripts/deploy_cowagent_live_memory.sh` on the operator's
+machine; copy that one file to the server, keep its line endings as LF, and run
+it **as the user that will own the service**. The unit shown below is written by
+the script itself, so the two stay in step:
 
 ```bash
 chmod +x deploy_cowagent_live_memory.sh
@@ -448,16 +458,12 @@ nothing about retrieval.
 ```bash
 cd ~/CowAgent
 .venv/bin/python -m pytest tests/ --collect-only -q      # 0 collection errors
-.venv/bin/python -m pytest tests/test_memory_facade.py -q \
-  --deselect tests/test_memory_facade.py::test_tc_b1_junction_to_shared_knowledge \
-  --deselect tests/test_memory_facade.py::test_tc_b2_dangling_junction \
-  --deselect tests/test_memory_facade.py::test_tc_b3_junction_to_default_memory
+.venv/bin/python -m pytest tests/test_memory_facade.py -q
 ```
 
-Those three cases build NTFS junctions through `cmd /c mklink /J` and cannot
-run on Linux. Without the `--deselect` flags they fail with
-`FileNotFoundError: [Errno 2] No such file or directory: 'cmd'`. That is a
-test-portability limitation of the branch, not a broken deployment.
+All cases in this file run on Linux. The three link cases build a junction
+through `cmd /c mklink /J` on Windows and a symlink elsewhere, so they exercise
+the same path-escape guard on both platforms.
 
 Write a memory through the runtime write path, index it, and read it back:
 
@@ -609,10 +615,10 @@ is in its `available_setting` table - `web_password`, `web_port`,
 `agent_workspace`, `model`, `bot_type` and `cow_lang` are all in it:
 
 ```bash
-env | grep -E '^(WEB_PASSWORD|WEB_PORT|AGENT_WORKSPACE|MODEL|BOT_TYPE|COW_LANG)='
+env | grep -E '^(WEB_PASSWORD|WEB_PORT|WEB_HOST|AGENT_WORKSPACE|MODEL|BOT_TYPE|COW_LANG)='
 ```
 
-`web_host` is not in the table, so `WEB_HOST` changes nothing.
+`web_host` is in that table as well, so `WEB_HOST` overrides the bind address.
 
 **`systemd-analyze verify` reports `Unknown key name 'StartLimitIntervalSec'`**
 
@@ -746,8 +752,7 @@ Learn more: [Tools overview](https://docs.cowagent.ai/tools/index) · [MCP integ
 - **GitHub / ClawHub / URL and more** — install skills from any source
 - **Conversational authoring** — generate custom skills through dialogue with `skill-creator`; turn any workflow or third-party API into a reusable skill
 
-```bash
-/skill list                   # list installed skills
+```text/skill list                   # list installed skills
 /skill search <keyword>        # search the marketplace
 /skill install <name>          # one-click install
 ```

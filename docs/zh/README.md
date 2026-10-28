@@ -102,8 +102,7 @@ docker compose up -d
 
 安装后可使用 `cow` [CLI 命令](https://docs.cowagent.ai/zh/cli) 管理服务：
 
-```bash
-cow start | stop | restart        # 服务管理
+```textcow start | stop | restart        # 服务管理
 cow status | logs                  # 状态和日志
 cow update                         # 拉取最新代码并重启
 cow skill install <名称>           # 安装技能
@@ -145,7 +144,13 @@ git rev-parse --abbrev-ref HEAD     # 必须输出：live-memory
 git rev-parse HEAD                  # 记下这个值 —— 就是你部署的提交
 ```
 
-只写 `git clone` 会检出默认分支（`master`），**不是**这些步骤对应的分支 —— `--branch live-memory` 才把要部署的代码放上磁盘。部署实测基于提交 `5df9d27052996923fa05d1cd3c4c6c98ec1bc297`；上面打印的哈希是 `live-memory` 当前指向的提交。截至撰写时，实测提交之后只有一个 `42ca91ab`，它只补充了这份说明、没有改动代码 —— 所以步骤仍与你即将运行的代码一致。若两个哈希之间相差的不止文档提交，先读 diff 再决定是否信任这些步骤。
+只写 `git clone` 会检出默认分支（`master`），**不是**这些步骤对应的分支 —— `--branch live-memory` 才把要部署的代码放上磁盘。部署实测基于提交 `5df9d27052996923fa05d1cd3c4c6c98ec1bc297`；上面打印的哈希是 `live-memory` 当前指向的提交。此后这个分支上又落了 4 个提交，其中 `025e80af` 改的是 `config.py`（重做启动日志里的凭据脱敏）。信任这些步骤之前先读 diff：
+
+```bash
+git diff 5df9d27052996923fa05d1cd3c4c6c98ec1bc297..HEAD -- config.py
+```
+
+下面步骤里的命令没有被这些提交改动，但第 4 步描述的密码脱敏行为已经改了。
 
 `python3-venv` 在这个包列表里，是因为 Ubuntu 的系统解释器默认不带它。缺这个包时，第 2 步的 `python3 -m venv` 会报 `ensurepip is not available`。`lsof` 是故障排查章节查端口用的。
 
@@ -235,10 +240,11 @@ python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/CowAgent/c
 **还有一样东西能覆盖这个密码。** 启动时 `config.py` 会遍历所有环境变量，把名字小写后，凡是命中 `available_setting` 表里的键，就用环境变量的值替换 `config.json` 里的值。`web_password`、`web_port`、`agent_workspace`、`model`、`bot_type`、`cow_lang` 都在这张表里 —— 所以服务器上若已经 export 了 `WEB_PASSWORD`，控制台要的就是**那个**密码，不是 `config.json` 里这个。发密码之前先查一下：
 
 ```bash
-env | grep -E '^(WEB_PASSWORD|WEB_PORT|AGENT_WORKSPACE|MODEL|BOT_TYPE|COW_LANG)='
+env | grep -E '^(WEB_PASSWORD|WEB_PORT|WEB_HOST|AGENT_WORKSPACE|MODEL|BOT_TYPE|COW_LANG)='
 ```
 
-`web_host` 不在这张表里，`WEB_HOST` 覆盖不了任何东西。
+`web_host` 也在这张表里，`WEB_HOST` 会覆盖 `config.json` 里的绑定地址。
+若它被设成 `127.0.0.1`，控制台只监听本机 —— 部署看起来一切正常，但从别的机器连不上。
 
 > MiniMax 的域名是 `api.minimaxi.com`，`api.minimax.com` 解析不了。
 
@@ -296,10 +302,13 @@ grep -c "SourceTreeWorkspaceError" nohup.out run.log
 | :--- | :--- | :--- |
 | 重启后能自起 | 不能 | 能 —— `systemd`，已设开机自启 |
 | 能否重复执行 | 不能 —— 每一步都要重来 | 能 —— 幂等设计 |
-| 结果如何验收 | 手工逐条看 | 9 条判据，任何一条不过退出码非零 |
+| 结果如何验收 | 手工逐条看 | 12 条判据（其中 9 条不过就非零退出，另 3 条只报状态） |
 | 是否需要先把脚本拷到服务器 | 不需要 | 需要 —— 先拷过去 |
 
-这个脚本是独立文件，不在本仓库里。把它拷到服务器、**保持 LF 行尾**，然后**用将来拥有这个服务的那个用户**运行：
+这个脚本是独立文件，不在本仓库里。它的单一真源是运维机器上的
+`~/cow/scripts/deploy_cowagent_live_memory.sh`；把**那一个文件**拷到服务器、
+**保持 LF 行尾**，然后**用将来拥有这个服务的那个用户**运行。下面贴的 unit 由脚本
+自己写出，所以两者不会走偏：
 
 ```bash
 chmod +x deploy_cowagent_live_memory.sh
@@ -363,13 +372,10 @@ sudo journalctl -u cowagent -n 50                 # 它自己记了什么
 ```bash
 cd ~/CowAgent
 .venv/bin/python -m pytest tests/ --collect-only -q      # 0 collection errors
-.venv/bin/python -m pytest tests/test_memory_facade.py -q \
-  --deselect tests/test_memory_facade.py::test_tc_b1_junction_to_shared_knowledge \
-  --deselect tests/test_memory_facade.py::test_tc_b2_dangling_junction \
-  --deselect tests/test_memory_facade.py::test_tc_b3_junction_to_default_memory
+.venv/bin/python -m pytest tests/test_memory_facade.py -q
 ```
 
-这三个用例通过 `cmd /c mklink /J` 建 NTFS junction，在 Linux 上跑不了。不加 `--deselect` 它们会失败并报 `FileNotFoundError: [Errno 2] No such file or directory: 'cmd'`。这是分支本身的测试可移植性限制，不是部署坏了。
+这个文件里的用例在 Linux 上全部能跑。那三个链接用例在 Windows 上通过 `cmd /c mklink /J` 建 junction、在其他平台建 symlink，因此两个平台验证的是同一条路径逃逸防护。
 
 通过运行时写入路径写一条记忆、建索引、再读回来：
 
@@ -502,10 +508,11 @@ assert_not_source_tree('/home/<user>/cow-workspace'); print('workspace OK')"
 有环境变量把它覆盖了。启动时 `config.py` 会遍历所有环境变量，把名字小写后，凡是命中 `available_setting` 表里的键，就用环境变量的值替换 `config.json` 里的值 —— `web_password`、`web_port`、`agent_workspace`、`model`、`bot_type`、`cow_lang` 都在这张表里：
 
 ```bash
-env | grep -E '^(WEB_PASSWORD|WEB_PORT|AGENT_WORKSPACE|MODEL|BOT_TYPE|COW_LANG)='
+env | grep -E '^(WEB_PASSWORD|WEB_PORT|WEB_HOST|AGENT_WORKSPACE|MODEL|BOT_TYPE|COW_LANG)='
 ```
 
-`web_host` 不在这张表里，`WEB_HOST` 覆盖不了任何东西。
+`web_host` 也在这张表里，`WEB_HOST` 会覆盖 `config.json` 里的绑定地址。
+若它被设成 `127.0.0.1`，控制台只监听本机 —— 部署看起来一切正常，但从别的机器连不上。
 
 **`systemd-analyze verify` 报 `Unknown key name 'StartLimitIntervalSec'`**
 
@@ -634,8 +641,7 @@ CowAgent 支持国内外主流厂商的大语言模型。**文本对话、图像
 - **GitHub / ClawHub / URL 等** — 任意来源一键安装
 - **对话创造** — 通过 `skill-creator` 用对话快速生成自定义技能，可将工作流程或第三方接口直接固化为技能
 
-```bash
-/skill list                   # 查看当前技能
+```text/skill list                   # 查看当前技能
 /skill search <关键词>         # 在技能广场搜索
 /skill install <名称>          # 一键安装
 ```
