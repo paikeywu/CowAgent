@@ -106,9 +106,24 @@ def test_tc_a2_confused_escapes(tmp_path, p):
 # --- B. symlinks / junctions -------------------------------------------------
 
 def _mklink_junction(link, target):
-    r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
-                       capture_output=True, text=True)
-    assert r.returncode == 0, r.stdout + r.stderr
+    """造一个指向 target 的**目录链接**。
+
+    平台差异不是实现细节，是语义：
+      * Windows 的 junction 免权限（symlink 要 SeCreateSymbolicLinkPrivilege），
+        但 os.path.islink() 对它返回 **False** —— reparse bit 才是可靠信号。
+      * Linux 只有 symlink，os.path.islink() 返回 **True**。
+
+    所以两个平台造的东西，在「islink() 是不是可靠信号」这一点上**结论相反**，
+    断言必须按平台写，不能照抄。
+    """
+    if sys.platform == "win32":
+        r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout + r.stderr
+    else:
+        # Linux 允许创建 dangling symlink（目标不存在），
+        # 正好对上 b2 要验的场景。
+        link.symlink_to(target, target_is_directory=True)
 
 
 def test_tc_b1_junction_to_shared_knowledge(tmp_path):
@@ -131,7 +146,13 @@ def test_tc_b2_dangling_junction(tmp_path):
     link = ws / "memory" / "markdown" / "events" / "dangling"
     _mklink_junction(link, cow / ".cow" / ".env.d")  # nonexistent target
     assert os.path.lexists(link) and not os.path.exists(link)
-    assert not os.path.islink(link)  # proves the exists()/islink() trap is real
+    # islink() 的平台语义相反：Windows junction 是 False，Linux symlink 是 True。
+    # 这条断言要证明的是「exists()/islink() 单独用都会漏掉这种链接」，
+    # 两个平台都要保住这个语义 —— 所以按平台断言，不要照抄。
+    if sys.platform == "win32":
+        assert not os.path.islink(link)  # junction: reparse bit 才是可靠信号
+    else:
+        assert os.path.islink(link)  # symlink: islink() 有效，但 exists() 仍是 False
     f = facade_for(ws, cow)
     with pytest.raises(PathEscapeError):
         f.write("markdown/events/dangling/x--a1b2c3d4.md", content="x")

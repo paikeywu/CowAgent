@@ -114,6 +114,16 @@ def test_the_sessions_endpoint_clamps_before_merging_agents(store, tmp_path):
          patch("agent.memory.get_conversation_store", lambda *a, **k: store), \
          patch("agent.registry.get_agent_registry") as registry:
         registry.return_value.list.return_value = []
+        # registry.get() 的 workspace 必须是**真实路径**：handler 会经
+        # state_root_str() 去问默认 Agent 的工作区，而 state_dir 的
+        # assert_not_source_tree() 会把「落在源码树内」的工作区拒掉。
+        # 原来这里让 registry.get() 返回 MagicMock —— str(MagicMock) 拼出
+        # 一个相对路径，realpath 之后正好落在源码树里，
+        # 于是 P0-20 的防线把一个**假路径**当成真路径拦下，测试报错。
+        # 防线没做错，是 mock 给的东西不是路径。给它一个真的（在源码树外）。
+        fake_ws = tmp_path / "agent-workspace"
+        fake_ws.mkdir()
+        registry.return_value.get.return_value.workspace = str(fake_ws)
         response = json.loads(sessions_api.SessionsHandler().GET())
 
     assert response["status"] == "success"
