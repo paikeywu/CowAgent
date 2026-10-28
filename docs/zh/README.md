@@ -114,6 +114,425 @@ cow install-browser                # 安装浏览器工具
 
 <br/>
 
+## 🖥️ 在 Ubuntu 服务器上部署
+
+在一台无桌面的 Ubuntu 主机上从源码运行 CowAgent。下面的步骤在 Ubuntu 26.04 LTS（Python 3.14.4）上实测通过，按顺序复制执行即可，每段代码块都可以单独复制粘贴。
+
+这里给两条部署路径：手工步骤（1-6）用 `nohup` 跑控制台；部署脚本则装一个 `systemd` 服务并自动验收。第 5 步会对比两者。
+
+### 前置条件
+
+| 项目 | 取值 | 原因 |
+| :--- | :--- | :--- |
+| 操作系统 | Ubuntu 26.04 LTS | 第 1 步用 `apt-get` 装包 |
+| Python | 3.14（`python3 -V`） | `python3 -m venv` 给出隔离的解释器 |
+| 磁盘 | 约 2 GB 空闲 | 约 390 MB 虚拟环境 + 约 40 MB 代码检出 |
+| 包索引 | `https://pypi.tuna.tsinghua.edu.cn/simple` | 官方 PyPI 在部分网络下慢到不可用 |
+| 出网 | `github.com`、`pypi.tuna.tsinghua.edu.cn` | 克隆代码 + 装依赖 |
+| 放行端口 | `9899/tcp` | Web 控制台 |
+
+> 模型密钥**不要**写进 `config.json`，放在第 4 步的 `.env` 里，权限 `600`。控制台密码**在** `config.json` 里，因此该文件同样保持 `600`。
+
+下面的检查要用到 `curl` 和 `ss`：`curl` 负责向控制台发请求，`ss` 负责报告端口被哪个进程占用。最小化安装的 Ubuntu 镜像通常没有 `curl`，`ss` 则随 `iproute2` 一起安装。
+
+### 1. 获取代码
+
+```bash
+sudo apt-get update && sudo apt-get install -y git curl python3-venv lsof iproute2
+git clone --branch live-memory https://github.com/paikeywu/CowAgent.git ~/CowAgent
+cd ~/CowAgent
+git rev-parse --abbrev-ref HEAD     # 必须输出：live-memory
+git rev-parse HEAD                  # 记下这个值 —— 就是你部署的提交
+```
+
+只写 `git clone` 会检出默认分支（`master`），**不是**这些步骤对应的分支 —— `--branch live-memory` 才把要部署的代码放上磁盘。部署实测基于提交 `5df9d27052996923fa05d1cd3c4c6c98ec1bc297`；上面打印的哈希是 `live-memory` 当前指向的提交。截至撰写时，实测提交之后只有一个 `42ca91ab`，它只补充了这份说明、没有改动代码 —— 所以步骤仍与你即将运行的代码一致。若两个哈希之间相差的不止文档提交，先读 diff 再决定是否信任这些步骤。
+
+`python3-venv` 在这个包列表里，是因为 Ubuntu 的系统解释器默认不带它。缺这个包时，第 2 步的 `python3 -m venv` 会报 `ensurepip is not available`。`lsof` 是故障排查章节查端口用的。
+
+### 2. 创建虚拟环境并安装依赖
+
+```bash
+cd ~/CowAgent
+python3 -m venv .venv
+.venv/bin/python -V                                   # Python 3.14.x
+.venv/bin/python -m pip install --upgrade pip setuptools wheel \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple
+.venv/bin/python -m pip install -r requirements.txt \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple
+.venv/bin/python -m pip install -e . \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple
+.venv/bin/python -m pip check                         # No broken requirements found.
+.venv/bin/python -m pip install pytest \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple        # 不在 requirements.txt 里；第 6 步要用
+```
+
+**用虚拟环境，不要用系统 Python。** 现在的 Ubuntu 把系统解释器标记为 externally managed（PEP 668），往里 `pip install` 会失败并提示你加 `--break-system-packages`。那个开关绕过了操作系统对自身包的保护，可能搞坏系统 Python —— 不要用。虚拟环境就是隔离机制，不需要额外装包。
+
+`pip install -e .` 把本仓库装成可编辑包，`cow` 命令由此进入 PATH（`cow start`、`cow status`、`cow logs`），也就是上文「快速开始」里提到的那个命令。它会在检出目录里生成 `cowagent.egg-info/`，`.gitignore` 已经排除了它，工作区保持干净。
+
+### 3. 把运行时状态放到源码树之外
+
+```bash
+mkdir -p ~/cow-workspace
+```
+
+`agent_workspace` 必须指向**不在** git 检出目录内的位置。运行时状态（记忆索引、调度器存储、skills）属于运行它的人，不属于仓库 —— 一次 clone 绝不能把别人的 `memory/long-term/index.db` 交给新用户。
+
+这一点在启动时被强制检查。`agent_workspace` 落在检出目录里，进程会拒绝启动：
+
+```
+common.state_dir.SourceTreeWorkspaceError: 工作区位于源码树内，拒绝把运行时状态写进源码树：'/home/<user>/CowAgent' 在 '/home/<user>/CowAgent' 之内。
+  运行时状态（memory/long-term/index.db 等）属于运行它的人，不属于仓库；它一旦进入版本库，clone 的人会拿到别人的记忆索引。
+  请把 agent_workspace / workspace 指向一个工作区目录（例如 %USERPROFILE%\cow），而不是源码目录。
+```
+
+这个检查会从工作区一路向上找 `.git` 祖先目录，所以检出目录下的任何位置都会被拒绝。把它指向 `~/cow-workspace`（或任何树外的目录）即可启动。
+
+### 4. 写 `config.json` 和凭据文件
+
+源码部署时，`config.json` 就在检出目录旁边（`~/CowAgent/config.json`）。如果你要把用户数据放到别处，用 `COW_DATA_DIR` 覆盖。
+
+这个路径不是约定，而是代码就是这么做的：`config.py` 用 `os.path.join(get_data_root(), "config.json")` 拼路径，而 `COW_DATA_DIR` 未设置时 `get_data_root()` 回落到仓库根目录。桌面客户端会设 `COW_DATA_DIR=~/.cow`，因此 **`~/.cow/config.json` 是桌面客户端的文件，源码部署永远不会读它**。源码部署的 `config.json` 要放在检出目录根下。
+
+一条命令写完整个文件并打印控制台密码：
+
+```bash
+cd ~/CowAgent
+python3 - <<'PY'
+import json, os, secrets
+
+# 想自己指定就填这里；留空则自动生成。
+CHOOSE_YOUR_PASSWORD = ""
+
+path = os.path.expanduser("~/CowAgent/config.json")
+pwd = CHOOSE_YOUR_PASSWORD or secrets.token_urlsafe(24)
+cfg = {
+    "cow_lang": "en",
+    "channel_type": "web",
+    "model": "MiniMax-M3",
+    "bot_type": "minimax",
+    "minimax_api_base": "https://api.minimaxi.com/v1",
+    "minimax_api_key": "",
+    "web_host": "0.0.0.0",
+    "web_port": 9899,
+    "web_password": pwd,
+    "agent": True,
+    "agent_workspace": os.path.expanduser("~/cow-workspace"),
+}
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+os.chmod(path, 0o600)
+print("console password:", pwd)
+PY
+```
+
+把这个密码记下来，或者以后再读出来 —— `config.json` 权限是 `600`，只有你自己的用户能看：
+
+```bash
+python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/CowAgent/config.json')))['web_password'])"
+```
+
+**还有一样东西能覆盖这个密码。** 启动时 `config.py` 会遍历所有环境变量，把名字小写后，凡是命中 `available_setting` 表里的键，就用环境变量的值替换 `config.json` 里的值。`web_password`、`web_port`、`agent_workspace`、`model`、`bot_type`、`cow_lang` 都在这张表里 —— 所以服务器上若已经 export 了 `WEB_PASSWORD`，控制台要的就是**那个**密码，不是 `config.json` 里这个。发密码之前先查一下：
+
+```bash
+env | grep -E '^(WEB_PASSWORD|WEB_PORT|AGENT_WORKSPACE|MODEL|BOT_TYPE|COW_LANG)='
+```
+
+`web_host` 不在这张表里，`WEB_HOST` 覆盖不了任何东西。
+
+> MiniMax 的域名是 `api.minimaxi.com`，`api.minimax.com` 解析不了。
+
+模型密钥写进环境文件，不写进 `config.json`：
+
+```bash
+mkdir -p ~/.cow ~/cow-workspace
+cat > ~/cow-workspace/.env <<'EOF'
+# CowAgent credentials -- mode 600, never pasted into config.json.
+MINIMAX_API_KEY=sk-REPLACE_WITH_YOUR_KEY
+EOF
+chmod 600 ~/cow-workspace/.env
+cp ~/cow-workspace/.env ~/.cow/.env
+chmod 600 ~/.cow/.env
+```
+
+两份、都是 `600` 权限，是有意的。`~/.cow/.env` 是 agent 自己的凭据工具读的那份，`~/cow-workspace/.env` 是第 5 步导出到进程环境的那份。密钥写一次、复制到两个位置 —— 少了 `~/.cow/.env`，控制台照样能开，但 agent 找不到自己的凭据。
+
+在指望 agent 能对话之前，把占位符换成你供应商给的密钥。没有密钥时控制台和记忆索引照常工作，对话不行 —— 每一次模型调用都会被拒。
+
+`web_host` 决定绑定地址，`web_password` 决定控制台要不要登录。设成 `web_host: 0.0.0.0` 就会绑定所有网卡，与有没有密码无关 —— 密码留空就是局域网里的一个裸奔控制台，启动日志会明说：
+
+```
+[WebChannel] ⚠️  Listening on 0.0.0.0 without web_password set; set an access password in config.json for public deployment
+```
+
+要么两个都设，要么绑 `127.0.0.1` 并用 SSH 隧道访问控制台。
+
+### 5. 启动控制台
+
+```bash
+cd ~/CowAgent
+set -a; . ~/cow-workspace/.env; set +a
+nohup setsid .venv/bin/python app.py > nohup.out 2>&1 &
+```
+
+`nohup.out` 和运行时的 `run.log` 都落在检出目录根下 —— 前者是因为上面的重定向，后者是因为日志写在数据根目录旁边。`.gitignore` 已经排除了 `*.log`、`nohup.out` 和 `config.json`，所以它们都不会让工作区变脏。
+
+确认它起来了：
+
+```bash
+pgrep -af app.py
+ss -ltnp | grep 9899
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:9899/     # 200
+grep -c "SourceTreeWorkspaceError" nohup.out run.log
+```
+
+最后一行是**每个文件各打印一个计数** —— `nohup.out:0` 和 `run.log:0`，不是单独的 `0`。两个都要是零。若 `run.log` 还不存在，这条命令会以 `2` 退出并为那个文件报错；读 `nohup.out` 的计数即可。
+
+然后打开 `http://<server-ip>:9899/`，用第 4 步打印的控制台密码登录。
+
+**上面的命令把控制台跑在 `nohup` 下，重启机器后不会自己起来。** 两条部署路径的差别不止这一条：
+
+| | 手工步骤（上面的 1-6） | `deploy_cowagent_live_memory.sh` |
+| :--- | :--- | :--- |
+| 重启后能自起 | 不能 | 能 —— `systemd`，已设开机自启 |
+| 能否重复执行 | 不能 —— 每一步都要重来 | 能 —— 幂等设计 |
+| 结果如何验收 | 手工逐条看 | 9 条判据，任何一条不过退出码非零 |
+| 是否需要先把脚本拷到服务器 | 不需要 | 需要 —— 先拷过去 |
+
+这个脚本是独立文件，不在本仓库里。把它拷到服务器、**保持 LF 行尾**，然后**用将来拥有这个服务的那个用户**运行：
+
+```bash
+chmod +x deploy_cowagent_live_memory.sh
+./deploy_cowagent_live_memory.sh \
+  --repo https://github.com/paikeywu/CowAgent.git \
+  --branch live-memory \
+  --install /home/<user>/CowAgent \
+  --workspace /home/<user>/cow-workspace \
+  --port 9899
+```
+
+**不要用 `sudo` 跑它。** 脚本只对它需要的 `systemctl`、`tee` 这几条命令自行提权，而 `~/.cow/.env` 和服务的 `HOME` 取自当前环境 —— 在 `sudo` 下它们会变成 root 的家目录，服务用户读不到。
+
+它做的就是上面 1-6 步的事，另外装一个 `systemd` unit，并且只有全部判据通过才退出 `0`。从 Windows 拷过去的文件带 CRLF 行尾，bash 解析不了；脚本第一行会先查这件事，直接给出明确提示，而不是抛一句语法错。
+
+在 `systemd` 下服务由 systemd 托管，挂了会自己起来。unit 长这样：
+
+```ini
+[Unit]
+Description=CowAgent (live-memory branch)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=<user>
+WorkingDirectory=/home/<user>/CowAgent
+ExecStart=/home/<user>/cow-workspace/start-cow.sh
+Restart=always
+RestartSec=5
+UMask=0077
+StandardOutput=append:/home/<user>/cow-workspace/server.log
+StandardError=append:/home/<user>/cow-workspace/server.log
+Environment=HOME=/home/<user>
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`StartLimitIntervalSec=` 和 `StartLimitBurst=` 是 `[Unit]` 段的指令。写在 `[Service]` 段里 systemd 不认识 `StartLimitIntervalSec=`，会直接忽略 —— 启动频率限制就回落到 manager 的默认值（`DefaultStartLimitIntervalSec=`，默认 10 秒），而不是你写的那个间隔；配置写错时 `Restart=always` 撞限额的次数会比预期快好几倍。
+
+unit 启动的是 `~/cow-workspace/start-cow.sh` —— 一个很短的包装脚本，负责 export `~/cow-workspace/.env` 再 `exec` 应用。辅助脚本要放在工作区，**不要**放进检出目录根下 —— `git status` 必须保持干净。
+
+常用命令：
+
+```bash
+sudo systemctl status cowagent                    # 起来了没有，什么时候起的
+sudo systemctl show -p MainPID --value cowagent   # systemd 托管的那个 PID
+ss -ltnp | grep 9899                              # 占着端口的那个 PID
+sudo journalctl -u cowagent -n 50                 # 它自己记了什么
+```
+
+这两个 PID 必须是同一个进程 —— 这才说明控制台跑的是你刚部署的代码，而不是上一轮遗留的旧实例。
+
+### 6. 冒烟测试记忆系统
+
+记忆子系统才值得验证 —— 进程跑着并不能说明检索能用。
+
+```bash
+cd ~/CowAgent
+.venv/bin/python -m pytest tests/ --collect-only -q      # 0 collection errors
+.venv/bin/python -m pytest tests/test_memory_facade.py -q \
+  --deselect tests/test_memory_facade.py::test_tc_b1_junction_to_shared_knowledge \
+  --deselect tests/test_memory_facade.py::test_tc_b2_dangling_junction \
+  --deselect tests/test_memory_facade.py::test_tc_b3_junction_to_default_memory
+```
+
+这三个用例通过 `cmd /c mklink /J` 建 NTFS junction，在 Linux 上跑不了。不加 `--deselect` 它们会失败并报 `FileNotFoundError: [Errno 2] No such file or directory: 'cmd'`。这是分支本身的测试可移植性限制，不是部署坏了。
+
+通过运行时写入路径写一条记忆、建索引、再读回来：
+
+```bash
+cd ~/CowAgent
+.venv/bin/python - <<'PY'
+import asyncio, sys, uuid
+from datetime import datetime
+from pathlib import Path
+sys.path.insert(0, ".")
+from agent.memory.summarizer import ensure_daily_memory_file
+from agent.memory.config import MemoryConfig
+from agent.memory.manager import MemoryManager
+
+WS = Path.home() / "cow-workspace"
+MARKER = "COWDEPLOY-" + uuid.uuid4().hex[:8]
+
+daily = ensure_daily_memory_file(WS)
+with open(daily, "a", encoding="utf-8") as f:
+    f.write("\n## Session Notes (%s)\n\n%s\n" % (datetime.now().strftime("%H:%M"), MARKER))
+
+mgr = MemoryManager(MemoryConfig(workspace_root=str(WS)),
+                    embedding_provider=None, reranker=None)
+try:
+    asyncio.run(mgr.sync(force=True))
+    hits = asyncio.run(mgr.search(MARKER, max_results=10, min_score=0.0))
+    blob = "\n".join(str(getattr(h, "snippet", "") or "") for h in hits)
+    print("hits:", len(hits), "| marker returned:", MARKER in blob)
+    if not hits or MARKER not in blob:
+        sys.exit(1)
+finally:
+    try:
+        mgr.storage.close()
+    except Exception:
+        pass
+PY
+```
+
+输出 `hits: 1 | marker returned: True` 说明记忆写进去了、建索引了、也从真实索引里读回来了。
+
+### 故障排查
+
+**9899 端口被占用**
+
+```bash
+ss -ltnp | grep 9899                      # 谁占着
+lsof -i :9899                             # 或者这个
+```
+
+把那个进程停掉，或改 `config.json` 里的 `web_port`。桌面客户端的端口取自 `COW_WEB_PORT`，不会和源码运行撞车。
+
+**依赖装不上**
+
+```bash
+.venv/bin/python -m pip install -r requirements.txt \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple -v      # -v 能看到真实报错
+```
+
+下载慢或卡住是索引的问题，不是你的网络：换清华镜像。报 `error: externally-managed-environment` 说明装到了系统 Python 上 —— 用 `.venv/bin/python`，别直接用 `pip`。
+
+**`python3 -m venv .venv` 报 "ensurepip is not available"**
+
+缺 `python3-venv` 包。装上再重跑：
+
+```bash
+sudo apt-get install -y python3-venv
+```
+
+**从 Windows 拷过去的脚本报 `syntax error near unexpected token $'in\r'`**
+
+文件是 CRLF 行尾。Linux bash 解析不了 —— 每行结尾都带一个回车符，`case ... in` 变成了 `in\r`。先转成 LF 再执行：
+
+```bash
+sed -i 's/\r$//' deploy.sh
+```
+
+执行前可以先看一眼：
+
+```bash
+file deploy.sh          # CRLF 文件会显示 "with CRLF line terminators"
+```
+
+顺带一提，CRLF 文件里每个空行都会变成只含一个回车符的行，bash 会报 `$'\r': command not found`。这些是噪声 —— 真正的错误是 `case ... in` 那一条。
+
+**`git clone` 失败，或到 GitHub 的网络不稳**
+
+clone 本身没有降级逻辑。走代理的机器可能能访问 `pypi.tuna.tsinghua.edu.cn` 却访问不了 `github.com`。在有网络的机器上 clone 再拷过去：
+
+```bash
+git clone --branch live-memory https://github.com/paikeywu/CowAgent.git CowAgent
+rsync -a CowAgent/ server:/home/<user>/CowAgent/
+```
+
+如果检出目录已经存在、只是 `git fetch` 失败，不必让整个部署失败，用本地分支继续即可：
+
+```bash
+cd ~/CowAgent
+git fetch origin live-memory        # 可能失败；没关系
+git checkout live-memory            # 继续用你手上这份
+```
+
+**`git status` 里有你没创建的文件**
+
+放进检出目录根、且 `.gitignore` 没覆盖的文件都会显示为未跟踪 —— 辅助脚本、`start.sh`、笔记文件都算。`.gitignore` 覆盖了 `config.json`、`nohup.out`、`*.log` 和 `*.egg-info/`，但**不覆盖 `*.sh`**。辅助脚本放 `~/cow-workspace`，或者把它加进 `.gitignore`。
+
+**进程带着 `SourceTreeWorkspaceError` 退出**
+
+```bash
+grep "SourceTreeWorkspaceError" nohup.out run.log
+```
+
+`agent_workspace` 解析到了检出目录里面。把它移出源码树 —— 第 4 步已经指向 `~/cow-workspace`，只有你手改过 `config.json` 才会出这问题。先看现在是什么：
+
+```bash
+grep agent_workspace ~/CowAgent/config.json
+```
+
+重启前先验证：
+
+```bash
+cd ~/CowAgent
+.venv/bin/python -c "
+import sys; sys.path.insert(0, '.')
+from common.state_dir import assert_not_source_tree
+assert_not_source_tree('/home/<user>/cow-workspace'); print('workspace OK')"
+```
+
+**第 4 步打印的控制台密码登不进去**
+
+有环境变量把它覆盖了。启动时 `config.py` 会遍历所有环境变量，把名字小写后，凡是命中 `available_setting` 表里的键，就用环境变量的值替换 `config.json` 里的值 —— `web_password`、`web_port`、`agent_workspace`、`model`、`bot_type`、`cow_lang` 都在这张表里：
+
+```bash
+env | grep -E '^(WEB_PASSWORD|WEB_PORT|AGENT_WORKSPACE|MODEL|BOT_TYPE|COW_LANG)='
+```
+
+`web_host` 不在这张表里，`WEB_HOST` 覆盖不了任何东西。
+
+**`systemd-analyze verify` 报 `Unknown key name 'StartLimitIntervalSec'`**
+
+`StartLimitIntervalSec=` 和 `StartLimitBurst=` 属于 `[Unit]` 段。写在 `[Service]` 段里，systemd 会忽略 `StartLimitIntervalSec=`，启动频率限制悄悄回落到 manager 默认值。把这两行挪进 `[Unit]`。
+
+**服务重启循环之后停在 `failed`**
+
+启动频率限额被打满了。清掉计数再起：
+
+```bash
+sudo systemctl reset-failed cowagent
+sudo systemctl restart cowagent
+```
+
+**控制台返回 401**
+
+`web_password` 设了，而你没带凭据。先登录 —— 登录接口是 `POST /auth/login`，body 为 `{"password": "..."}`，返回一个 token 并设置 `cow_auth_token` cookie。
+
+**控制台能开，但每条消息都报错**
+
+模型密钥还是占位符，或者压根没加载。检查文件并重启服务：
+
+```bash
+grep MINIMAX_API_KEY ~/cow-workspace/.env
+```
+<br/>
+
 ## 👥 多智能体团队
 
 支持创建多个 Agent 组成团队，每个成员拥有独立的记忆、能力、知识与工作空间，既能专注各自领域，也能在同一会话中通过协作完成复杂任务。多 Agent 团队支持在 Web 端、桌面客户端、IM 通道接入端使用。

@@ -110,3 +110,14 @@ docker/agent-mail-data/
 /MEMORY.md
 /tmp_wx.txt
 
+# CowAgent 的**工作区骨架**也是运行时状态，同一个病根：
+# 有一次运行把仓库本身当成了工作区根，于是它把自己的身份文件
+# (AGENT.md / USER.md / RULE.md / BOOTSTRAP.md) 和知识库 (knowledge/)
+# 写进了源码树。这些不是本仓库的源码 —— 本仓库是「跑 CowAgent 的东西」，
+# 不是「CowAgent 的工作区」。
+/AGENT.md
+/USER.md
+/RULE.md
+/BOOTSTRAP.md
+/knowledge/
+

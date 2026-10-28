@@ -120,6 +120,10 @@ Run CowAgent from source on a headless Ubuntu host. The steps below were run on
 an Ubuntu 26.04 LTS server (Python 3.14.4). Copy the blocks in order; each one
 is complete and copy-pasteable on its own.
 
+Two ways to deploy are described here: the manual steps (1-6), which run the
+console under `nohup`, and the deployment script, which installs a `systemd`
+service and verifies the result. Step 5 compares the two.
+
 ### Prerequisites
 
 | Requirement | Value | Why |
@@ -135,10 +139,15 @@ is complete and copy-pasteable on its own.
 > described in step 4, with mode `600`. The console password does live in
 > `config.json`, so that file stays mode `600` as well.
 
+`curl` and `ss` are on the package list because the checks further down need
+them: `curl` sends every request to the console, and `ss` reports which
+process holds the port. On a minimal Ubuntu image `curl` is often absent and
+`ss` arrives with `iproute2`.
+
 ### 1. Get the code
 
 ```bash
-sudo apt-get update && sudo apt-get install -y git curl python3-venv lsof
+sudo apt-get update && sudo apt-get install -y git curl python3-venv lsof iproute2
 git clone --branch live-memory https://github.com/paikeywu/CowAgent.git ~/CowAgent
 cd ~/CowAgent
 git rev-parse --abbrev-ref HEAD     # must print: live-memory
@@ -149,8 +158,10 @@ git rev-parse HEAD                  # record this -- it is the commit you deploy
 **not** the branch these steps were written against — `--branch live-memory` is
 what puts the deployed code on disk. The deployment was verified against commit
 `5df9d27052996923fa05d1cd3c4c6c98ec1bc297`; the hash printed above is whatever
-`live-memory` points at right now. If the two differ, you are on a newer
-commit of the same branch — read the diff before trusting the steps.
+`live-memory` points at right now. As of this writing the only commit after the
+verified one is `42ca91ab`, which adds these instructions and changes no code —
+so the steps still describe the code you are about to run. If the two differ by
+more than a documentation commit, read the diff before trusting the steps.
 
 `python3-venv` is in that package list because Ubuntu ships the system
 interpreter without it. Without the package, `python3 -m venv` in step 2 fails
@@ -181,6 +192,12 @@ fails with `error: externally-managed-environment` and tells you to pass
 of its own packages and can break the system Python — do not use it. The
 virtualenv is the isolation mechanism, and it needs no extra package.
 
+`pip install -e .` installs this repository as an editable package. That is
+what puts the `cow` command on your PATH (`cow start`, `cow status`,
+`cow logs`), which the Quick Start section above refers to. It creates a
+`cowagent.egg-info/` directory in the checkout; `.gitignore` already excludes
+it, so the working tree stays clean.
+
 ### 3. Point the runtime state outside the source tree
 
 ```bash
@@ -209,6 +226,13 @@ workspace anywhere under a checkout is rejected. Point it at `~/cow-workspace`
 
 `config.json` lives next to the checkout (`~/CowAgent/config.json`) for source
 deployments. `COW_DATA_DIR` overrides it if you keep user data elsewhere.
+
+That path is not a convention — it is what the code does. `config.py` builds the
+path as `os.path.join(get_data_root(), "config.json")`, and `get_data_root()`
+falls back to the repository root when `COW_DATA_DIR` is unset. The desktop
+client sets `COW_DATA_DIR=~/.cow`, so **`~/.cow/config.json` is the desktop
+client's file and a source deployment never reads it**. Put the source
+deployment's `config.json` in the checkout root.
 
 One command writes the whole file and prints the console password, so you have
 it in front of you:
@@ -251,6 +275,20 @@ so only your own user can see it:
 python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/CowAgent/config.json')))['web_password'])"
 ```
 
+**One thing can still override that password.** At startup `config.py` walks
+every environment variable, lowercases the name, and any name that matches a
+key in its `available_setting` table replaces the value from `config.json`.
+`web_password`, `web_port`, `agent_workspace`, `model`, `bot_type` and
+`cow_lang` are all in that table — so if the server already exports
+`WEB_PASSWORD`, the console asks for *that* password and not the one in
+`config.json`. Check before you hand the password out:
+
+```bash
+env | grep -E '^(WEB_PASSWORD|WEB_PORT|AGENT_WORKSPACE|MODEL|BOT_TYPE|COW_LANG)='
+```
+
+`web_host` is not in the table, so `WEB_HOST` does not override anything.
+
 > The MiniMax endpoint is `api.minimaxi.com`. `api.minimax.com` does not
 > resolve.
 
@@ -267,11 +305,15 @@ cp ~/cow-workspace/.env ~/.cow/.env
 chmod 600 ~/.cow/.env
 ```
 
+Two copies, both mode `600`, on purpose. `~/.cow/.env` is the copy the agent's
+own credential tool reads; `~/cow-workspace/.env` is the one step 5 exports
+into the process environment. Write the key once and copy it to both — a
+missing `~/.cow/.env` leaves the console up but the agent unable to find its
+credentials.
+
 Replace the placeholder with the key from your provider before you expect the
 agent to answer. The console and the memory index work without it; chat does
-not, because every model call is rejected. `~/.cow/.env` is the copy the
-agent's own credential tool reads; `~/cow-workspace/.env` is the one step 5
-exports into the process environment.
+not, because every model call is rejected.
 
 `web_host` decides the bind address; `web_password` decides whether the console
 asks for a login. Setting `web_host: 0.0.0.0` binds every interface whether or
@@ -292,20 +334,111 @@ set -a; . ~/cow-workspace/.env; set +a
 nohup setsid .venv/bin/python app.py > nohup.out 2>&1 &
 ```
 
+`nohup.out` and the runtime `run.log` both land in the checkout root — the
+first because the command above redirects there, the second because the logger
+writes it next to the data root. `.gitignore` already excludes `*.log`,
+`nohup.out` and `config.json`, so none of them makes the working tree dirty.
+
 Check that it came up:
 
 ```bash
 pgrep -af app.py
 ss -ltnp | grep 9899
 curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:9899/     # 200
-grep -c "SourceTreeWorkspaceError" nohup.out run.log                # 0
+grep -c "SourceTreeWorkspaceError" nohup.out run.log
 ```
+
+The last line prints one count per file — `nohup.out:0` and `run.log:0` — not a
+bare `0`. You want zero on both. If `run.log` does not exist yet the command
+still exits `2` and prints an error for that file; read the `nohup.out` count.
 
 Then open `http://<server-ip>:9899/` and sign in with the console password
 printed in step 4.
 
-The service runs under `nohup`, so it does not come back after a reboot. Put
-it under `systemd` if you need it to.
+**The command above runs the console under `nohup`, so it does not come back
+after a reboot.** The two deployment paths differ in more than that:
+
+| | Manual steps (1-6 above) | `deploy_cowagent_live_memory.sh` |
+| :--- | :--- | :--- |
+| Survives a reboot | no | yes - `systemd`, enabled at boot |
+| Re-runnable | no - every step again | yes - idempotent by design |
+| Result verified | by hand | 9 checks; the exit code is non-zero if any fails |
+| Needs the script on the server | no | yes - copy it over first |
+
+The script is a standalone file, not part of this repository. Copy it to the
+server, keep its line endings as LF, and run it **as the user that will own
+the service**:
+
+```bash
+chmod +x deploy_cowagent_live_memory.sh
+./deploy_cowagent_live_memory.sh \
+  --repo https://github.com/paikeywu/CowAgent.git \
+  --branch live-memory \
+  --install /home/<user>/CowAgent \
+  --workspace /home/<user>/cow-workspace \
+  --port 9899
+```
+
+Do not run it with `sudo`. The script elevates only the individual
+`systemctl` and `tee` calls it needs, and it writes `~/.cow/.env` and the
+service's `HOME` from the current environment - under `sudo` those become
+root's home, where the service user cannot read them.
+
+It performs the same steps 1-6 do, installs a `systemd` unit, and exits `0`
+only when every check passes. A file copied from Windows arrives with CRLF
+line endings, which bash cannot parse; the script's first line checks for that
+and stops with a clear message instead of a syntax error.
+
+Under `systemd` the service is supervised and comes back on its own. The unit
+looks like this:
+
+```ini
+[Unit]
+Description=CowAgent (live-memory branch)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=<user>
+WorkingDirectory=/home/<user>/CowAgent
+ExecStart=/home/<user>/cow-workspace/start-cow.sh
+Restart=always
+RestartSec=5
+UMask=0077
+StandardOutput=append:/home/<user>/cow-workspace/server.log
+StandardError=append:/home/<user>/cow-workspace/server.log
+Environment=HOME=/home/<user>
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`StartLimitIntervalSec=` and `StartLimitBurst=` are `[Unit]` directives. In
+`[Service]` systemd does not know `StartLimitIntervalSec=` and ignores it, so
+the start rate limit falls back to the manager default
+(`DefaultStartLimitIntervalSec=`, 10 seconds) rather than the interval you
+wrote - and `Restart=always` with a broken configuration then trips the limit
+several times faster than intended.
+
+The unit starts `~/cow-workspace/start-cow.sh`, a short wrapper that exports
+`~/cow-workspace/.env` and then `exec`s the app. Helper scripts belong in the
+workspace, not in the checkout root - `git status` has to stay clean.
+
+Useful commands:
+
+```bash
+sudo systemctl status cowagent                    # is it up, and since when
+sudo systemctl show -p MainPID --value cowagent   # the PID systemd supervises
+ss -ltnp | grep 9899                              # the PID holding the port
+sudo journalctl -u cowagent -n 50                 # what it logged
+```
+
+Those two PIDs must be the same process. That is what proves the console is
+serving the code you just deployed and not a stale instance left over from an
+earlier run.
 
 ### 6. Smoke-test the memory system
 
@@ -397,6 +530,53 @@ The `python3-venv` package is missing. Install it and run the command again:
 sudo apt-get install -y python3-venv
 ```
 
+**A shell script you copied from Windows fails with `syntax error near unexpected token $'in\r'`**
+
+The file has CRLF line endings. Linux bash cannot parse it — every line ends
+with a carriage return, and the `case ... in` keyword becomes `in\r`. Convert
+the file before running it:
+
+```bash
+sed -i 's/\r$//' deploy.sh
+```
+
+Check before you run:
+
+```bash
+file deploy.sh          # a CRLF file says "with CRLF line terminators"
+```
+
+Note that a CRLF file also makes every blank line into a line holding only a
+carriage return, which bash reports as `$'\r': command not found`. Those
+messages are noise — the real error is the `case ... in` one.
+
+**`git clone` fails, or the network to GitHub is unreliable**
+
+Clone does not have a fallback built in, and a server behind a proxy may reach
+`pypi.tuna.tsinghua.edu.cn` but not `github.com`. Clone on a machine that has
+access and copy the directory over:
+
+```bash
+git clone --branch live-memory https://github.com/paikeywu/CowAgent.git CowAgent
+rsync -a CowAgent/ server:/home/<user>/CowAgent/
+```
+
+If the checkout already exists and only `git fetch` is failing, you can keep
+the local branch instead of aborting the whole deployment:
+
+```bash
+cd ~/CowAgent
+git fetch origin live-memory        # may fail; that is fine
+git checkout live-memory            # serve what you already have
+```
+
+**`git status` shows files you did not create**
+
+Anything you put in the checkout root that `.gitignore` does not cover shows up
+as untracked — a helper shell script, a `start.sh`, a notes file. `.gitignore`
+covers `config.json`, `nohup.out`, `*.log` and `*.egg-info/`, but not `*.sh`.
+Keep helper scripts in `~/cow-workspace`, or add the file to `.gitignore`.
+
 **The app dies with `SourceTreeWorkspaceError`**
 
 ```bash
@@ -419,6 +599,35 @@ cd ~/CowAgent
 import sys; sys.path.insert(0, '.')
 from common.state_dir import assert_not_source_tree
 assert_not_source_tree('/home/<user>/cow-workspace'); print('workspace OK')"
+```
+
+**The console password printed in step 4 does not work**
+
+An environment variable overrides it. At startup `config.py` walks every
+environment variable and replaces any `config.json` value whose lowercased name
+is in its `available_setting` table - `web_password`, `web_port`,
+`agent_workspace`, `model`, `bot_type` and `cow_lang` are all in it:
+
+```bash
+env | grep -E '^(WEB_PASSWORD|WEB_PORT|AGENT_WORKSPACE|MODEL|BOT_TYPE|COW_LANG)='
+```
+
+`web_host` is not in the table, so `WEB_HOST` changes nothing.
+
+**`systemd-analyze verify` reports `Unknown key name 'StartLimitIntervalSec'`**
+
+`StartLimitIntervalSec=` and `StartLimitBurst=` belong to the `[Unit]`
+section. Placed in `[Service]`, systemd ignores `StartLimitIntervalSec=` and
+the start rate limit silently falls back to the manager default. Move both
+lines into `[Unit]`.
+
+**The service sits in `failed` after a crash loop**
+
+The start rate limit has been reached. Clear the counter and start it again:
+
+```bash
+sudo systemctl reset-failed cowagent
+sudo systemctl restart cowagent
 ```
 
 **The console returns 401**
