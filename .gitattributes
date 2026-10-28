@@ -1,0 +1,13 @@
+# 强制 shell 脚本以 LF 行尾检出。
+#
+# 背景：Windows 上 core.autocrlf=true，工作区里的 *.sh 全是 CRLF
+# （git ls-files --eol "*.sh" → i/lf w/crlf attr/）。
+# 从 Windows 工作区手工拷到 Linux 的脚本，第一行就崩：
+#   line 47: syntax error near unexpected token $'in\r''
+#   set: pipefail\r: invalid option name
+#
+# 服务器 git clone 出来本来就是 LF，所以仓库自带脚本没事，
+# 出事的是从 Windows 手工拷过去的。
+* text=auto
+*.sh text eol=lf
+*.bash text eol=lf

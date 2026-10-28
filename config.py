@@ -445,19 +445,57 @@ class Config(dict):
 config = Config()
 
 
+# 敏感词元：键名里出现任一即视为凭据。
+# 历史缺陷：判据只有 ("key" in k or "secret" in k)，
+# 于是 web_password / external_api_token 根本不在覆盖范围 ——
+# 实测目标机 run.log 里 web_password 明文出现 27 次（文件权限 664）。
+# 覆盖面按"会出现在配置里的凭据名"枚举，不靠猜。
+_SENSITIVE_TOKENS = (
+    "key",
+    "secret",
+    "password",
+    "passwd",
+    "pwd",
+    "token",
+    "credential",
+    "auth",
+)
+
+
+def _is_sensitive_key(k) -> bool:
+    kl = str(k).lower()
+    return any(t in kl for t in _SENSITIVE_TOKENS)
+
+
 def _mask_value(val):
-    """Mask a sensitive string value, keeping first 3 and last 3 chars."""
-    if not isinstance(val, str) or len(val) <= 8:
+    """完全遮蔽敏感值，只留下"设了没有 / 多长"这类可观测信息。
+
+    与旧实现的三点差异，都是为了堵真实的漏：
+      1. 旧实现只保留首 3 尾 3 字符 —— 对密码而言那仍是 6 个字符的泄露。
+      2. 旧实现对长度 <= 8 的值**原样返回** —— 短密码等于没脱敏。
+      3. 旧实现只处理 str —— 数字密码（如 123456）会原样打印。
+    代价：日志里不再能看出"这个 key 是 sk- 开头的"这类前缀信息。
+    补偿：键名仍在、长度仍在，"是否已设置"一眼可辨。
+    """
+    if val is None:
+        return None
+    if isinstance(val, bool):
         return val
-    return val[0:3] + "*" * 5 + val[-3:]
+    if isinstance(val, (int, float)):
+        return "***"
+    if isinstance(val, str):
+        if not val:
+            return val
+        return "***(%d chars)" % len(val)
+    return "***"
 
 
 def _mask_sensitive_recursive(obj):
-    """Recursively mask values whose keys contain 'key' or 'secret'."""
+    """递归遮蔽敏感键的值。键敏感就遮蔽，与值的类型无关。"""
     if isinstance(obj, dict):
         masked = {}
         for k, v in obj.items():
-            if ("key" in k or "secret" in k) and isinstance(v, str):
+            if _is_sensitive_key(k):
                 masked[k] = _mask_value(v)
             else:
                 masked[k] = _mask_sensitive_recursive(v)
