@@ -102,7 +102,8 @@ Once started, open `http://localhost:9899` to access the **Web console** — you
 
 After installation, manage the service with the [cow CLI](https://docs.cowagent.ai/cli/index):
 
-```textcow start | stop | restart        # service control
+```text
+cow start | stop | restart        # service control
 cow status | logs                  # status and logs
 cow update                         # pull latest code and restart
 cow skill install <name>           # install a skill
@@ -157,9 +158,15 @@ git rev-parse HEAD                  # record this -- it is the commit you deploy
 **not** the branch these steps were written against — `--branch live-memory` is
 what puts the deployed code on disk. The deployment was verified against commit
 `5df9d27052996923fa05d1cd3c4c6c98ec1bc297`; the hash printed above is whatever
-`live-memory` points at right now. Four commits landed on this branch after the
+`live-memory` points at right now. Several commits landed on this branch after the
 verified one, and one of them (`025e80af`) changes `config.py` — it reworks
-credential masking in the startup log. Read the diff before trusting the steps:
+credential masking in the startup log. List them and read the diff before
+trusting the steps:
+
+```bash
+git log --oneline 5df9d27052996923fa05d1cd3c4c6c98ec1bc297..HEAD
+git diff 5df9d27052996923fa05d1cd3c4c6c98ec1bc297..HEAD -- config.py
+```
 
 ```bash
 git diff 5df9d27052996923fa05d1cd3c4c6c98ec1bc297..HEAD -- config.py
@@ -370,7 +377,7 @@ after a reboot.** The two deployment paths differ in more than that:
 | :--- | :--- | :--- |
 | Survives a reboot | no | yes - `systemd`, enabled at boot |
 | Re-runnable | no - every step again | yes - idempotent by design |
-| Result verified | by hand | 12 checks (9 fail the run; 3 report status only) |
+| Result verified | by hand | 10 checks (9 fail the run; 1 reports status only) |
 | Needs the script on the server | no | yes - copy it over first |
 
 The script is a standalone file, not part of this repository. Its single source
@@ -752,7 +759,8 @@ Learn more: [Tools overview](https://docs.cowagent.ai/tools/index) · [MCP integ
 - **GitHub / ClawHub / URL and more** — install skills from any source
 - **Conversational authoring** — generate custom skills through dialogue with `skill-creator`; turn any workflow or third-party API into a reusable skill
 
-```text/skill list                   # list installed skills
+```text
+/skill list                   # list installed skills
 /skill search <keyword>        # search the marketplace
 /skill install <name>          # one-click install
 ```

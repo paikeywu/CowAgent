@@ -102,7 +102,8 @@ docker compose up -d
 
 安装后可使用 `cow` [CLI 命令](https://docs.cowagent.ai/zh/cli) 管理服务：
 
-```textcow start | stop | restart        # 服务管理
+```text
+cow start | stop | restart        # 服务管理
 cow status | logs                  # 状态和日志
 cow update                         # 拉取最新代码并重启
 cow skill install <名称>           # 安装技能
@@ -144,7 +145,7 @@ git rev-parse --abbrev-ref HEAD     # 必须输出：live-memory
 git rev-parse HEAD                  # 记下这个值 —— 就是你部署的提交
 ```
 
-只写 `git clone` 会检出默认分支（`master`），**不是**这些步骤对应的分支 —— `--branch live-memory` 才把要部署的代码放上磁盘。部署实测基于提交 `5df9d27052996923fa05d1cd3c4c6c98ec1bc297`；上面打印的哈希是 `live-memory` 当前指向的提交。此后这个分支上又落了 4 个提交，其中 `025e80af` 改的是 `config.py`（重做启动日志里的凭据脱敏）。信任这些步骤之前先读 diff：
+只写 `git clone` 会检出默认分支（`master`），**不是**这些步骤对应的分支 —— `--branch live-memory` 才把要部署的代码放上磁盘。部署实测基于提交 `5df9d27052996923fa05d1cd3c4c6c98ec1bc297`；上面打印的哈希是 `live-memory` 当前指向的提交。此后这个分支上又落了若干个提交，其中 `025e80af` 改的是 `config.py`（重做启动日志里的凭据脱敏）。信任这些步骤之前先列出来自己数，再读 diff：
 
 ```bash
 git diff 5df9d27052996923fa05d1cd3c4c6c98ec1bc297..HEAD -- config.py
@@ -302,7 +303,7 @@ grep -c "SourceTreeWorkspaceError" nohup.out run.log
 | :--- | :--- | :--- |
 | 重启后能自起 | 不能 | 能 —— `systemd`，已设开机自启 |
 | 能否重复执行 | 不能 —— 每一步都要重来 | 能 —— 幂等设计 |
-| 结果如何验收 | 手工逐条看 | 12 条判据（其中 9 条不过就非零退出，另 3 条只报状态） |
+| 结果如何验收 | 手工逐条看 | 10 条判据（其中 9 条不过就非零退出，另 1 条只报状态） |
 | 是否需要先把脚本拷到服务器 | 不需要 | 需要 —— 先拷过去 |
 
 这个脚本是独立文件，不在本仓库里。它的单一真源是运维机器上的
@@ -641,7 +642,8 @@ CowAgent 支持国内外主流厂商的大语言模型。**文本对话、图像
 - **GitHub / ClawHub / URL 等** — 任意来源一键安装
 - **对话创造** — 通过 `skill-creator` 用对话快速生成自定义技能，可将工作流程或第三方接口直接固化为技能
 
-```text/skill list                   # 查看当前技能
+```text
+/skill list                   # 查看当前技能
 /skill search <关键词>         # 在技能广场搜索
 /skill install <名称>          # 一键安装
 ```
