@@ -114,6 +114,329 @@ cow install-browser                # install browser automation
 
 <br/>
 
+## 🖥️ Deploy on an Ubuntu Server
+
+Run CowAgent from source on a headless Ubuntu host. The steps below were run on
+an Ubuntu 26.04 LTS server (Python 3.14.4). Copy the blocks in order; each one
+is complete and copy-pasteable on its own.
+
+### Prerequisites
+
+| Requirement | Value | Why |
+| :--- | :--- | :--- |
+| OS | Ubuntu 26.04 LTS | step 1 installs packages with `apt-get` |
+| Python | 3.14 (`python3 -V`) | `python3 -m venv` gives an isolated interpreter |
+| Disk | ~2 GB free | ~390 MB virtualenv + ~40 MB checkout |
+| Package index | `https://pypi.tuna.tsinghua.edu.cn/simple` | the official PyPI can be unusably slow from some networks |
+| Outbound HTTPS | `github.com`, `pypi.tuna.tsinghua.edu.cn` | clone + dependencies |
+| Open port | `9899/tcp` | the Web console |
+
+> The model key never goes into `config.json`. Keep it in the `.env` file
+> described in step 4, with mode `600`. The console password does live in
+> `config.json`, so that file stays mode `600` as well.
+
+### 1. Get the code
+
+```bash
+sudo apt-get update && sudo apt-get install -y git curl python3-venv lsof
+git clone --branch live-memory https://github.com/paikeywu/CowAgent.git ~/CowAgent
+cd ~/CowAgent
+git rev-parse --abbrev-ref HEAD     # must print: live-memory
+git rev-parse HEAD                  # record this -- it is the commit you deployed
+```
+
+`git clone` on its own checks out the default branch (`master`), which is
+**not** the branch these steps were written against — `--branch live-memory` is
+what puts the deployed code on disk. The deployment was verified against commit
+`5df9d27052996923fa05d1cd3c4c6c98ec1bc297`; the hash printed above is whatever
+`live-memory` points at right now. If the two differ, you are on a newer
+commit of the same branch — read the diff before trusting the steps.
+
+`python3-venv` is in that package list because Ubuntu ships the system
+interpreter without it. Without the package, `python3 -m venv` in step 2 fails
+with `ensurepip is not available`. `lsof` is what the port check in the
+troubleshooting section uses.
+
+### 2. Create a virtualenv and install the dependencies
+
+```bash
+cd ~/CowAgent
+python3 -m venv .venv
+.venv/bin/python -V                                   # Python 3.14.x
+.venv/bin/python -m pip install --upgrade pip setuptools wheel \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple
+.venv/bin/python -m pip install -r requirements.txt \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple
+.venv/bin/python -m pip install -e . \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple
+.venv/bin/python -m pip check                         # No broken requirements found.
+.venv/bin/python -m pip install pytest \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple        # not in requirements.txt; step 6 needs it
+```
+
+**Use the virtualenv, not the system Python.** On a current Ubuntu the system
+interpreter is marked externally managed (PEP 668), so `pip install` into it
+fails with `error: externally-managed-environment` and tells you to pass
+`--break-system-packages`. That flag bypasses the operating system's protection
+of its own packages and can break the system Python — do not use it. The
+virtualenv is the isolation mechanism, and it needs no extra package.
+
+### 3. Point the runtime state outside the source tree
+
+```bash
+mkdir -p ~/cow-workspace
+```
+
+`agent_workspace` must point at a directory that is **not** inside the git
+checkout. The runtime state (the memory index, scheduler store, skills) belongs
+to whoever runs the app, not to the repository — a clone must never hand
+someone else's `memory/long-term/index.db` to a new user.
+
+This is enforced at startup. With `agent_workspace` pointing inside the
+checkout, the process refuses to start with:
+
+```
+common.state_dir.SourceTreeWorkspaceError: 工作区位于源码树内，拒绝把运行时状态写进源码树：'/home/<user>/CowAgent' 在 '/home/<user>/CowAgent' 之内。
+  运行时状态（memory/long-term/index.db 等）属于运行它的人，不属于仓库；它一旦进入版本库，clone 的人会拿到别人的记忆索引。
+  请把 agent_workspace / workspace 指向一个工作区目录（例如 %USERPROFILE%\cow），而不是源码目录。
+```
+
+The check walks up from the workspace looking for a `.git` ancestor, so a
+workspace anywhere under a checkout is rejected. Point it at `~/cow-workspace`
+(or any directory outside the tree) and the app boots.
+
+### 4. Write `config.json` and the credentials file
+
+`config.json` lives next to the checkout (`~/CowAgent/config.json`) for source
+deployments. `COW_DATA_DIR` overrides it if you keep user data elsewhere.
+
+One command writes the whole file and prints the console password, so you have
+it in front of you:
+
+```bash
+cd ~/CowAgent
+python3 - <<'PY'
+import json, os, secrets
+
+# Set your own password here if you prefer one you can type from memory.
+# Leave it empty and one is generated for you.
+CHOOSE_YOUR_PASSWORD = ""
+
+path = os.path.expanduser("~/CowAgent/config.json")
+pwd = CHOOSE_YOUR_PASSWORD or secrets.token_urlsafe(24)
+cfg = {
+    "cow_lang": "en",
+    "channel_type": "web",
+    "model": "MiniMax-M3",
+    "bot_type": "minimax",
+    "minimax_api_base": "https://api.minimaxi.com/v1",
+    "minimax_api_key": "",
+    "web_host": "0.0.0.0",
+    "web_port": 9899,
+    "web_password": pwd,
+    "agent": True,
+    "agent_workspace": os.path.expanduser("~/cow-workspace"),
+}
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+os.chmod(path, 0o600)
+print("console password:", pwd)
+PY
+```
+
+Write that password down, or read it back later — `config.json` is mode `600`,
+so only your own user can see it:
+
+```bash
+python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/CowAgent/config.json')))['web_password'])"
+```
+
+> The MiniMax endpoint is `api.minimaxi.com`. `api.minimax.com` does not
+> resolve.
+
+The model key goes into an environment file, not into `config.json`:
+
+```bash
+mkdir -p ~/.cow ~/cow-workspace
+cat > ~/cow-workspace/.env <<'EOF'
+# CowAgent credentials -- mode 600, never pasted into config.json.
+MINIMAX_API_KEY=sk-REPLACE_WITH_YOUR_KEY
+EOF
+chmod 600 ~/cow-workspace/.env
+cp ~/cow-workspace/.env ~/.cow/.env
+chmod 600 ~/.cow/.env
+```
+
+Replace the placeholder with the key from your provider before you expect the
+agent to answer. The console and the memory index work without it; chat does
+not, because every model call is rejected. `~/.cow/.env` is the copy the
+agent's own credential tool reads; `~/cow-workspace/.env` is the one step 5
+exports into the process environment.
+
+`web_host` decides the bind address; `web_password` decides whether the console
+asks for a login. Setting `web_host: 0.0.0.0` binds every interface whether or
+not a password is set — leave the password empty and that is an open console on
+your LAN, and the startup log says so:
+
+```
+[WebChannel] ⚠️  Listening on 0.0.0.0 without web_password set; set an access password in config.json for public deployment
+```
+
+Set both, or bind `127.0.0.1` and reach the console through an SSH tunnel.
+
+### 5. Start the console
+
+```bash
+cd ~/CowAgent
+set -a; . ~/cow-workspace/.env; set +a
+nohup setsid .venv/bin/python app.py > nohup.out 2>&1 &
+```
+
+Check that it came up:
+
+```bash
+pgrep -af app.py
+ss -ltnp | grep 9899
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:9899/     # 200
+grep -c "SourceTreeWorkspaceError" nohup.out run.log                # 0
+```
+
+Then open `http://<server-ip>:9899/` and sign in with the console password
+printed in step 4.
+
+The service runs under `nohup`, so it does not come back after a reboot. Put
+it under `systemd` if you need it to.
+
+### 6. Smoke-test the memory system
+
+The memory subsystem is the part worth verifying — a running process proves
+nothing about retrieval.
+
+```bash
+cd ~/CowAgent
+.venv/bin/python -m pytest tests/ --collect-only -q      # 0 collection errors
+.venv/bin/python -m pytest tests/test_memory_facade.py -q \
+  --deselect tests/test_memory_facade.py::test_tc_b1_junction_to_shared_knowledge \
+  --deselect tests/test_memory_facade.py::test_tc_b2_dangling_junction \
+  --deselect tests/test_memory_facade.py::test_tc_b3_junction_to_default_memory
+```
+
+Those three cases build NTFS junctions through `cmd /c mklink /J` and cannot
+run on Linux. Without the `--deselect` flags they fail with
+`FileNotFoundError: [Errno 2] No such file or directory: 'cmd'`. That is a
+test-portability limitation of the branch, not a broken deployment.
+
+Write a memory through the runtime write path, index it, and read it back:
+
+```bash
+cd ~/CowAgent
+.venv/bin/python - <<'PY'
+import asyncio, sys, uuid
+from datetime import datetime
+from pathlib import Path
+sys.path.insert(0, ".")
+from agent.memory.summarizer import ensure_daily_memory_file
+from agent.memory.config import MemoryConfig
+from agent.memory.manager import MemoryManager
+
+WS = Path.home() / "cow-workspace"
+MARKER = "COWDEPLOY-" + uuid.uuid4().hex[:8]
+
+daily = ensure_daily_memory_file(WS)
+with open(daily, "a", encoding="utf-8") as f:
+    f.write("\n## Session Notes (%s)\n\n%s\n" % (datetime.now().strftime("%H:%M"), MARKER))
+
+mgr = MemoryManager(MemoryConfig(workspace_root=str(WS)),
+                    embedding_provider=None, reranker=None)
+try:
+    asyncio.run(mgr.sync(force=True))
+    hits = asyncio.run(mgr.search(MARKER, max_results=10, min_score=0.0))
+    blob = "\n".join(str(getattr(h, "snippet", "") or "") for h in hits)
+    print("hits:", len(hits), "| marker returned:", MARKER in blob)
+    if not hits or MARKER not in blob:
+        sys.exit(1)
+finally:
+    try:
+        mgr.storage.close()
+    except Exception:
+        pass
+PY
+```
+
+`hits: 1 | marker returned: True` means the memory was written, indexed, and
+read back out of the real index.
+
+### Troubleshooting
+
+**Port 9899 already in use**
+
+```bash
+ss -ltnp | grep 9899                      # which process holds it
+lsof -i :9899                             # or this
+```
+
+Stop that process, or change `web_port` in `config.json`. The desktop client
+picks its port from `COW_WEB_PORT`, so it never collides with a source run.
+
+**Dependencies will not install**
+
+```bash
+.venv/bin/python -m pip install -r requirements.txt \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple -v      # -v shows the real error
+```
+
+A slow or stalled download is the index, not your network: switch to the
+Tsinghua mirror. `error: externally-managed-environment` means the install
+ran against the system Python — use `.venv/bin/python`, never `pip` on its own.
+
+**`python3 -m venv .venv` fails with "ensurepip is not available"**
+
+The `python3-venv` package is missing. Install it and run the command again:
+
+```bash
+sudo apt-get install -y python3-venv
+```
+
+**The app dies with `SourceTreeWorkspaceError`**
+
+```bash
+grep "SourceTreeWorkspaceError" nohup.out run.log
+```
+
+`agent_workspace` resolves inside the git checkout. Move it out of the tree —
+step 4 already points it at `~/cow-workspace`, so this only happens if you
+edited `config.json` by hand. Check what it says now:
+
+```bash
+grep agent_workspace ~/CowAgent/config.json
+```
+
+Verify before restarting:
+
+```bash
+cd ~/CowAgent
+.venv/bin/python -c "
+import sys; sys.path.insert(0, '.')
+from common.state_dir import assert_not_source_tree
+assert_not_source_tree('/home/<user>/cow-workspace'); print('workspace OK')"
+```
+
+**The console returns 401**
+
+`web_password` is set and you are sending no credentials. Sign in first — the
+login endpoint is `POST /auth/login` with `{"password": "..."}`, which returns
+a token and a `cow_auth_token` cookie.
+
+**The console loads, but every message comes back as an error**
+
+The model key is still the placeholder, or it was never loaded. Check the file
+and restart the service:
+
+```bash
+grep MINIMAX_API_KEY ~/cow-workspace/.env
+```
+
+<br/>
 ## 👥 Multi-Agent Team
 
 Create a team of Agents, each with its own memory, capabilities, knowledge, and workspace. Each can focus on its own domain, or collaborate within a shared conversation to tackle complex tasks together. Multi-Agent teams are available on the Web, the desktop client, and IM channel integrations.
