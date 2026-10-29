@@ -50,9 +50,24 @@ from agent.memory.body_pointer import (
 )
 from agent.memory.storage import MemoryChunk, MemoryStorage
 
-#: The chunker version stamped into ``files.chunker_version``. Bump it when the
-#: cutting strategy changes, so a probe can re-cut the same way.
-CHUNKER_VERSION = 3
+#: The chunker version stamped into ``files.chunker_version``.
+#:
+#: P1-阶段三 第五轮 (F-2): this used to be a LOCAL constant with the value
+#: 3, while ``chunker.TextChunker.CHUNKER_VERSION`` was 4 and
+#: ``migrate.CHUNKER_VERSION`` was 4.  A rebuild therefore wrote
+#: ``files.chunker_version = 3`` into a library whose rows were cut by the
+#: v4 algorithm — and the C-A3 criterion compares that column against
+#: ``TextChunker.CHUNKER_VERSION`` (4) → a rebuild turned a green library
+#: red.  Measured on this machine: all 16 libraries still carried 3
+#: (ROOT: {3: 89, 0: 1}).
+#:
+#: **The version number is a FACT about the algorithm, so it lives with the
+#: algorithm.**  Three modules that each spelled it out is exactly how they
+#: drift apart.  The single source is ``chunker.TextChunker.CHUNKER_VERSION``;
+#: this module re-exports it so the existing call sites keep working.
+from agent.memory.chunker import TextChunker as _TextChunker
+
+CHUNKER_VERSION = _TextChunker.CHUNKER_VERSION
 
 
 class RebuildError(RuntimeError):

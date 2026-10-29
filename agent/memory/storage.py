@@ -727,6 +727,38 @@ class MemoryStorage:
             )
             raise
 
+        # P1-阶段三 第五轮 (F-4): the body-column guard. The index guard
+        # above protects the VISIBILITY axis; this one protects the
+        # EXTERNALIZATION axis — the four body columns + body_origin must
+        # not be erased by a writer that does not know about them.
+        #
+        # The writer that erases them is the desktop build from 2026-10-13,
+        # which is STILL RUNNING on this machine and writes with
+        # ``INSERT OR REPLACE INTO chunks (...)`` — a column list that does
+        # not name them, so the row is replaced wholesale and they fall
+        # back to their DEFAULT (NULL). The anti-downgrade UPSERT in this
+        # module protects the NEW writer; this trigger protects the file
+        # against the OLD one, because the database write boundary is the
+        # only place every writer must pass.
+        #
+        # The trigger is TEMPORARY: once the desktop build is rebuilt from
+        # the current source, it is redundant (and harmless — it only
+        # fires for a row that arrives without a body_path while the
+        # stored row has one, which a current writer never produces).
+        try:
+            from agent.memory.body_guard import install_guard as _install_body_guard
+
+            _install_body_guard(self.conn)
+        except Exception as e:
+            # Loud, not silent: a guard that cannot be installed is a
+            # guard that does not exist.
+            from common.log import logger
+            logger.error(
+                f"[MemoryStorage] Body-column guard could not be installed "
+                f"on {self.db_path}: {e}"
+            )
+            raise
+
         # Create indexes
         self.conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_chunks_user 

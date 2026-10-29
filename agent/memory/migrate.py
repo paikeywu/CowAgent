@@ -73,6 +73,7 @@ from agent.memory.body_pointer import (  # noqa: E402
     rebuild_from_anchor,
     resolve_truth_file,
 )
+from agent.memory.chunker import TextChunker  # noqa: E402
 from agent.memory.naming import canonical_text  # noqa: E402
 from agent.memory.rebuilder import _chunk_id  # noqa: E402
 from agent.memory.schema_drift import (  # noqa: E402
@@ -90,7 +91,13 @@ from agent.memory.schema_drift import (  # noqa: E402
 #: gains a ``+S`` suffix.  The version bump is what lets the inspector
 #: tell "this row has no segment sequence" from "this row was cut by an
 #: algorithm that did not need one".
-CHUNKER_VERSION = 4
+#:
+#: P1-阶段三 第五轮 (F-2): the NUMBER is a fact about the algorithm, so
+#: it is read from the algorithm instead of being spelled out here.  Three
+#: modules each carrying their own copy of the version is exactly how they
+#: drift apart — and the drift is silent: the rebuild wrote 3 into a
+#: library cut by 4, and the criterion that compares the two went red.
+CHUNKER_VERSION = TextChunker.CHUNKER_VERSION
 
 #: The state a backfilled row carries.  'mirror' is M6's business — the
 #: backfill itself leaves the row a projection (the text lives in the
@@ -546,6 +553,34 @@ def step_m4(live: List[Dict[str, Any]], report: Report, dry_run: bool = False
         try:
             # --- the conditional backfill, in ONE transaction ---
             conn.execute("BEGIN IMMEDIATE")
+            # P1-阶段三 第五轮 (F-4): install the body-column guard BEFORE
+            # the backfill, not after.  The backfill is the step that puts
+            # the pointers in, and the legacy desktop build (still running
+            # on this machine) erases them with ``INSERT OR REPLACE``.
+            # Installing the guard first closes the window in which the
+            # migration writes and the legacy writer wipes — measured on
+            # this machine: the S3-D migration filled ROOT to 91 rows and
+            # 27 minutes later the library was back to 268 rows with every
+            # pointer NULL.
+            #
+            # The guard is a BEFORE INSERT trigger on ``chunks``; it does
+            # not interfere with the backfill, which uses a plain UPDATE.
+            guard_status = "not-attempted"
+            try:
+                from agent.memory.body_guard import ensure_guard as _ensure_body_guard
+
+                _g = _ensure_body_guard(conn)
+                guard_status = "%s" % _g.get("status")
+                if _g.get("status") == "failed":
+                    raise MigrationError(
+                        "the body-column guard could not be installed on %s: %s"
+                        % (name, _g.get("reason")))
+            except MigrationError:
+                raise
+            except Exception as e:
+                raise MigrationError(
+                    "the body-column guard could not be installed on %s: %s: %s"
+                    % (name, type(e).__name__, e))
             # P1-阶段三 第四轮: EVERY row is visited, not only the ones
             # with a NULL pointer.  A row whose anchor is a bare line span
             # cannot rebuild a multi-segment markdown block — its anchor
@@ -734,13 +769,15 @@ def step_m4(live: List[Dict[str, Any]], report: Report, dry_run: bool = False
             "no truth source=%d  id/part not recoverable=%d\n"
             "body_origin distribution: %s\n"
             "anchors with a segment sequence (+S)=%d  bare anchors=%d\n"
-            "orphans (factual drift, text kept)=%d" % (
+            "orphans (factual drift, text kept)=%d\n"
+            "body-column guard: %s" % (
                 filled, skipped, no_source, no_part,
                 origin_dist or "none", anchors_with_segments, anchors_bare,
-                orphans),
+                orphans, guard_status),
             filled=filled, skipped=skipped, orphans=orphans,
             origin_dist=origin_dist,
-            anchors_with_segments=anchors_with_segments)
+            anchors_with_segments=anchors_with_segments,
+            body_guard=guard_status)
         report.criterion(
             "M4.%s.count" % name,
             "body_path IS NULL == 0, or only the rows with no truth source (%s)"
@@ -784,6 +821,44 @@ def step_m4(live: List[Dict[str, Any]], report: Report, dry_run: bool = False
         "skipped=%d  (a non-zero count means the backfill raced a writer; "
         "the L-1 fallback says: re-run that library)" % grand["skipped_concurrent"],
         **grand)
+
+    # P1-阶段三 第五轮 (F-4): the body-column guard must be INSTALLED in
+    # every library — a guard that is missing from one library is a
+    # library the legacy writer can erase.  The count is the evidence:
+    # "the guard is in place" without a number is not a fact.
+    guard_present = 0
+    guard_missing: List[str] = []
+    guard_stale: List[str] = []
+    for lib in live:
+        try:
+            c = sqlite3.connect(str(lib["db"]))
+            try:
+                from agent.memory.body_guard import is_installed
+                from agent.memory.body_guard import stored_trigger_sql
+
+                if is_installed(c):
+                    guard_present += 1
+                elif stored_trigger_sql(c):
+                    guard_stale.append(lib["name"])
+                else:
+                    guard_missing.append(lib["name"])
+            finally:
+                c.close()
+        except sqlite3.Error:
+            guard_missing.append(lib["name"])
+    report.criterion(
+        "M4.GUARD",
+        "the body-column guard is installed in every live library",
+        "PASS" if not guard_missing and not guard_stale else "FAIL",
+        "libraries with the guard CURRENT: %d / %d\n"
+        "missing: %s\n"
+        "stale (installed but not the current definition): %s\n"
+        "(the guard is what keeps the legacy desktop build from erasing "
+        "the pointers this migration just wrote)" % (
+            guard_present, len(live), guard_missing or "none",
+            guard_stale or "none"),
+        present=guard_present, total=len(live),
+        missing=guard_missing, stale=guard_stale)
 
     # P1-阶段三 第四轮: every row must carry a DECIDED origin.  A row
     # left at 'unresolved' is a row nobody judged — the inspector reports

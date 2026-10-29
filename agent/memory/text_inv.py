@@ -160,6 +160,18 @@ def check_inv1(conn: sqlite3.Connection, root: Path) -> Dict[str, Any]:
                 "body_origin FROM chunks "
                 "WHERE text_state IN ('projection','mirror')").fetchall()
         else:
+            # P1-阶段三 第四轮: a library that predates the column has NO
+            # origin at all.  That is NOT the same as 'unresolved':
+            # 'unresolved' means "nobody has judged this row yet", and it
+            # is a verdict about the ROW.  A missing column is a verdict
+            # about the SCHEMA — and the schema drift check owns that.
+            #
+            # Reporting it as 'unresolved' made every pre-migration
+            # library INV-1 RED: a false red that says "these rows are
+            # undecided" when the truth is "this library has not been
+            # migrated yet".  (Measured: the regression baseline's
+            # synthetic corpus went RED on INV-1 and the set-diff
+            # criterion reported a regression that was not one.)
             rows = conn.execute(
                 "SELECT id, body_path, body_anchor, body_hash, text_state, "
                 "NULL FROM chunks "
@@ -174,8 +186,15 @@ def check_inv1(conn: sqlite3.Connection, root: Path) -> Dict[str, Any]:
     fp = f"chunks={len(rows)}"
     origin_counts: Dict[str, int] = {}
     for cid, bpath, banchor, bhash, _state, origin in rows:
-        origin = origin or ORIGIN_UNRESOLVED
-        origin_counts[origin] = origin_counts.get(origin, 0) + 1
+        # A missing origin (the column does not exist) means "this
+        # library predates the column" — the row is judged by the OLD
+        # rule (the pointer must exist and locate), NOT by the
+        # 'unresolved' rule.
+        if origin is None:
+            origin = ORIGIN_FILE
+            origin_counts["(no column)"] = origin_counts.get("(no column)", 0) + 1
+        else:
+            origin_counts[origin] = origin_counts.get(origin, 0) + 1
 
         if origin == ORIGIN_UNRESOLVED:
             out.append(_v(REASON_INV1, CODE_INV1_UNRESOLVED,
