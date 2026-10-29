@@ -362,3 +362,37 @@ def test_state_root_refuses_a_source_tree_workspace(tmp_path):
             state_dir.state_root()
     finally:
         set_agent_registry(None)
+
+
+# --- P1-阶段一 (D6): 非路径对象不得触发误伤，真实源码树仍必须被拒 ---
+
+def test_a_magicmock_workspace_is_not_refused(tmp_path):
+    """D6 反向用例：MagicMock 工作区不得触发源码树拒绝。
+
+    MagicMock 实现了 __fspath__（os.PathLike），字符串化成一个相对片段，
+    realpath 之后恰好落进当前 checkout —— P0-20 的防线曾把一个**假路径**
+    当成真路径拦下（test_conversation_store_page_window.py:117-126 自述）。
+    防线没做错，是输入不是路径。修法：非路径对象根本不进 .git 上溯。
+    """
+    from unittest.mock import MagicMock
+    state_dir.assert_not_source_tree(MagicMock())   # 不抛即通过
+
+
+def test_a_magicmock_string_attribute_is_not_refused(tmp_path):
+    """D6 反向用例：mock 的 .workspace 属性（也是 mock）同样不误伤。"""
+    from unittest.mock import MagicMock
+    state_dir.assert_not_source_tree(MagicMock().workspace)   # 不抛即通过
+
+
+def test_a_real_source_tree_string_is_still_refused(tmp_path):
+    """D6 正向对照：真实源码树的**字符串**路径仍必须被拒。
+
+    识别 mock 不能以「把字符串路径也放过」为代价 —— 那样守卫就空了。
+    """
+    tree = tmp_path / "repo"
+    (tree / ".git").mkdir(parents=True)
+    ws = tree / "workspace"
+    ws.mkdir()
+    with pytest.raises(state_dir.SourceTreeWorkspaceError):
+        state_dir.assert_not_source_tree(str(ws))
+

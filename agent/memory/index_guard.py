@@ -251,7 +251,11 @@ def _build_trigger_sql() -> List[str]:
         f"CASE WHEN {sealed_by_guard} "
         f"THEN (SELECT g.owner_token FROM {GUARD_TABLE} g "
         f"      WHERE g.path = NEW.path AND g.class = '{CLASS_SEALED}') "
-        f"ELSE NULL END"
+        f"ELSE NULL END, "
+        # P1-阶段一 (M2): carry the externalization columns through — a
+        # corrected row must not come back with text_state=NULL.
+        "NEW.body_path, NEW.body_anchor, NEW.body_hash, "
+        "COALESCE(NEW.text_state, 'projection')"
     )
 
     # Self-registration: a dark page whose chunks are indexed BEFORE this
@@ -279,9 +283,14 @@ def _build_trigger_sql() -> List[str]:
         f"({sealed_by_text} OR {sealed_by_guard})",
     )
 
+    # P1-阶段一 (M2): the corrective row must carry the four externalization
+    # columns through. A corrected row that silently drops them would read
+    # text_state=NULL even though the migration defaults every chunk to
+    # 'projection' — and a NULL here is what the stage-two writer keys on.
     cols = ("id, user_id, scope, source, path, start_line, end_line, text, "
             "embedding, hash, metadata, updated_at, file_sealed, "
-            "element_released, sealed_owner")
+            "element_released, sealed_owner, body_path, body_anchor, "
+            "body_hash, text_state")
 
     insert_trigger = f"""
 CREATE TRIGGER {GUARD_TRIGGERS[0]} BEFORE INSERT ON chunks
@@ -417,22 +426,23 @@ def ensure_guard(conn: sqlite3.Connection) -> Dict[str, Any]:
         return {"status": "failed",
                 "reason": "the database has no chunks table yet"}
 
-    has_flags = {"file_sealed", "element_released"} <= columns
-    has_owner = "sealed_owner" in columns
-    if not (has_flags and has_owner):
-        # The corrective INSERT names the projection columns. On a database
-        # that predates them the guard would fail to install, and a guard
-        # that fails to install is a guard that does not exist — so the
-        # flags are added here, the same way the migration adds them.
+    # The corrective INSERT names the projection + externalization columns.
+    # On a database that predates any of them the guard would fail to
+    # install, and a guard that fails to install is a guard that does not
+    # exist — so the missing columns are added here, from the SAME single
+    # source of truth the storage migration reads (P1-阶段一 D-A), instead
+    # of a hand-maintained list that drifts.
+    from agent.memory.schema_drift import ADDABLE_COLUMNS
+    missing = [name for name in ADDABLE_COLUMNS if name not in columns]
+    if missing:
         try:
-            for name, decl in (("file_sealed", "INTEGER DEFAULT 0"),
-                               ("element_released", "INTEGER DEFAULT 0"),
-                               ("sealed_owner", "TEXT")):
-                if name not in columns:
-                    conn.execute(f"ALTER TABLE chunks ADD COLUMN {name} {decl}")
+            for name in missing:
+                conn.execute(
+                    f"ALTER TABLE chunks ADD COLUMN {name} {ADDABLE_COLUMNS[name]}"
+                )
         except sqlite3.Error as e:
             return {"status": "failed",
-                    "reason": f"cannot add the projection columns: {e}"}
+                    "reason": f"cannot add the guard columns: {e}"}
 
     if is_current(conn):
         return {"status": "present"}

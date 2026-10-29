@@ -1273,6 +1273,19 @@ class MemoryManager:
 
         rerank_status = self._reranker_status()
 
+        # P1-阶段一 (M1): the schema fingerprint, so the gate that decides
+        # whether this index may serve can compare one token instead of
+        # re-deriving the column set. A missing token reads as "unknown"
+        # — distinct from a schema that IS known.
+        schema_fp = None
+        try:
+            row = self.storage.conn.execute(
+                "SELECT value FROM _meta WHERE key='schema_fingerprint'"
+            ).fetchone()
+            schema_fp = row[0] if row else None
+        except Exception:
+            schema_fp = None
+
         # Which knowledge root this Agent actually reads: its own knowledge/
         # when present, otherwise the shared copy. Retrieval reports
         # "knowledge/..." paths either way; this field says whose they are.
@@ -1310,6 +1323,7 @@ class MemoryManager:
                 '(FTS5 + LIKE), so semantic matches are not found'
                 if degraded else ''
             ),
+            'schema_fingerprint': schema_fp,
             'embedding_coverage': (
                 round(embedded / chunks, 4) if chunks else 0.0
             ),

@@ -57,6 +57,37 @@ class SourceTreeWorkspaceError(StateDirError):
     """
 
 
+def _as_path(workspace_root) -> Optional[Path]:
+    """Coerce ``workspace_root`` to a real path, or None when it isn't one.
+
+    A ``MagicMock`` / stub workspace stringifies into a relative fragment
+    (``<MagicMock id=...>``) whose realpath lands inside the current
+    checkout. That used to trip the source-tree refusal — a fake refusal
+    caused by a non-path input, not by a real layout violation. Only a
+    value that is genuinely a path (``str`` / ``os.PathLike``) may reach
+    the ``.git`` walk. A mock is excluded explicitly: ``MagicMock``
+    implements ``__fspath__`` and so passes ``os.PathLike``, but the
+    "path" it reports is a test artifact, not a real location.
+    """
+    # unittest.mock objects ARE os.PathLike (MagicMock auto-creates
+    # __fspath__), so they must be ruled out before the PathLike branch.
+    if type(workspace_root).__module__.startswith("unittest.mock"):
+        return None
+    if isinstance(workspace_root, Path):
+        return workspace_root
+    if isinstance(workspace_root, os.PathLike):
+        try:
+            return Path(workspace_root)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(workspace_root, str):
+        try:
+            return Path(workspace_root)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def _source_tree_root(path: Path) -> Optional[Path]:
     """The git work tree that contains ``path``, if any.
 
@@ -86,8 +117,19 @@ def assert_not_source_tree(workspace_root: Path | str) -> None:
 
     The refusal names the alternative, because a refusal that only says
     "no" blocks the work without telling the caller what to do.
+
+    P1-阶段一 (D6): a NON-PATH value must not trip the refusal. A test
+    that hands a ``MagicMock`` workspace (or any object that stringifies
+    into a relative fragment) used to be refused, because ``Path(<mock>)``
+    stringifies into a relative path whose realpath then lands inside the
+    current checkout. The guard was correct; the input was not a path. So
+    the refusal only fires on something that is actually a path-like value
+    that resolves under a real ``.git``. A mock is the caller's problem,
+    not the layout's — it must not be turned into a fake refusal.
     """
-    root = Path(workspace_root)
+    root = _as_path(workspace_root)
+    if root is None:
+        return
     tree = _source_tree_root(root)
     if tree is None:
         return

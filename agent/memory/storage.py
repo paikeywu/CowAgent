@@ -290,6 +290,16 @@ class MemoryChunk:
     # page (P0-15 L-5: the collision was reproducible). The sealed branch
     # of the predicate reads THIS column and nothing else.
     sealed_owner: Optional[str] = None
+    # P1-阶段一 (D-C): the four body-externalization columns.  Stage one
+    # lands the COLUMNS only — the writer that fills them (the chunked body
+    # store) is stage two.  Every chunk starts life as a projection (text
+    # lives in this row, the way it always has).
+    body_path: Optional[str] = None     # truth-layer file this body lives in
+    body_anchor: Optional[str] = None   # byte span / locator inside that file
+    body_hash: Optional[str] = None     # sha256 of the canonical body (drift check)
+    # 'projection' (text here) | 'externalized' (text moved to body_path)
+    # | 'stale' (hash drifted) | 'missing' (body file gone).
+    text_state: Optional[str] = "projection"
 
 
 @dataclass
@@ -588,7 +598,11 @@ class MemoryStorage:
                 updated_at INTEGER DEFAULT (strftime('%s', 'now')),
                 hit_count INTEGER NOT NULL DEFAULT 0,
                 last_hit_at INTEGER,
-                sealed_owner TEXT
+                sealed_owner TEXT,
+                body_path TEXT,
+                body_anchor TEXT,
+                body_hash TEXT,
+                text_state TEXT NOT NULL DEFAULT 'projection'
             )
         """)
 
@@ -645,6 +659,25 @@ class MemoryStorage:
                 value TEXT NOT NULL
             )
         """)
+
+        # P1-阶段一 (M1): persist the schema fingerprint. The gate that
+        # decides whether this index may serve reads one comparable token
+        # from ``_meta`` instead of re-deriving the column set; the writer
+        # and the reader compare tokens, and a mismatch is what a
+        # NOTRUN / refuse-to-serve decision keys on.
+        try:
+            from agent.memory.schema_drift import schema_fingerprint
+            fp = schema_fingerprint(self.db_path)
+            if fp:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO _meta(key, value) "
+                    "VALUES('schema_fingerprint', ?)",
+                    (fp,),
+                )
+        except Exception:
+            # A fingerprint that cannot be written must not block startup;
+            # the reader treats a missing token as "unknown", not "wrong".
+            pass
 
         repair_pending = False
         # Create FTS5 virtual table + triggers (only if supported).
@@ -748,30 +781,38 @@ class MemoryStorage:
             self.conn.execute("ALTER TABLE chunks ADD COLUMN last_hit_at INTEGER")
 
     def _migrate_release_columns(self):
-        """Add the release projection flags (P0-11 P-2) to an older index.
+        """Add the projection + externalization columns to an older index.
 
-        Both default to 0, which means "not released / not sealed" — the
-        safe-for-visibility reading for a column that does not exist yet: an
-        index written before this feature has no released content in it
-        unless the truth layer says otherwise, and the projection refresh
-        re-stamps every row from the disk before the next search anyway.
+        The release projection flags default to 0 ("not released / not
+        sealed") — the safe-for-visibility reading for a column that does
+        not exist yet: an index written before this feature has no released
+        content in it unless the truth layer says otherwise, and the
+        projection refresh re-stamps every row from the disk before the
+        next search anyway.
+
+        P1-阶段一 (D-A): the column set is the SINGLE SOURCE OF TRUTH in
+        ``agent.memory.schema_drift.ADDABLE_COLUMNS`` — the same map the
+        drift detector reads — instead of a hand-maintained copy here. The
+        four body-externalization columns (D-C) ride the same mechanism: a
+        database that predates them gets them added, and their defaults
+        (text here, no body file) are exactly what a row that never
+        externalized should read.
         """
+        from agent.memory.schema_drift import ADDABLE_COLUMNS
+
         cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(chunks)")}
-        if "element_released" not in cols:
-            self.conn.execute(
-                "ALTER TABLE chunks ADD COLUMN element_released INTEGER NOT NULL DEFAULT 0"
-            )
-        if "file_sealed" not in cols:
-            self.conn.execute(
-                "ALTER TABLE chunks ADD COLUMN file_sealed INTEGER NOT NULL DEFAULT 0"
-            )
-        if "sealed_owner" not in cols:
-            # P0-16 L-5: the owner token's own column. NULL means "no owner
-            # recorded" — which for a dark page means nobody may read it
-            # (fail closed), the same reading the old NULL ``user_id``
-            # gave.
-            self.conn.execute(
-                "ALTER TABLE chunks ADD COLUMN sealed_owner TEXT"
+        added = []
+        for name, decl in ADDABLE_COLUMNS.items():
+            if name not in cols:
+                self.conn.execute(
+                    f"ALTER TABLE chunks ADD COLUMN {name} {decl}"
+                )
+                added.append(name)
+        if added:
+            from common.log import logger
+            logger.info(
+                f"[MemoryStorage] migrated chunks columns on {self.db_path}: "
+                f"+{', '.join(added)}"
             )
 
     def _verify_schema(self):
@@ -1006,8 +1047,9 @@ class MemoryStorage:
                 INSERT INTO chunks
                 (id, user_id, scope, source, path, start_line, end_line,
                  text, embedding, hash, metadata, element_released,
-                 file_sealed, sealed_owner, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                 file_sealed, sealed_owner, body_path, body_anchor,
+                 body_hash, text_state, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
                 ON CONFLICT(id) DO UPDATE SET
                     user_id     = excluded.user_id,
                     scope       = excluded.scope,
@@ -1022,6 +1064,10 @@ class MemoryStorage:
                     element_released = excluded.element_released,
                     file_sealed      = excluded.file_sealed,
                     sealed_owner     = excluded.sealed_owner,
+                    body_path        = excluded.body_path,
+                    body_anchor      = excluded.body_anchor,
+                    body_hash        = excluded.body_hash,
+                    text_state       = excluded.text_state,
                     updated_at  = strftime('%s', 'now')
             """
         else:
@@ -1029,8 +1075,9 @@ class MemoryStorage:
                 INSERT OR REPLACE INTO chunks
                 (id, user_id, scope, source, path, start_line, end_line,
                  text, embedding, hash, metadata, element_released,
-                 file_sealed, sealed_owner, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                 file_sealed, sealed_owner, body_path, body_anchor,
+                 body_hash, text_state, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
             """
         params = (
             chunk.id, chunk.user_id, chunk.scope, chunk.source, chunk.path,
@@ -1041,6 +1088,10 @@ class MemoryStorage:
             int(chunk.element_released or 0),
             int(chunk.file_sealed or 0),
             chunk.sealed_owner or None,
+            chunk.body_path or None,
+            chunk.body_anchor or None,
+            chunk.body_hash or None,
+            chunk.text_state or "projection",
         )
         with self._lock:
             try:
@@ -1061,8 +1112,9 @@ class MemoryStorage:
                 INSERT INTO chunks
                 (id, user_id, scope, source, path, start_line, end_line,
                  text, embedding, hash, metadata, element_released,
-                 file_sealed, sealed_owner, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                 file_sealed, sealed_owner, body_path, body_anchor,
+                 body_hash, text_state, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
                 ON CONFLICT(id) DO UPDATE SET
                     user_id     = excluded.user_id,
                     scope       = excluded.scope,
@@ -1077,6 +1129,10 @@ class MemoryStorage:
                     element_released = excluded.element_released,
                     file_sealed      = excluded.file_sealed,
                     sealed_owner     = excluded.sealed_owner,
+                    body_path        = excluded.body_path,
+                    body_anchor      = excluded.body_anchor,
+                    body_hash        = excluded.body_hash,
+                    text_state       = excluded.text_state,
                     updated_at  = strftime('%s', 'now')
             """
         else:
@@ -1084,8 +1140,9 @@ class MemoryStorage:
                 INSERT OR REPLACE INTO chunks
                 (id, user_id, scope, source, path, start_line, end_line,
                  text, embedding, hash, metadata, element_released,
-                 file_sealed, sealed_owner, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                 file_sealed, sealed_owner, body_path, body_anchor,
+                 body_hash, text_state, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
             """
         params_list = [
             (
@@ -1101,6 +1158,10 @@ class MemoryStorage:
                 # here is what made every dark page ownerless — and an
                 # ownerless dark page is invisible to its own owner.
                 c.sealed_owner or None,
+                c.body_path or None,
+                c.body_anchor or None,
+                c.body_hash or None,
+                c.text_state or "projection",
             )
             for c in chunks
         ]
@@ -1920,7 +1981,13 @@ class MemoryStorage:
         return json.loads(raw)
 
     def _row_to_chunk(self, row) -> MemoryChunk:
-        """Convert database row to MemoryChunk"""
+        """Convert database row to MemoryChunk.
+
+        The four externalization columns may be absent on a database that
+        predates them — but the open-time migration adds them, and
+        ``_verify_schema`` fails loudly when they still are not there, so a
+        missing column here is a genuine surprise worth not masking.
+        """
         return MemoryChunk(
             id=row['id'],
             user_id=row['user_id'],
@@ -1932,7 +1999,11 @@ class MemoryStorage:
             text=row['text'],
             embedding=self._decode_embedding(row['embedding']),
             hash=row['hash'],
-            metadata=json.loads(row['metadata']) if row['metadata'] else None
+            metadata=json.loads(row['metadata']) if row['metadata'] else None,
+            body_path=row['body_path'],
+            body_anchor=row['body_anchor'],
+            body_hash=row['body_hash'],
+            text_state=row['text_state'],
         )
     
     @staticmethod

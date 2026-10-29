@@ -54,6 +54,10 @@ EXPECTED_CHUNK_COLUMNS: Tuple[str, ...] = (
     "element_released",
     "file_sealed",
     "sealed_owner",
+    "body_path",
+    "body_anchor",
+    "body_hash",
+    "text_state",
 )
 
 #: The columns a migration may ADD. A column that is not in this map is
@@ -65,6 +69,13 @@ ADDABLE_COLUMNS: Dict[str, str] = {
     "element_released": "INTEGER NOT NULL DEFAULT 0",
     "file_sealed": "INTEGER NOT NULL DEFAULT 0",
     "sealed_owner": "TEXT",
+    # P1-阶段一 (D-C): the four body-externalization columns.  Every chunk
+    # starts as a projection, so the new column defaults match a row that
+    # never externalized: text here, no body file, no hash yet.
+    "body_path": "TEXT",
+    "body_anchor": "TEXT",
+    "body_hash": "TEXT",
+    "text_state": "TEXT NOT NULL DEFAULT 'projection'",
 }
 
 
@@ -175,3 +186,37 @@ def describe_drift(drift: Dict[str, List[str]]) -> str:
         cols = ", ".join(drift[root])
         lines.append(f"{root}: missing {cols}")
     return "; ".join(lines)
+
+
+def schema_fingerprint(db_path: Union[str, Path]) -> Optional[str]:
+    """A stable fingerprint of the index's chunks schema.
+
+    P1-阶段一 (M1): the gate that decides whether an index may serve needs
+    one comparable token, not a column list it must re-derive. The token is
+    the sha256 of the ordered ``PRAGMA table_info(chunks)`` column set, so
+    two indexes that can answer the same queries share a fingerprint and
+    two that cannot do not. ``None`` means there is no readable chunks
+    table to fingerprint (a fresh workspace, or a damaged file) — which is
+    itself a meaningful answer, distinct from any schema.
+    """
+    import hashlib
+
+    path = Path(db_path)
+    if not path.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        rows = conn.execute("PRAGMA table_info(chunks)").fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    if not rows:
+        return None
+    # cid, name, type, notnull, dflt, pk — the shape that decides whether
+    # a query can run, in the order the table defines it.
+    material = "|".join(":".join(str(p) for p in row) for row in rows)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
