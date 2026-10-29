@@ -19,6 +19,12 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+# P1-阶段三 (C-A2): the probe finds the truth file through the ONE
+# resolution rule — the same one the writer and the invariant checkers
+# use.  Imported at module level (no cycle: body_pointer imports nothing
+# from the memory package at import time).
+from agent.memory.body_pointer import resolve_truth_file
+
 #: 缓存生存期（秒）。同一 path 在此窗口内不重复 stat。
 DEFAULT_TTL_SECONDS = 30.0
 
@@ -57,17 +63,35 @@ class FreshnessProbe:
         ``>``). That constant false red drowned the real ones — and masked
         other defects behind it. Same precision on both sides = the
         comparison means what it says.
+
+        P1-阶段三 (C-A2): the file is found through the ONE resolution rule
+        (``body_pointer.resolve_truth_file``) — the same one the writer and
+        the invariant checkers use. This probe used to stat
+        ``<workspace>/<relpath>`` directly, which finds NOTHING for the
+        knowledge tree when the agent has no copy of its own (the file
+        lives in the shared root) — so every knowledge hit read as stale.
         """
         now = self._clock()
         cached = self._cache.get(relpath)
         if cached is not None and (now - cached[0]) < self.ttl:
             self.cache_hits += 1
             return cached[1]
-        real = self.workspace_root / relpath.replace("\\", "/")
-        try:
-            mtime = int(self._statter(real))
-        except OSError:
-            mtime = None
+        real = resolve_truth_file(self.workspace_root, relpath)
+        if real is None:
+            # Fall back to the workspace-relative join for the paths that
+            # resolve_truth_file cannot (a file that exists but is not
+            # under a known root).  The stat is the authority: if it is
+            # there, its mtime is real.
+            candidate = self.workspace_root / relpath.replace("\\", "/")
+            try:
+                mtime = int(self._statter(candidate))
+            except OSError:
+                mtime = None
+        else:
+            try:
+                mtime = int(self._statter(real))
+            except OSError:
+                mtime = None
         self._cache[relpath] = (now, mtime)
         return mtime
 

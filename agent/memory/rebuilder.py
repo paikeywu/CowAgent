@@ -41,6 +41,12 @@ from common.log import logger
 from agent.memory.chunker import TextChunker, chunk_for_file
 from agent.memory.naming import canonical_text
 from agent.memory import changes
+from agent.memory.body_pointer import (
+    STATE_PROJECTION,
+    body_anchor,
+    body_hash,
+    posix_body_path,
+)
 from agent.memory.storage import MemoryChunk, MemoryStorage
 
 #: The chunker version stamped into ``files.chunker_version``. Bump it when the
@@ -67,25 +73,42 @@ def _chunk_id(path: str, start_line: int, end_line: int, part: int = 0) -> str:
 
 
 def _posix_rel(path: Path, workspace_root: Path) -> str:
-    """Workspace-relative POSIX path, asserted safe (INV-11)."""
+    """Workspace-relative POSIX path, asserted safe (INV-11).
+
+    P1-阶段三 (C-A2): the SAFETY RULE is not re-spelled here.  The
+    writer-side pointer builder (``agent.memory.body_pointer``) owns it and
+    it delegates to ``agent.memory.paths`` — the ONE rule since P1-阶段二-C.
+    This function keeps its name and its raise-on-unsafe behaviour (the
+    rebuilder must NOT write a projection for a path it cannot point at),
+    but the DECISION comes from the shared module.
+    """
     rel = path.resolve().relative_to(workspace_root.resolve()).as_posix()
-    if "\\" in rel or rel.startswith("/") or ".." in rel.split("/"):
-        raise RebuildError(f"unsafe body_path {rel!r} (backslash / absolute / '..')")
-    return rel
+    safe = posix_body_path(rel)
+    if safe is None:
+        raise RebuildError(
+            f"unsafe body_path {rel!r} (backslash / absolute / '..')")
+    return safe
 
 
 def _body_anchor(start_line: int, end_line: int, part: int = 0) -> str:
-    """``L<start>-<end>[:p<part>]`` — the part segment keeps anchor<->id 1:1."""
-    anchor = f"L{start_line}-{end_line}"
-    if part:
-        anchor += f":p{part}"
-    return anchor
+    """``L<start>-<end>[:p<part>]`` — the part segment keeps anchor<->id 1:1.
+
+    P1-阶段三 (C-A2): the ANCHOR GRAMMAR is the ONE definition
+    (``agent.memory.body_pointer.body_anchor``), shared with the manager's
+    write path and with the checker's parser.  Two spellings of the anchor
+    format is how "the anchor points nowhere" happens while both sides
+    believe they agree.
+    """
+    return body_anchor(start_line, end_line, part)
 
 
 def _body_hash(fragment: str) -> str:
-    """sha256 of the canonical fragment — the drift-check token (INV-3)."""
-    return "sha256:" + hashlib.sha256(
-        canonical_text(fragment).encode("utf-8")).hexdigest()
+    """sha256 of the canonical fragment — the drift-check token (INV-3).
+
+    P1-阶段三 (C-A2): delegates to the shared builder, which in turn
+    imports ``naming.canonical_text`` — the ONE canonical implementation.
+    """
+    return body_hash(fragment)
 
 
 def recompute_release_flags(
@@ -204,7 +227,7 @@ def rebuild_file(
             body_path=rel,
             body_anchor=_body_anchor(pc.start_line, pc.end_line, pc.part),
             body_hash=_body_hash(pc.text),
-            text_state="projection",
+            text_state=STATE_PROJECTION,
         ))
 
     try:

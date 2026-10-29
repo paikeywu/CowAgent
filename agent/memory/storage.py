@@ -316,6 +316,19 @@ class SearchResult:
     # file is newer than the index (fail-visible retrieval keeps it but marks
     # it). None = not probed; True/False = the probe's verdict.
     stale: Optional[bool] = None
+    # P1-阶段三 (D-C): the temporal-decay FACTOR for this result, carried
+    # alongside the score instead of being multiplied into it.
+    #
+    # D-C's second defect was "the decay is applied twice": the fused score
+    # was decayed in `_merge_results` and the rerank score was decayed
+    # AGAIN in `_rerank`.  Factorizing the decay out is what makes "applied
+    # exactly once" a property of the code rather than an accident of the
+    # call order — the factor travels with the result and is applied once,
+    # at the end of the ranking chain.
+    #
+    # None means "no decay applies" (1.0) — which is what a result that
+    # never went through the fusion carries.
+    decay: Optional[float] = None
 
 
 class MemorySchemaError(RuntimeError):
@@ -722,7 +735,11 @@ class MemoryStorage:
                 hash TEXT NOT NULL,
                 mtime INTEGER NOT NULL,
                 size INTEGER NOT NULL,
-                updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+                updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+                -- P1-阶段三 (C-A3): NULLABLE, so "not measured" (NULL) is
+                -- distinguishable from "measured, and it is zero" (0).
+                chunk_count INTEGER,
+                chunker_version INTEGER
             )
         """)
         # P1-阶段二: files bookkeeping grows chunk_count / chunker_version so a
@@ -804,14 +821,34 @@ class MemoryStorage:
 
         PRAGMA table_info is metadata-only; ALTER TABLE only fires when the
         columns are missing. Idempotent.
+
+        P1-阶段三 (C-A3): the columns are added as NULLABLE, without a
+        default.  The earlier form was ``INTEGER NOT NULL DEFAULT 0``, which
+        made every existing row read "this file produced zero chunks" — a
+        statement that was FALSE for every row in the index and could not be
+        told apart from a file that really produced no chunks.
+
+        With a nullable column the two states are distinguishable:
+
+        * ``NULL`` — "not measured" (an old row nobody has re-written yet);
+        * ``0``    — "measured, and this file really produced no chunks".
+
+        A reader that wants to trust the number can therefore require
+        ``chunk_count IS NOT NULL``, and a reader that wants to spot the
+        gap can count the NULLs.
+
+        An index whose columns ALREADY exist with the old NOT NULL DEFAULT 0
+        declaration keeps that declaration (SQLite cannot relax it without
+        a table rebuild), so the old rows still read 0 — which is why the
+        criterion for C-A3.3 counts the NULLs instead of trusting the 0s.
         """
         cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(files)")}
         if "chunk_count" not in cols:
             self.conn.execute(
-                "ALTER TABLE files ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0")
+                "ALTER TABLE files ADD COLUMN chunk_count INTEGER")
         if "chunker_version" not in cols:
             self.conn.execute(
-                "ALTER TABLE files ADD COLUMN chunker_version INTEGER NOT NULL DEFAULT 0")
+                "ALTER TABLE files ADD COLUMN chunker_version INTEGER")
 
     def _migrate_release_columns(self):
         """Add the projection + externalization columns to an older index.
@@ -2044,13 +2081,47 @@ class MemoryStorage:
             return None, ""
         return SCOPE_SEALED, ""
 
-    def update_file_metadata(self, path: str, source: str, file_hash: str, mtime: int, size: int):
-        """Update file metadata"""
+    def update_file_metadata(self, path: str, source: str, file_hash: str,
+                            mtime: int, size: int,
+                            chunk_count: Optional[int] = None,
+                            chunker_version: Optional[int] = None):
+        """Update file metadata.
+
+        P1-阶段三 (C-A3): the ``chunk_count`` / ``chunker_version`` columns
+        are FILLED, not left at their default 0.
+
+        The old behaviour was a row that said "this file has 0 chunks" for
+        every file — which is a LIE that reads like a fact.  A reader cannot
+        tell "this file really produced no chunks" from "nobody filled the
+        column in", and the second reading is the true one for the 87 rows
+        of the root index before this change.
+
+        So the two states are now DISTINGUISHABLE:
+
+        * ``chunk_count`` is the file's REAL chunk count.  ``None`` (the
+          default) means "not known" and is stored as NULL — a reader can
+          see the difference between "not measured" and "measured zero".
+        * ``chunker_version`` is the version of the chunker that cut the
+          file.  ``None`` means "not known", stored as NULL.
+
+        A file that really has zero chunks is written as 0 (with the
+        version), and a file whose count was never measured is written as
+        NULL.  The criterion for C-A3.3 asserts exactly that distinction.
+
+        The migration that brings an OLD files table up to date declares the
+        two columns as ``NOT NULL DEFAULT 0`` — that is the only place a 0
+        can appear without being written, and it is a schema default on a
+        column whose value no reader should trust until the next write.
+        """
         with self._lock:
             self.conn.execute("""
-                INSERT OR REPLACE INTO files (path, source, hash, mtime, size, updated_at)
-                VALUES (?, ?, ?, ?, ?, strftime('%s', 'now'))
-            """, (path, source, file_hash, mtime, size))
+                INSERT OR REPLACE INTO files
+                (path, source, hash, mtime, size, chunk_count,
+                 chunker_version, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+            """, (path, source, file_hash, mtime, size,
+                  None if chunk_count is None else int(chunk_count),
+                  None if chunker_version is None else int(chunker_version)))
             self.conn.commit()
     
     def get_stats(self) -> Dict[str, int]:

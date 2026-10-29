@@ -53,6 +53,19 @@ class MemoryConfig:
     # proof of usefulness, so the signal is off unless explicitly enabled.
     hit_boost_weight: float = 0.0
     hit_boost_max: float = 1.25
+
+    # P1-阶段三 (D-C): the reranker's share of the final score.
+    #
+    # Before this, the reranker score REPLACED the fused score outright, so
+    # the keyword/vector channels' evidence was thrown away whenever a
+    # reranker was configured.  The two are now FUSED: the retrieval score
+    # keeps a (1 - rerank_weight) share and the reranker takes
+    # ``rerank_weight``, over a renormalized denominator.
+    #
+    # 0.5 = the two contribute equally.  The reranker is a strong opinion,
+    # not the sole authority; at 1.0 the behaviour would be the old
+    # "substitute" one, and at 0.0 the reranker would have no effect at all.
+    rerank_weight: float = 0.5
     
     # Memory sources
     sources: List[str] = field(default_factory=lambda: ["memory", "session"])

@@ -8,6 +8,20 @@ venv*
 *.pyc
 python
 config.json
+# The config file's own BACKUPS must be ignored too (P1-阶段三 · C-A5 · H4).
+#
+# ``config.json`` alone was not enough: the deployment script writes a
+# timestamped backup next to it (``config.json.bak-<stamp>``) before it
+# touches the live file, and the 0.114 host was left carrying
+# ``?? config.json.bak-20261028-120030`` — an UNTRACKED file in the working
+# copy.  The deploy script's "the repository working copy is clean" check
+# (``git status --porcelain | wc -l``) counts it, so the deployment script
+# was failing ITSELF on a file it had created.
+#
+# The pattern is anchored to the repository root: a bare ``config.json.bak-*``
+# would also match inside ``plugins/`` and other trees that have their own
+# (tracked) configuration files.
+config.json.bak-*
 QR.png
 nohup.out
 tmp

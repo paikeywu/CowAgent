@@ -829,11 +829,41 @@ class MemoryManager:
             embeddings = [None] * len(texts)
         
         # Create memory chunks
+        #
+        # P1-阶段三 (H1 · C-A2): the four body-externalization columns are
+        # filled HERE.  This write path did not fill them at all (the whole
+        # file had ZERO hits for `text_state`), so every row it wrote had
+        # `body_path IS NULL` — a pointer that points nowhere, which is
+        # exactly what INV-1 reports.  A migration would have backfilled the
+        # existing rows and the next sync would have written new NULL rows
+        # again, and INV-1 would have gone RED on the rows the migration had
+        # just fixed.
+        #
+        # `add_memory` stores a blob of text under a SYNTHETIC path — it
+        # does not write a truth file — so there is no file to point at and
+        # no fragment to hash.  The honest value for `body_path` is None:
+        # the row has no truth-layer body yet.  The anchor and the hash are
+        # still filled from the chunk itself, so the row carries a complete
+        # drift token rather than four empty columns.
         memory_chunks = []
         for chunk, embedding in zip(chunks, embeddings):
             chunk_id = self._generate_chunk_id(path, chunk.start_line, chunk.end_line, chunk.part)
             chunk_hash = MemoryStorage.compute_hash(chunk.text)
-            
+
+            # The path is the row's OWN key; it is checked with the ONE
+            # path-safety rule (agent.memory.paths), never with a second
+            # spelling of it.
+            body_path, body_anchor, body_hash, text_state = (
+                self._body_columns_for(
+                    relpath=path,
+                    start_line=chunk.start_line,
+                    end_line=chunk.end_line,
+                    part=chunk.part,
+                    chunk_text=chunk.text,
+                    workspace_root=None,
+                )
+            )
+
             memory_chunks.append(MemoryChunk(
                 id=chunk_id,
                 user_id=user_id,
@@ -845,7 +875,11 @@ class MemoryManager:
                 text=chunk.text,
                 embedding=embedding,
                 hash=chunk_hash,
-                metadata=metadata
+                metadata=metadata,
+                body_path=body_path,
+                body_anchor=body_anchor,
+                body_hash=body_hash,
+                text_state=text_state,
             ))
         
         # Save to storage
@@ -853,6 +887,8 @@ class MemoryManager:
         
         # Update file metadata
         file_hash = MemoryStorage.compute_hash(content)
+        # P1-阶段三 (C-A3): the real chunk count and the chunker version,
+        # so the files row states a fact instead of defaulting to 0.
         self.storage.update_file_metadata(
             path=path,
             source=source,
@@ -866,7 +902,9 @@ class MemoryManager:
             # class of bug as C-3. Now it is the actual write moment, in
             # whole seconds — the same precision the other writers use.
             mtime=int(time.time()),
-            size=len(content)
+            size=len(content),
+            chunk_count=len(memory_chunks),
+            chunker_version=TextChunker.CHUNKER_VERSION,
         )
     
     async def sync(self, force: bool = False):
@@ -1262,6 +1300,29 @@ class MemoryManager:
             for chunk, embedding in zip(entry["chunks"], entry_embeddings):
                 chunk_id = self._generate_chunk_id(rel_path, chunk.start_line, chunk.end_line, chunk.part)
                 chunk_hash = MemoryStorage.compute_hash(chunk.text)
+                # P1-阶段三 (H1 · C-A2): the four body-externalization
+                # columns are filled on THIS write path too.  It is the
+                # path that writes the bulk of the index (every file the
+                # scan finds), so leaving the four columns NULL here meant
+                # that a migration's backfill was undone by the very next
+                # sync — and INV-1 ("points nowhere") went RED on the rows
+                # the migration had just fixed.
+                #
+                # `entry["file_path"]` is the truth file this chunk was cut
+                # from, and the workspace root is the root the path is
+                # relative to.  The path-safety rule is the ONE rule
+                # (agent.memory.paths) — not a second spelling.
+                body_path, body_anchor, body_hash, text_state = (
+                    self._body_columns_for(
+                        relpath=rel_path,
+                        start_line=chunk.start_line,
+                        end_line=chunk.end_line,
+                        part=chunk.part,
+                        chunk_text=chunk.text,
+                        workspace_root=workspace_dir_path,
+                        source_file=entry.get("file_path"),
+                    )
+                )
                 memory_chunks.append(MemoryChunk(
                     id=chunk_id,
                     user_id=entry["user_id"],
@@ -1281,15 +1342,26 @@ class MemoryManager:
                     # the sealed branch of the predicate is always false —
                     # which would hide every dark page from its own owner.
                     sealed_owner=entry.get("sealed_owner"),
+                    body_path=body_path,
+                    body_anchor=body_anchor,
+                    body_hash=body_hash,
+                    text_state=text_state,
                 ))
             self.storage.save_chunks_batch(memory_chunks)
             stat = entry["file_path"].stat()
+            # P1-阶段三 (C-A3): the files bookkeeping row now carries the
+            # REAL chunk count and the chunker version that produced it.
+            # Before this, every row said "0 chunks" — a fact that was
+            # false for every file in the index and could not be told
+            # apart from a file that really produced none.
             self.storage.update_file_metadata(
                 path=rel_path,
                 source=entry["source"],
                 file_hash=entry["file_hash"],
                 mtime=int(stat.st_mtime),
                 size=stat.st_size,
+                chunk_count=len(memory_chunks),
+                chunker_version=TextChunker.CHUNKER_VERSION,
             )
 
         # Stamp the chunker version only when we rebuilt from an empty index,
@@ -1397,12 +1469,22 @@ class MemoryManager:
         # whether this index may serve can compare one token instead of
         # re-deriving the column set. A missing token reads as "unknown"
         # — distinct from a schema that IS known.
+        #
+        # P1-阶段三 (C-A1.4): the fingerprint is reported TOGETHER WITH the
+        # tables it covers. The old single-table fingerprint said
+        # "consistent" for two indexes whose `files` tables had already
+        # forked; a reader who is not told WHAT was compared cannot tell
+        # that verdict apart from a real one.
         schema_fp = None
+        schema_fp_tables = ""
         try:
             row = self.storage.conn.execute(
                 "SELECT value FROM _meta WHERE key='schema_fingerprint'"
             ).fetchone()
             schema_fp = row[0] if row else None
+            from agent.memory.schema_drift import schema_fingerprint_tables
+
+            schema_fp_tables = ",".join(schema_fingerprint_tables())
         except Exception:
             schema_fp = None
 
@@ -1444,6 +1526,10 @@ class MemoryManager:
                 if degraded else ''
             ),
             'schema_fingerprint': schema_fp,
+            # WHAT the fingerprint covers. Without it, "the fingerprints
+            # agree" is indistinguishable from "the fingerprints agree on
+            # the one table the fingerprint looked at".
+            'schema_fingerprint_tables': schema_fp_tables,
             # P1 阶段二-B T3: the read-path freshness probe counters — stale
             # hits must be self-reported, not discovered by luck (风控: 自曝
             # 不能是撞运气自曝).
@@ -1486,6 +1572,63 @@ class MemoryManager:
     
     # Helper methods
     
+    @staticmethod
+    def _body_columns_for(
+        *,
+        relpath: str,
+        start_line: int,
+        end_line: int,
+        part: int,
+        chunk_text: str,
+        workspace_root: Optional[Path],
+        source_file: Optional[Path] = None,
+    ) -> Tuple[Optional[str], Optional[str], Optional[str], str]:
+        """The four body-externalization columns for one chunk row.
+
+        P1-阶段三 (H1 · C-A2).  Returns
+        ``(body_path, body_anchor, body_hash, text_state)``.
+
+        The knowledge of HOW to build them lives in
+        ``agent.memory.body_pointer`` — the ONE module — so the two writers
+        (this one and the rebuilder) cannot drift apart.  The path-safety
+        rule is ``agent.memory.paths`` — also the ONE rule, imported rather
+        than re-spelled.
+
+        ``workspace_root=None`` means "there is no truth file behind this
+        row": ``add_memory`` stores a blob of text under a synthetic path
+        without writing a file.  Such a row carries no ``body_path`` (there
+        is nothing to point at) but still carries an anchor and a drift
+        token, so it is not four empty columns.
+
+        ``source_file`` is the absolute path of the file the chunk was cut
+        from.  It is used to read the fragment, so the hash is computed from
+        the SAME bytes the invariant checker will read back (INV-3).
+        """
+        from agent.memory.body_pointer import four_columns_for_chunk
+
+        if workspace_root is None:
+            # No truth file behind this row: anchor + hash of the chunk's
+            # own text, and no body_path (there is no file to point at).
+            from agent.memory.body_pointer import (
+                STATE_PROJECTION,
+                body_anchor,
+                body_hash,
+            )
+
+            return (None,
+                    body_anchor(start_line, end_line, part),
+                    body_hash(chunk_text),
+                    STATE_PROJECTION)
+
+        return four_columns_for_chunk(
+            workspace_root=workspace_root,
+            relpath=relpath,
+            start_line=start_line,
+            end_line=end_line,
+            part=part,
+            chunk_text=chunk_text,
+        )
+
     def _generate_chunk_id(self, path: str, start_line: int, end_line: int,
                            part: int = 0) -> str:
         """Generate unique chunk ID; `part` separates the pieces of one split line."""
@@ -1495,7 +1638,11 @@ class MemoryManager:
         return hashlib.md5(content.encode('utf-8')).hexdigest()
     
     @staticmethod
-    def _compute_temporal_decay(path: str, half_life_days: float = 30.0) -> float:
+    def _compute_temporal_decay(
+        path: str,
+        half_life_days: float = 30.0,
+        occurred_at: Optional[str] = None,
+    ) -> float:
         """
         Compute temporal decay multiplier for dated memory files.
 
@@ -1505,21 +1652,43 @@ class MemoryManager:
 
         Formula: multiplier = exp(-ln2/half_life * age_in_days)
 
-        G-4 · D-A · **STILL UNFIXED (registered as an open P1-阶段三 item)**:
-        the date is read from the PATH by a regex; the truth layer's own
-        ``occurred_at`` is never consulted. The design corpus defines D-A
-        as "衰减正则只匹配 memory/YYYY-MM-DD.md，v2 结构下静默失效" and
-        marks it P0-fix. The fix (read front-matter ``occurred_at`` first,
-        fall back to the regex; keep knowledge pages evergreen) is
-        specified in 00-P1详细设计-文本外置.md §… but is NOT implemented:
-        every path this regex does not match returns 1.0 silently.
-        There is NO criterion for it yet — so it must not be reported as
-        fixed. See the G-4 section of
-        2026-10-29-P1-阶段二F-G1G4修复.md.
+        P1-阶段三 (D-A) · **FIXED**.  The date is now read from the TRUTH
+        LAYER FIRST: the front-matter's ``occurred_at``, which is what the v2
+        element system writes.  The old implementation read the date from
+        the PATH with a regex that only matched ``memory/YYYY-MM-DD.md`` (and
+        the per-user / dreams variants), so every v2 element file --
+        ``memory/markdown/events/2026-10-28/<slug>--<hash8>.md`` -- silently
+        returned 1.0.  "Silently" is the operative word: the decay was not
+        applied AND nothing said so.
+
+        The order of consultation:
+
+        1. **``occurred_at``** (the front-matter, or an explicit argument) --
+           the element's own statement of WHEN it happened.  This is the
+           authoritative date in the v2 structure.
+        2. **The legacy path regex** -- for the daily-diary structure that
+           predates the element system (``memory/YYYY-MM-DD.md``).
+        3. **Evergreen** -- everything else (knowledge pages, MEMORY.md,
+           handoff notes, undated elements).
+
+        ``knowledge/`` pages stay evergreen **even when they carry an
+        ``occurred_at``**: a knowledge page is a distilled analysis whose
+        date is a time anchor, not a freshness marker.  That distinction was
+        already encoded in the old regex (a dated knowledge page never
+        decayed) and it is preserved here -- the rule is about the LAYER, not
+        about the presence of a date.
+
+        The timestamp is parsed with ``text_inv.parse_timestamp`` -- the ONE
+        parser -- so the decay side and the shelf-lag side agree on what a
+        timestamp means (P1 阶段二-B T2-B2 was exactly this class of bug).
+
+        Fail-closed on an unparseable date: an ``occurred_at`` we cannot read
+        is treated as evergreen rather than as "now", because guessing
+        "now" would make an old element look fresh -- the opposite of the
+        error we are fixing.
         """
         import re
-        import math
-        
+
         # Normalize legacy backslash paths so the anchor below also matches
         # paths produced on Windows checkouts.
         normalized = path.replace("\\", "/")
@@ -1529,24 +1698,99 @@ class MemoryManager:
         # Dated knowledge pages (knowledge/analysis/foo-2026-09-02.md) are
         # event time anchors rather than perishable content, so they stay
         # evergreen and are never decayed.
+        #
+        # P1-阶段三 (D-A): a knowledge page stays evergreen EVEN IF it carries
+        # an ``occurred_at`` -- the LAYER decides, not the presence of a date.
+        is_knowledge = normalized.startswith("knowledge/")
+
+        # --- 1. the truth layer's own date ---------------------------------
+        if occurred_at:
+            stamp = MemoryManager._parse_occurred_at(occurred_at)
+            if stamp is None:
+                # Unparseable: fall through to the path rule, then evergreen.
+                pass
+            elif is_knowledge:
+                return 1.0
+            else:
+                return MemoryManager._decay_from_date(
+                    stamp.date(), half_life_days)
+
+        # --- 2. the legacy path rule ---------------------------------------
         match = re.search(
             r'^memory/(?:users/[^/]+/|dreams/)?(\d{4})-(\d{2})-(\d{2})\.md$', normalized
         )
         if not match:
+            # --- 3. evergreen ------------------------------------------------
             return 1.0  # evergreen: MEMORY.md, knowledge pages, handoffs...
-        
+
         try:
             file_date = datetime(
                 int(match.group(1)), int(match.group(2)), int(match.group(3))
             )
-            age_days = (datetime.now() - file_date).days
+        except ValueError:
+            return 1.0
+        return MemoryManager._decay_from_date(file_date.date(), half_life_days)
+
+    @staticmethod
+    def _parse_occurred_at(value: str):
+        """The moment an element's ``occurred_at`` states, or None.
+
+        P1-阶段三 (D-A): the parsing is delegated to
+        ``text_inv.parse_timestamp`` -- the ONE parser -- so the decay side and
+        the shelf-lag side cannot disagree about what a timestamp means.
+        """
+        from agent.memory.text_inv import parse_timestamp
+
+        return parse_timestamp(value)
+
+    @staticmethod
+    def _decay_from_date(file_date, half_life_days: float) -> float:
+        """The decay multiplier for a date, with the documented formula.
+
+        ``multiplier = exp(-ln2/half_life * age_in_days)``; a date in the
+        future (or today) is evergreen.
+        """
+        import math
+
+        try:
+            age_days = (datetime.now().date() - file_date).days
             if age_days <= 0:
                 return 1.0
-            
+
             decay_lambda = math.log(2) / half_life_days
             return math.exp(-decay_lambda * age_days)
-        except (ValueError, OverflowError):
+        except (ValueError, OverflowError, TypeError):
             return 1.0
+
+    @staticmethod
+    def _occurred_at_of(workspace_root, relpath: str) -> Optional[str]:
+        """The ``occurred_at`` the truth file behind ``relpath`` declares.
+
+        P1-阶段三 (D-A): the decay needs the element's own date, and the
+        element's date lives in the FILE.  This reads it -- read-only, from
+        the workspace root, with the ONE front-matter parser
+        (``agent.memory.frontmatter.split_frontmatter``).
+
+        Returns None when the file does not exist, carries no front-matter,
+        or declares no ``occurred_at``.  None means "no date stated", which
+        the caller turns into "fall back to the legacy path rule".
+        """
+        if not workspace_root or not relpath:
+            return None
+        try:
+            from agent.memory.frontmatter import split_frontmatter
+            from agent.memory.paths import normalize_relpath
+
+            target = Path(workspace_root) / normalize_relpath(relpath)
+            if not target.is_file():
+                return None
+            fm, _ = split_frontmatter(target.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        value = fm.get("occurred_at")
+        if value is None:
+            return None
+        return str(value)
     
     @staticmethod
     def _normalize_weights(vector_weight: float, keyword_weight: float) -> tuple:
@@ -1591,6 +1835,36 @@ class MemoryManager:
             for i, r in enumerate(results)
         }
 
+    def _decay_for_path(self, path: str,
+                        half_life_days: float = 30.0) -> float:
+        """The decay factor for one indexed path.
+
+        P1-阶段三 (D-A).  The order of consultation:
+
+        1. the truth file's own front-matter ``occurred_at`` — the v2 element
+           structure's authoritative date;
+        2. the legacy path regex (daily diaries);
+        3. evergreen.
+
+        The file is read only for paths that are NOT already decidable by
+        the legacy rule, and the read is bounded: one file per candidate
+        path, front-matter only (the first block), and the front-matter
+        parser is the ONE parser.
+
+        The workspace root is resolved defensively: a manager built without
+        a config (several tests do) simply gets the legacy behaviour rather
+        than an exception.
+        """
+        try:
+            workspace = self.config.get_workspace()
+        except Exception:
+            workspace = None
+        occurred_at = None
+        if workspace is not None:
+            occurred_at = self._occurred_at_of(workspace, path)
+        return self._compute_temporal_decay(
+            path, half_life_days=half_life_days, occurred_at=occurred_at)
+
     def _merge_results(
         self,
         vector_results: List[SearchResult],
@@ -1598,13 +1872,31 @@ class MemoryManager:
         vector_weight: float,
         keyword_weight: float
     ) -> List[SearchResult]:
-        """Merge vector and keyword search results with temporal decay.
+        """Merge vector and keyword search results.
 
         Each channel is rank-normalized to a common (0, 1] scale first, then a
         chunk is scored by the weighted average over only the channels that
         actually returned it. A strong single-channel hit is therefore not
         diluted by a 0.0 from the missing channel, and the two channels' raw
         scores no longer have to be comparable to be fused fairly.
+
+        P1-阶段三 (D-C): the temporal decay is NOT multiplied into the score
+        here any more -- it is CARRIED on the result (``SearchResult.decay``)
+        and applied once, at the end of the ranking chain.
+
+        Why the factor travels instead of being applied:
+
+        * the old code applied the decay in BOTH ``_merge_results`` and
+          ``_rerank``, so a reranked result was decayed TWICE (``decay**2``)
+          -- a 100-day-old element with a 30-day half-life was scored at
+          0.0056 instead of 0.0992;
+        * applying it at the end means "the decay is applied once" is a
+          property of the CODE, not of the order in which two methods happen
+          to be called.  A third ranking stage cannot introduce a second
+          multiplication by accident.
+
+        The UNDECAYED score is what travels, so the reranker can fuse with
+        the retrieval signal on the same scale (see ``_rerank``).
         """
         vector_weight, keyword_weight = self._normalize_weights(vector_weight, keyword_weight)
         vector_norm = self._rank_normalize(vector_results)
@@ -1634,9 +1926,6 @@ class MemoryManager:
             )
             combined_score = (numerator / denominator) if denominator > 0 else 0.0
 
-            # Apply temporal decay for dated memory files
-            combined_score *= self._compute_temporal_decay(result.path)
-
             merged_results.append(SearchResult(
                 path=result.path,
                 start_line=result.start_line,
@@ -1644,7 +1933,13 @@ class MemoryManager:
                 score=combined_score,
                 snippet=result.snippet,
                 source=result.source,
-                user_id=result.user_id
+                user_id=result.user_id,
+                # P1-阶段三 (D-C): the decay FACTOR travels with the score;
+                # it is applied once, at the end of the ranking chain.
+                # P1-阶段三 (D-A): the factor is looked up per PATH, so the
+                # truth layer's own ``occurred_at`` is consulted (the v2
+                # element structure) rather than only the legacy path regex.
+                decay=self._decay_for_path(result.path),
             ))
 
         merged_results.sort(key=lambda r: r.score, reverse=True)
@@ -1657,28 +1952,34 @@ class MemoryManager:
     ) -> List[SearchResult]:
         """Reorder candidates by the reranker's relevance scores.
 
-        Replaces each candidate's fused score with the reranker's score (still
-        subject to temporal decay), then re-sorts. Returns ``results``
-        unchanged when no reranker is configured, and falls back to them when
-        rerank fails, the same way vector search degrades to keyword-only.
+        P1-阶段三 (D-C) -- **FIXED**.  Two things were wrong here:
 
-        G-4 · D-C · **STILL UNFIXED (registered as an open P1-阶段三 item)**:
-        two things are wrong here and neither has a criterion yet.
-
-          1. The reranker score REPLACES the fused score outright (no
+          1. The reranker score REPLACED the fused score outright (no
              renormalization), so the keyword/vector channels' contribution
-             is discarded whenever a reranker is configured.
-          2. The temporal decay is applied to the rerank score here, while
-             the fused score was ALREADY decayed upstream — the decay is
+             was discarded whenever a reranker was configured.
+          2. The temporal decay was applied to the rerank score here, while
+             the fused score was ALREADY decayed upstream -- the decay was
              multiplied twice on the rerank path.
 
-        The design corpus defines D-C as "decay 被乘了两次；有 reranker
-        时融合分被完全丢弃" and marks it P0-fix, with the target shape
-        ``score_breakdown = {bm25, rerank, decay, hit_boost, graph}``
-        (09 号 D-C2) — weighted total for ranking, breakdown for display.
-        That is NOT implemented. Do not report it as fixed without a
-        criterion. See the G-4 section of
-        2026-10-29-P1-阶段二F-G1G4修复.md.
+        What it does now:
+
+        * **The rerank score is FUSED with the retrieval score, not
+          substituted for it.**  Both are on the (0, 1] retrieval scale (the
+          reranker providers already rank-normalize onto it), so the two are
+          combined by a weighted average and renormalized over the channels
+          that actually produced a value.  The final score therefore
+          reflects BOTH the retrieval channels and the reranker: the
+          reranker can promote a candidate, but it can no longer throw away
+          the evidence that brought it there.
+
+        * **The decay is applied ONCE, at the end.**  The fused score is
+          kept UNDECAYED through the fusion, the decay factor travels on
+          the result, and the final score is ``fused * decay`` -- exactly one
+          multiplication.
+
+        The DEGRADATION behaviour is unchanged: no reranker configured
+        returns ``results`` untouched, and a rerank that raises keeps the
+        fused order.  The stage-two degradation criteria still hold.
         """
         if self.reranker is None or not results:
             return results
@@ -1695,21 +1996,98 @@ class MemoryManager:
             logger.warning(f"[MemoryManager] Rerank failed, keeping fused order: {e}")
             return results
 
+        # The reranker's own scale is (0, 1] with the top hit at 1.0 -- the
+        # same shape the fusion channels use.  Normalizing it here (rather
+        # than trusting the provider) is what makes the two comparable when
+        # a provider returns raw logits.
+        rerank_norm = self._rank_normalize_scores(scores)
+        rerank_weight = self._rerank_weight()
+
         reranked = []
-        for result, score in zip(results, scores):
-            decayed = score * self._compute_temporal_decay(result.path)
+        for result, rerank_score in zip(results, rerank_norm):
+            # D-C fix 1: FUSE, do not substitute.  The retrieval score and
+            # the rerank score are both on (0, 1]; the weighted average is
+            # renormalized over the channels that produced a value, exactly
+            # like ``_merge_results`` does for the vector/keyword channels.
+            fused = self._fuse_scores(result.score, rerank_score,
+                                      rerank_weight=rerank_weight)
+            # D-C fix 2: the decay is applied ONCE, here, and only here.
+            decay = 1.0 if result.decay is None else float(result.decay)
             reranked.append(SearchResult(
                 path=result.path,
                 start_line=result.start_line,
                 end_line=result.end_line,
-                score=decayed,
+                score=fused * decay,
                 snippet=result.snippet,
                 source=result.source,
-                user_id=result.user_id
+                user_id=result.user_id,
+                decay=decay,
             ))
 
         reranked.sort(key=lambda r: r.score, reverse=True)
         return reranked
+
+    def _rerank_weight(self) -> float:
+        """The reranker's share of the final score (P1-阶段三 D-C).
+
+        Read from the config when there is one; the default is 0.5 (the two
+        signals contribute equally).  A manager built without a config (the
+        unit tests do) gets the default rather than an exception — the
+        fusion must never be the thing that breaks a search.
+        """
+        config = getattr(self, "config", None)
+        try:
+            weight = float(getattr(config, "rerank_weight", 0.5))
+        except (TypeError, ValueError):
+            return 0.5
+        if not (0.0 <= weight <= 1.0):
+            return 0.5
+        return weight
+
+    @staticmethod
+    def _rank_normalize_scores(scores: List[float]) -> List[float]:
+        """Map a score list onto the retrieval scale: the top hit becomes 1.0.
+
+        The same shape ``_rank_normalize`` gives the fusion channels, so a
+        reranked score and a fused score carry comparable numbers.  A
+        provider that already returns that scale is unchanged by it (the
+        normalization is order-preserving and the top hit is already 1.0).
+        """
+        n = len(scores)
+        if n == 0:
+            return []
+        order = sorted(range(n), key=lambda i: scores[i], reverse=True)
+        normalized = [0.0] * n
+        for rank, index in enumerate(order):
+            normalized[index] = (n - rank) / n
+        return normalized
+
+    @staticmethod
+    def _fuse_scores(retrieval_score: float, rerank_score: float,
+                     rerank_weight: float = 0.5) -> float:
+        """Combine the retrieval score and the rerank score.
+
+        The rerank weight is the reranker's share of the final signal.  At
+        0.5 the two contribute equally -- the reranker is a strong opinion,
+        not the sole authority, and the retrieval channels' evidence is never
+        discarded.
+
+        The result is renormalized over the values that actually exist, so a
+        missing channel contributes 0 to the WEIGHT, not to the score -- the
+        same rule ``_merge_results`` uses for its two channels.
+        """
+        try:
+            w = float(rerank_weight)
+        except (TypeError, ValueError):
+            w = 0.5
+        if not (0.0 <= w <= 1.0):
+            w = 0.5
+        retrieval_weight = 1.0 - w
+        numerator = retrieval_weight * float(retrieval_score) + w * float(rerank_score)
+        denominator = retrieval_weight + w
+        if denominator <= 0:
+            return float(retrieval_score)
+        return numerator / denominator
 
     def _hit_boost_params(self):
         """(weight, cap) of the hit-popularity boost; weight 0 means off."""

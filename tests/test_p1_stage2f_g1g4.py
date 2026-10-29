@@ -752,6 +752,30 @@ def test_g5_the_chunk_decision_is_checked_independently_of_itself():
 
 
 # ---- G-4 · the real D-A / D-C status ------------------------------------
+#
+# P1-阶段三 (S3-B): D-A and D-C are NOW FIXED, so these criteria FLIP.
+#
+# They used to assert that the "STILL UNFIXED" registration was PRESENT —
+# a criterion that was about a defect being honestly reported.  The defect
+# is fixed now, so the honest report is "FIXED", and a criterion that still
+# demanded the "STILL UNFIXED" wording would FAIL the code for being
+# correct — which is the same failure the G-4 criterion was written to
+# prevent, pointing the other way.
+#
+# What the flipped criteria assert:
+#   * the "STILL UNFIXED" registration is GONE (the defect is fixed, and
+#     the code must not keep claiming it is open);
+#   * a FIXED-status registration is present (the fix must be SAY SO in
+#     the code, not just be present in it — an unregistered fix is a fix
+#     nobody can audit);
+#   * the fix is REAL: D-A consults the truth layer's ``occurred_at``, and
+#     D-C fuses the rerank score and applies the decay exactly once.
+#
+# The last pair are the behavioural criteria; the registration checks are
+# the documentation ones.  Both are needed: a docstring that says "FIXED"
+# without the behaviour is a false claim, and the behaviour without the
+# docstring is an undeclared change.
+
 
 def _g4_registration(source: str, marker: str) -> bool:
     """Is the UNFIXED-status registration for ``marker`` present?
@@ -770,27 +794,137 @@ def _g4_registration(source: str, marker: str) -> bool:
     return False
 
 
-def test_g4_da_is_registered_as_unfixed():
-    """G-4: D-A (decay from occurred_at) is NOT fixed — say so in code."""
-    src = (REPO / "agent" / "memory" / "manager.py").read_text(
-        encoding="utf-8")
-    assert _g4_registration(src, "D-A"), (
-        "G-4: D-A must be registered in _compute_temporal_decay's docstring "
-        "as unfixed (the registration was deleted)")
+def _g4_fixed_registration(source: str, marker: str) -> bool:
+    """Is the FIXED-status registration for ``marker`` present?"""
+    for block in source.split("\n    "):
+        if marker in block and "FIXED" in block:
+            return True
+    return False
 
 
-def test_g4_dc_is_registered_as_unfixed():
-    """G-4: D-C (reranker fusion / double decay) is NOT fixed."""
+def test_g4_da_is_fixed_and_says_so():
+    """G-4 / P1-阶段三 S3-B: D-A (decay from occurred_at) IS fixed now."""
     src = (REPO / "agent" / "memory" / "manager.py").read_text(
         encoding="utf-8")
-    assert _g4_registration(src, "D-C"), (
-        "G-4: D-C must be registered in _rerank's docstring as unfixed "
-        "(the registration was deleted)")
+    assert not _g4_registration(src, "D-A"), (
+        "G-4: D-A is fixed (P1-阶段三 S3-B) — the 'STILL UNFIXED' "
+        "registration must be REMOVED; a code that keeps claiming the "
+        "defect is open is misreporting its own state")
+    assert _g4_fixed_registration(src, "D-A"), (
+        "G-4: D-A's fix must be REGISTERED in "
+        "_compute_temporal_decay's docstring as FIXED (an unregistered fix "
+        "is a fix nobody can audit)")
+
+
+def test_g4_dc_is_fixed_and_says_so():
+    """G-4 / P1-阶段三 S3-B: D-C (reranker fusion / double decay) IS fixed."""
+    src = (REPO / "agent" / "memory" / "manager.py").read_text(
+        encoding="utf-8")
+    assert not _g4_registration(src, "D-C"), (
+        "G-4: D-C is fixed (P1-阶段三 S3-B) — the 'STILL UNFIXED' "
+        "registration must be REMOVED")
+    assert _g4_fixed_registration(src, "D-C"), (
+        "G-4: D-C's fix must be REGISTERED in _rerank's docstring as FIXED")
+
+
+def test_g4_da_really_reads_the_truth_layers_occurred_at():
+    """The D-A fix is REAL: the decay consults the truth layer.
+
+    A docstring that says "FIXED" is a claim; this is the evidence.  The
+    criterion is BEHAVIOURAL: an element file whose front-matter declares
+    an old ``occurred_at`` must decay, and the same file without the
+    front-matter must not.
+    """
+    from agent.memory.manager import MemoryManager
+
+    # 100 days ago, in the v2 element structure (a path the old regex
+    # never matched).
+    import datetime
+
+    old = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+        days=100)
+    stamp = old.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    path = "memory/markdown/events/2026-05-01/some-event--deadbeef.md"
+
+    decayed = MemoryManager._compute_temporal_decay(path, occurred_at=stamp)
+    assert decayed < 1.0, (
+        "D-A is NOT fixed: an element whose front-matter declares a "
+        f"100-day-old occurred_at still scores {decayed} — the decay never "
+        "consulted the truth layer")
+    # Without the front-matter, the legacy path rule does not match this
+    # path either, so it is evergreen.
+    assert MemoryManager._compute_temporal_decay(path) == 1.0
+
+
+def test_g4_dc_applies_the_decay_exactly_once():
+    """The D-C fix is REAL: the decay is applied once, not twice.
+
+    The old code multiplied the decay in BOTH ``_merge_results`` and
+    ``_rerank``.  The criterion is BEHAVIOURAL: with a dated path, the
+    reranked score must be the FUSED score times the decay ONCE — not
+    times the decay squared.
+    """
+    import math
+
+    from agent.memory.manager import MemoryManager
+    from agent.memory.reranker import Reranker
+    from agent.memory.storage import SearchResult
+
+    class _Fixed(Reranker):
+        def rerank(self, query, documents):
+            return [1.0 for _ in documents]
+
+    manager = MemoryManager.__new__(MemoryManager)
+    manager.reranker = _Fixed()
+    manager.config = type("C", (), {"rerank_weight": 0.5})()
+
+    # 100 days ago with a 30-day half-life -> exp(-ln2/30 * 100).
+    expected_decay = math.exp(-math.log(2) / 30.0 * 100)
+
+    result = SearchResult(
+        path="memory/2026-01-01.md", start_line=1, end_line=1, score=0.8,
+        snippet="s", source="memory", user_id=None,
+        decay=expected_decay,
+    )
+    reranked = manager._rerank("q", [result])
+    got = reranked[0].score
+
+    # The rerank side is rank-normalized to 1.0 for a single candidate, so
+    # the fused score is (0.8 + 1.0) / 2 = 0.9.
+    assert abs(got - 0.9 * expected_decay) < 1e-9, (
+        f"D-C is NOT fixed: the decay was applied more than once "
+        f"(got {got}, expected {0.9 * expected_decay})")
+    assert abs(got - 0.9 * expected_decay * expected_decay) > 1e-9, (
+        "the score is the decay applied TWICE — D-C is not fixed")
+
+
+#: The files that may legitimately mention D-A / D-C, and WHY.
+#:
+#: The guard is about COLLISION: a test that uses "D-C" to mean something
+#: else (the foundation test once used it for "the four columns landed").
+#: Two files talk about the REAL defects and are therefore allowed:
+#:
+#:   * this one -- it OWNS the status criteria for the two defects;
+#:   * test_memory_rerank.py -- it carries the new behavioural criterion
+#:     for the D-C fusion fix.
+#:
+#: An explicit list of files (each with its reason) is the honest shape
+#: here.  The earlier shape -- a keyword list of "legitimate contexts" --
+#: had to be extended with every new legitimate mention, which is exactly
+#: how a guard like this gets quietly disabled.
+G4_FILES_ALLOWED_TO_MENTION = {
+    "test_p1_stage2f_g1g4.py":
+        "this file owns the D-A / D-C status criteria",
+    "test_memory_rerank.py":
+        "carries the behavioural criterion for the D-C fusion fix",
+}
 
 
 def test_g4_no_number_collision_left_in_the_tests():
     """G-4: no test may use D-A/D-C to mean something else."""
     for p in (REPO / "tests").glob("test_*.py"):
+        if p.name in G4_FILES_ALLOWED_TO_MENTION:
+            continue
         t = p.read_text(encoding="utf-8", errors="replace")
         # A mention is legitimate only inside a collision notice: the block
         # that EXPLAINS the collision and points at the real status.
@@ -799,7 +933,8 @@ def test_g4_no_number_collision_left_in_the_tests():
                 continue
             legitimate = any(k in block for k in (
                 "COLLISION", "collision", "G-4", "STILL UNFIXED",
-                "registered", "NUMBER COLLISION"))
+                "registered", "NUMBER COLLISION",
+            ))
             if legitimate:
                 continue
             for line in block.splitlines():

@@ -1074,7 +1074,8 @@ class Inspector:
         """
         from agent.memory.schema_drift import (
             describe_drift,
-            missing_columns,
+            missing_columns_all,
+            missing_columns_by_table,
             scan_workspaces,
         )
 
@@ -1084,13 +1085,22 @@ class Inspector:
         drift = scan_workspaces(roots)
         own_db = self._index_db_path()
         if own_db.is_file():
-            own_missing = missing_columns(own_db)
+            own_missing = missing_columns_all(own_db)
             if own_missing:
                 drift.setdefault(str(self.workspace_root), own_missing)
 
         for root in sorted(drift):
             missing = drift[root]
             rel = self._relative_to_self(root)
+            # P1-阶段三 (H2): the report says WHICH TABLE each missing column
+            # belongs to. "path" and "hash" exist in BOTH modelled tables,
+            # so a bare list is genuinely ambiguous — and the whole point of
+            # this change is that the drift report must not be ambiguous
+            # about where the fork is.
+            by_table = missing_columns_by_table(
+                (Path(root) / "memory" / "long-term" / "index.db")
+                if (Path(root) / "memory" / "long-term" / "index.db").is_file()
+                else own_db)
             self._violation(
                 report, REASON_SCHEMA_DRIFT, rel,
                 f"the index is behind the current schema (missing "
@@ -1099,6 +1109,7 @@ class Inspector:
                 f"than as an error",
                 _SEV_HIGH, code=CODE_SCHEMA_DRIFT,
                 missing_columns=missing,
+                missing_by_table=by_table,
                 index_root=root,
                 drift_summary=describe_drift({root: missing}),
             )

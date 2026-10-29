@@ -94,6 +94,16 @@ def fake_sentence_transformers(monkeypatch):
 
 
 def test_rerank_reorders_by_reranker_score():
+    """The reranker's opinion decides the ORDER.
+
+    P1-阶段三 (D-C): the rerank score no longer REPLACES the fused score —
+    the two are FUSED.  So the scores below are the fusion of the incoming
+    score (0.0 for all three) and the rank-normalized rerank score
+    (1.0 / 0.667 / 0.333), at the default 0.5 weight.
+
+    The ORDER is still the reranker's order, which is what the reranker is
+    for; what changed is that the retrieval channels' evidence survives.
+    """
     results = [_result("a"), _result("b"), _result("c")]
     reranker = ScriptedReranker({"snippet a": 0.1, "snippet b": 0.5, "snippet c": 0.9})
 
@@ -101,7 +111,50 @@ def test_rerank_reorders_by_reranker_score():
 
     assert [r.snippet for r in reranked] == ["snippet c", "snippet b", "snippet a"]
     # Non-dated paths carry decay 1.0, so scores pass through unchanged.
-    assert [r.score for r in reranked] == [0.9, 0.5, 0.1]
+    # The fused score is (retrieval + rerank) / 2, with the rerank side
+    # rank-normalized onto (0, 1]: c=1.0, b=2/3, a=1/3.
+    assert [round(r.score, 6) for r in reranked] == [
+        round((0.0 + 1.0) / 2, 6),
+        round((0.0 + 2 / 3) / 2, 6),
+        round((0.0 + 1 / 3) / 2, 6),
+    ]
+
+
+def test_rerank_fuses_with_the_fused_score_instead_of_replacing_it():
+    """D-C: the retrieval score is NOT discarded by the reranker.
+
+    The old behaviour replaced the fused score outright, so the
+    keyword/vector channels' contribution vanished whenever a reranker was
+    configured.  With a non-zero incoming score the final score must be
+    strictly between the two, and must differ from the pure reranker score.
+    """
+    results = [_result("a", score=0.8), _result("b", score=0.2)]
+    reranker = ScriptedReranker({"snippet a": 0.9, "snippet b": 0.1})
+
+    reranked = _manager_with(reranker)._rerank("query", results)
+
+    by_snippet = {r.snippet: r.score for r in reranked}
+    # Rank-normalized rerank: a=1.0, b=0.5.
+    assert by_snippet["snippet a"] != 1.0, (
+        "the final score IS the pure reranker score — the fused score was "
+        "discarded (D-C not fixed)")
+    assert by_snippet["snippet a"] > by_snippet["snippet b"], (
+        "the order must still follow the reranker")
+    # a: (0.8 + 1.0) / 2 = 0.9 ; b: (0.2 + 0.5) / 2 = 0.35
+    assert round(by_snippet["snippet a"], 6) == 0.9
+    assert round(by_snippet["snippet b"], 6) == 0.35
+
+
+def test_rerank_weight_of_one_restores_the_substitute_behaviour():
+    """The weight is configurable; 1.0 means "the reranker decides"."""
+    results = [_result("a", score=0.8)]
+    reranker = ScriptedReranker({"snippet a": 0.9})
+    manager = _manager_with(reranker)
+    manager.config = SimpleNamespace(rerank_weight=1.0)
+
+    reranked = manager._rerank("query", results)
+    # Rank-normalized rerank for a single candidate is 1.0.
+    assert round(reranked[0].score, 6) == 1.0
 
 
 def test_rerank_is_noop_without_reranker():

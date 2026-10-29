@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.memory.naming import canonical_text
+from agent.memory.body_pointer import resolve_truth_file
 
 # T2: the shelf-lag invariant reads the single change log the facade /
 # import_human_edit / rebuilder all write to — the two projections read the
@@ -79,8 +80,18 @@ def _parse_anchor(anchor: str) -> Optional[Tuple[int, int, int]]:
         return None
 
 
-def _read_fragment(path: Path, anchor: str) -> Optional[str]:
-    """Read the fragment an anchor points at, or None when it cannot be located."""
+def read_fragment_at_anchor(path: Path, anchor: str) -> Optional[str]:
+    """The fragment an anchor points at, or None when it cannot be located.
+
+    P1-阶段三 (C-A2): this is the ONE reader of the anchor grammar.  It was
+    private (``_read_fragment``) and is now public, because the WRITER side
+    (the body-pointer builder) must read the fragment the SAME way the
+    CHECKER reads it — otherwise the two sides parse the same anchor
+    differently and INV-3 reports a hash mismatch that no amount of
+    rewriting the row can fix.
+
+    The private alias below is kept so the existing callers keep working.
+    """
     parsed = _parse_anchor(anchor)
     if parsed is None:
         return None
@@ -95,6 +106,11 @@ def _read_fragment(path: Path, anchor: str) -> Optional[str]:
     # newline): clamp, never reject — rejecting a valid tail is a false red.
     end = min(end, len(lines))
     return "".join(lines[start - 1:end])
+
+
+def _read_fragment(path: Path, anchor: str) -> Optional[str]:
+    """Read the fragment an anchor points at, or None when it cannot be located."""
+    return read_fragment_at_anchor(path, anchor)
 
 
 def _v(reason: str, code: str, path: str, detail: str, severity: str,
@@ -130,8 +146,13 @@ def check_inv1(conn: sqlite3.Connection, root: Path) -> Dict[str, Any]:
                           f"{bpath!r} body_anchor={banchor!r} (points nowhere)",
                           "high", chunk_id=cid))
             continue
-        fpath = root / bpath
-        if not fpath.is_file():
+        # P1-阶段三 (C-A2): the file is found through the ONE resolution
+        # rule (the writer's), not by joining the workspace root — the
+        # knowledge tree lives in the SHARED root when the agent has no
+        # copy of its own, and a reader that guessed the root reported
+        # every knowledge row as "the body file does not exist".
+        fpath = resolve_truth_file(root, bpath)
+        if fpath is None:
             out.append(_v(REASON_INV1, CODE_INV1, bpath,
                           f"chunk {cid}: body_path does not exist on disk",
                           "high", chunk_id=cid))
@@ -199,7 +220,14 @@ def check_inv2_inv3(conn: sqlite3.Connection, root: Path, *,
                 "fingerprint": "sampled=0", "violations": []}
     fp = f"sampled={len(rows)} full={bool(full)}"
     for cid, _cpath, bpath, banchor, bhash, text in rows:
-        fpath = root / bpath
+        # P1-阶段三 (C-A2): the SAME resolution rule as the writer and as
+        # INV-1 — one rule for "where the truth file is".
+        fpath = resolve_truth_file(root, bpath)
+        if fpath is None:
+            out2.append(_v(REASON_INV2, CODE_INV2, bpath,
+                           f"chunk {cid}: body_path does not exist on disk",
+                           "high", chunk_id=cid, anchor=banchor))
+            continue
         frag = _read_fragment(fpath, banchor)
         if frag is None:
             out2.append(_v(REASON_INV2, CODE_INV2, bpath,
@@ -359,8 +387,14 @@ def check_inv11(conn: sqlite3.Connection, root: Path) -> Dict[str, Any]:
             "fingerprint": fp, "violations": out}
 
 
-def _parse_ts(value: str) -> Optional[datetime]:
+def parse_timestamp(value: str) -> Optional[datetime]:
     """Parse a timestamp into an aware datetime, or None if unparseable.
+
+    P1-阶段三 (D-A): this was private (``_parse_ts``) and is now public,
+    because the DECAY side must parse ``occurred_at`` the same way the
+    shelf-lag check parses ``generated_at``.  Two parsers for one timestamp
+    format is how "the file says one moment and the code thinks another"
+    happens.
 
     Two spellings exist in this system and BOTH must compare correctly:
       * ``2026-10-29T14:45:35+08:00``  — changes.py (``isoformat``)
@@ -393,6 +427,11 @@ def _parse_ts(value: str) -> Optional[datetime]:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=_CST)
     return dt
+
+
+def _parse_ts(value: str) -> Optional[datetime]:
+    """Parse a timestamp into an aware datetime, or None if unparseable."""
+    return parse_timestamp(value)
 
 
 def check_shelf_lag(root: Path) -> Dict[str, Any]:
