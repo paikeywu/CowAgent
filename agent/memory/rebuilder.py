@@ -45,6 +45,7 @@ from agent.memory.body_pointer import (
     STATE_PROJECTION,
     body_anchor,
     body_hash,
+    four_columns_for_chunk,
     posix_body_path,
 )
 from agent.memory.storage import MemoryChunk, MemoryStorage
@@ -159,7 +160,20 @@ def rebuild_file(
     if not fp.is_file():
         raise RebuildError(f"truth file not found: {fp}")
 
-    rel = _posix_rel(fp, workspace)
+    # P1-阶段三 (S3-C): the relative path comes from the INDEX KEY, not
+    # from the filesystem location of the resolved file.
+    #
+    # The knowledge tree lives in the SHARED root when the agent has no
+    # copy of its own, so the resolved file is NOT under the agent's
+    # workspace — and ``relative_to(workspace_root)`` raised "not in the
+    # subpath of", which made the rebuild fail for every knowledge file
+    # in every agent library (63-69 errors per library, measured).
+    #
+    # The index key (``knowledge/<relative>``) and the file's location
+    # are DIFFERENT things; the key is what the row stores and what the
+    # pointer must be.  So the key is derived from the KEY SPACE, and
+    # the file is found through the ONE resolution rule.
+    rel = _rel_key_for(fp, workspace)
 
     raw = fp.read_text(encoding="utf-8")
     canonical = canonical_text(raw)
@@ -209,6 +223,23 @@ def rebuild_file(
     chunks: List[MemoryChunk] = []
     for pc in pieces:
         cid = _chunk_id(rel, pc.start_line, pc.end_line, pc.part)
+        # P1-阶段三 (S3-C): the four body columns come from the WRITER'S
+        # single definition (``body_pointer.four_columns_for_chunk``) —
+        # the same call the manager's write path makes.  The rebuilder
+        # used to spell the rule out itself and hashed the CHUNKER'S
+        # TEXT, which is a different hash from the one the checker
+        # recomputes (it hashes the FRAGMENT at the anchor).  For a
+        # re-assembled chunk the two differ, and the result was the
+        # same fact reported twice: INV-2 RED (the truth) AND INV-3 RED
+        # (which looks like corruption).  One definition, one hash.
+        body_path, body_anchor, body_hash, text_state = four_columns_for_chunk(
+            workspace_root=workspace,
+            relpath=rel,
+            start_line=pc.start_line,
+            end_line=pc.end_line,
+            part=pc.part,
+            chunk_text=pc.text,
+        )
         chunks.append(MemoryChunk(
             id=cid,
             user_id=user_id,
@@ -219,15 +250,19 @@ def rebuild_file(
             end_line=pc.end_line,
             text=pc.text,
             embedding=None,
+            # The ROW's content hash — the chunker's text.  This is the
+            # optimistic lock the conditional backfill compares against,
+            # NOT the drift token.
             hash=_body_hash(pc.text),
             metadata=None,
             element_released=element_released,
             file_sealed=file_sealed,
             sealed_owner=sealed_owner,
-            body_path=rel,
-            body_anchor=_body_anchor(pc.start_line, pc.end_line, pc.part),
-            body_hash=_body_hash(pc.text),
-            text_state=STATE_PROJECTION,
+            body_path=body_path or rel,
+            body_anchor=body_anchor or _body_anchor(pc.start_line,
+                                                      pc.end_line, pc.part),
+            body_hash=body_hash or _body_hash(pc.text),
+            text_state=text_state or STATE_PROJECTION,
         ))
 
     try:
@@ -257,6 +292,56 @@ def rebuild_file(
         "file_hash": file_hash,
         "release_mismatch": bool(mm_for_this),
     }
+
+
+
+def _rel_key_for(fp: Path, workspace_root: Path) -> str:
+    """The INDEX KEY for a truth file — not its filesystem location.
+
+    The key space is the workspace root for everything except the
+    knowledge tree, which lives in the shared root when the agent has
+    no copy of its own.  So the key is derived by asking the ONE
+    resolution rule (in reverse): is this file inside the knowledge
+    directory?  Then the key starts with ``knowledge/``; otherwise the
+    key is the path relative to the workspace root.
+
+    This is the counterpart of ``body_pointer.resolve_truth_file``: that
+    one turns a key into a file, this one turns a file into a key.  Two
+    rules that are not inverses of each other is how a rebuild writes a
+    pointer that points nowhere.
+    """
+    from agent.memory.paths import normalize_relpath
+    from agent.memory.body_pointer import _knowledge_dir
+
+    fp_resolved = fp.resolve()
+    ws_resolved = Path(workspace_root).resolve()
+
+    knowledge_dir = _knowledge_dir(workspace_root)
+    if knowledge_dir is not None:
+        try:
+            rel_to_knowledge = fp_resolved.relative_to(
+                Path(knowledge_dir).resolve())
+            key = "knowledge/" + rel_to_knowledge.as_posix()
+            safe = posix_body_path(key)
+            if safe is None:
+                raise RebuildError(
+                    "unsafe body_path %r (backslash / absolute / '..')" % key)
+            return safe
+        except ValueError:
+            pass
+
+    try:
+        rel = fp_resolved.relative_to(ws_resolved).as_posix()
+    except ValueError:
+        raise RebuildError(
+            "truth file %s is outside the workspace %s and outside the "
+            "knowledge directory — it has no index key" % (fp_resolved,
+                                                           ws_resolved))
+    safe = posix_body_path(rel)
+    if safe is None:
+        raise RebuildError(
+            "unsafe body_path %r (backslash / absolute / '..')" % rel)
+    return safe
 
 
 def _norm(p: str) -> str:
