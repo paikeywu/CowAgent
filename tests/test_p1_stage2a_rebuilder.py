@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from agent.memory.storage import MemoryStorage
-from agent.memory import rebuilder
+from agent.memory import index_guard, rebuilder
 from agent.memory.release_state import release_mismatches
 
 
@@ -133,3 +133,49 @@ def test_no_mismatch_when_consistent(tmp_path):
     r = rebuilder.rebuild_file(st, ws, f)
     st.close()
     assert r["release_mismatch"] is False
+
+
+def test_sealed_dark_page_owner_survives(tmp_path):
+    """F-A1 反向用例：暗页 owner 透传到 chunks.sealed_owner，不被守卫改写为 NULL。
+
+    暗页若以 scope='shared' 写入，守卫矫正会从 guard 表取 owner（注册时恒
+    NULL）覆盖 rebuilder 算出的正确 owner → 主人格读不到自己的暗页（P0-21）。
+    rebuilder 必须以 scope='sealed' 自带 owner 进入，绕开矫正。
+    """
+    ws = tmp_path
+    md = ws / "memory" / "markdown" / "letters"
+    md.mkdir(parents=True)
+    (ws / "memory" / "long-term").mkdir(parents=True, exist_ok=True)
+    f = md / "2026-10-01-secret--aaaaaaaa.md"
+    f.write_text(
+        "---\nid: s1\nvisibility: sealed\nauthor_viewpoint: agent--primus\n---\n\nprivate thought\n",
+        encoding="utf-8")
+    st = MemoryStorage(db_path=ws / "memory" / "long-term" / "index.db")
+    index_guard.ensure_guard(st.conn)
+    r = rebuilder.rebuild_file(st, ws, f)
+    row = st.conn.execute(
+        "SELECT scope, file_sealed, sealed_owner FROM chunks WHERE path=?",
+        (r["path"],)).fetchone()
+    assert row is not None
+    assert row[0] == "sealed", f"dark page must be sealed scope, got {row[0]}"
+    assert row[1] == 1, "file_sealed must be 1"
+    assert row[2] is not None and "primus" in row[2], \
+        f"F-A1: sealed_owner lost -> {row[2]!r}"
+    st.close()
+
+
+def test_files_row_carries_chunk_count_and_version(tmp_path):
+    """F-A2 反向用例：files.chunk_count/chunker_version 写入，非恒 0。"""
+    ws, md = _ws(tmp_path)
+    f = _mkfile(md)
+    st = _storage(ws)
+    index_guard.ensure_guard(st.conn)
+    r = rebuilder.rebuild_file(st, ws, f)
+    row = st.conn.execute(
+        "SELECT chunk_count, chunker_version FROM files WHERE path=?",
+        (r["path"],)).fetchone()
+    assert row is not None
+    assert row[0] == r["chunks"], f"chunk_count {row[0]} != {r['chunks']}"
+    assert row[1] == rebuilder.CHUNKER_VERSION, \
+        f"chunker_version {row[1]} != {rebuilder.CHUNKER_VERSION}"
+    st.close()

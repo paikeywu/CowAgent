@@ -162,6 +162,17 @@ def rebuild_file(
     if mm_for_this:
         _audit_mismatch(workspace, rel, mm_for_this)
 
+    # F-A1: a dark page must enter as scope='sealed' carrying its owner, NOT as
+    # scope='shared'. If it went in 'shared', the index_guard corrective path
+    # would fire and overwrite sealed_owner from the guard table (whose
+    # owner_token is NULL at registration) — losing the very owner the
+    # rebuilder just derived, so the owner could no longer read its own dark
+    # page (violates P0-21). Entering 'sealed' bypasses the corrective trigger
+    # entirely (it only fires on NEW.scope='shared').
+    if file_sealed:
+        scope = "sealed"
+        user_id = user_id or sealed_owner
+
     chunks: List[MemoryChunk] = []
     for pc in pieces:
         cid = _chunk_id(rel, pc.start_line, pc.end_line, pc.part)
@@ -189,7 +200,8 @@ def rebuild_file(
     try:
         storage.replace_file_chunks(
             rel, chunks, file_hash=file_hash,
-            mtime=int(stat.st_mtime), size=stat.st_size)
+            mtime=int(stat.st_mtime), size=stat.st_size,
+            chunker_version=CHUNKER_VERSION)
     except Exception as e:
         # Never half-rebuild: the old projection is still in place (the swap
         # rolled back). Log ERROR and mark .audit/ so the inspector reports red

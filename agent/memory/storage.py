@@ -1759,7 +1759,8 @@ class MemoryStorage:
         return quality * _verbatim_mention_factor(groups, text)
 
     def replace_file_chunks(self, path: str, chunks: List[MemoryChunk],
-                            file_hash: str, mtime: int, size: int):
+                            file_hash: str, mtime: int, size: int,
+                            chunker_version: int = 0):
         """Atomically replace every chunk row for one file (T1, P1-阶段二).
 
         The projection for one truth-layer file must never exist in a
@@ -1857,9 +1858,11 @@ class MemoryStorage:
                 # mtime is indistinguishable from a stale one.
                 self.conn.execute(
                     "INSERT OR REPLACE INTO files "
-                    "(path, source, hash, mtime, size, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, strftime('%s', 'now'))",
-                    (path, "memory", file_hash, mtime, size))
+                    "(path, source, hash, mtime, size, chunk_count, "
+                    " chunker_version, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))",
+                    (path, "memory", file_hash, mtime, size,
+                     len(chunks), int(chunker_version)))
                 self.vector_backend.upsert(
                     [self._to_vector_record(c) for c in chunks])
                 self.conn.commit()
