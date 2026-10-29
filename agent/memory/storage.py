@@ -721,6 +721,11 @@ class MemoryStorage:
                 updated_at INTEGER DEFAULT (strftime('%s', 'now'))
             )
         """)
+        # P1-阶段二: files bookkeeping grows chunk_count / chunker_version so a
+        # reader can tell HOW a projection was cut (and a probe can re-cut the
+        # same way). Additive, in place, idempotent — a database an older build
+        # wrote simply lacks the columns until this build opens it.
+        self._migrate_files_columns()
 
         self.conn.commit()
 
@@ -789,6 +794,20 @@ class MemoryStorage:
             )
         if "last_hit_at" not in cols:
             self.conn.execute("ALTER TABLE chunks ADD COLUMN last_hit_at INTEGER")
+
+    def _migrate_files_columns(self):
+        """Add chunk_count / chunker_version to a files table an older build wrote.
+
+        PRAGMA table_info is metadata-only; ALTER TABLE only fires when the
+        columns are missing. Idempotent.
+        """
+        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(files)")}
+        if "chunk_count" not in cols:
+            self.conn.execute(
+                "ALTER TABLE files ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0")
+        if "chunker_version" not in cols:
+            self.conn.execute(
+                "ALTER TABLE files ADD COLUMN chunker_version INTEGER NOT NULL DEFAULT 0")
 
     def _migrate_release_columns(self):
         """Add the projection + externalization columns to an older index.
@@ -1738,6 +1757,115 @@ class MemoryStorage:
             return 0.0
         quality = min(1.0, total / weight_sum)
         return quality * _verbatim_mention_factor(groups, text)
+
+    def replace_file_chunks(self, path: str, chunks: List[MemoryChunk],
+                            file_hash: str, mtime: int, size: int):
+        """Atomically replace every chunk row for one file (T1, P1-阶段二).
+
+        The projection for one truth-layer file must never exist in a
+        HALF-REBUILT state: the old rows are deleted and the new rows are
+        inserted in a SINGLE transaction, and the ``files`` bookkeeping row
+        (hash / mtime / size / chunker_version) is updated in the same one.
+        A failure rolls the whole thing back, leaving the OLD projection
+        intact — a stale-but-complete projection is strictly better than a
+        partial one (the reader can still answer, and the probe marks it
+        stale instead of returning garbage).
+
+        ``hit_count`` / ``last_hit_at`` are inherited per chunk id from the
+        old rows (creative E11): a rebuild must not silently reset the
+        retrieval-heat signal — a chunk that was found often before is still
+        the one that was found often, regardless of how many times the file
+        has been re-cut.
+
+        FTS stays consistent for free: the existing AFTER INSERT / DELETE /
+        UPDATE triggers fire inside the same transaction, so the FTS shadow
+        tables see exactly the same all-or-nothing boundary as ``chunks``.
+        """
+        # Snapshot the stats we want to survive, keyed by chunk id, BEFORE the
+        # delete. The ids are deterministic (md5 of path:start:end[:part]), so
+        # a rebuilt chunk lands on the SAME id and inherits its own heat.
+        old_stats: Dict[str, Tuple[int, Optional[int]]] = {}
+        for row in self.conn.execute(
+                "SELECT id, hit_count, last_hit_at FROM chunks WHERE path = ?",
+                (path,)):
+            old_stats[row["id"]] = (int(row["hit_count"] or 0),
+                                    row["last_hit_at"])
+
+        if _HAS_UPSERT:
+            ins_sql = """
+                INSERT INTO chunks
+                (id, user_id, scope, source, path, start_line, end_line,
+                 text, embedding, hash, metadata, element_released,
+                 file_sealed, sealed_owner, body_path, body_anchor,
+                 body_hash, text_state, hit_count, last_hit_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                ON CONFLICT(id) DO UPDATE SET
+                    user_id = excluded.user_id, scope = excluded.scope,
+                    source = excluded.source, path = excluded.path,
+                    start_line = excluded.start_line, end_line = excluded.end_line,
+                    text = excluded.text, embedding = excluded.embedding,
+                    hash = excluded.hash, metadata = excluded.metadata,
+                    element_released = excluded.element_released,
+                    file_sealed = excluded.file_sealed,
+                    sealed_owner = excluded.sealed_owner,
+                    body_path = excluded.body_path, body_anchor = excluded.body_anchor,
+                    body_hash = excluded.body_hash, text_state = excluded.text_state,
+                    hit_count = excluded.hit_count, last_hit_at = excluded.last_hit_at,
+                    updated_at = strftime('%s', 'now')
+            """
+        else:
+            ins_sql = """
+                INSERT OR REPLACE INTO chunks
+                (id, user_id, scope, source, path, start_line, end_line,
+                 text, embedding, hash, metadata, element_released,
+                 file_sealed, sealed_owner, body_path, body_anchor,
+                 body_hash, text_state, hit_count, last_hit_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+            """
+
+        params_list = []
+        for c in chunks:
+            hc, lha = old_stats.get(c.id, (0, None))
+            params_list.append((
+                c.id, c.user_id, c.scope, c.source, c.path,
+                c.start_line, c.end_line, c.text,
+                None,
+                c.hash,
+                json.dumps(c.metadata) if c.metadata else None,
+                int(c.element_released or 0),
+                int(c.file_sealed or 0),
+                c.sealed_owner or None,
+                c.body_path or None,
+                c.body_anchor or None,
+                c.body_hash or None,
+                c.text_state or "projection",
+                hc,
+                lha,
+            ))
+
+        with self._lock:
+            try:
+                # One transaction: delete + reinsert + files-row update.
+                # BEGIN IMMEDIATE takes the write lock now (not on first write)
+                # so the whole unit is atomic against other writers too.
+                self.conn.execute("BEGIN IMMEDIATE")
+                self.conn.execute("DELETE FROM chunks WHERE path = ?", (path,))
+                if params_list:
+                    self.conn.executemany(ins_sql, params_list)
+                # The files bookkeeping row travels in the SAME transaction:
+                # a rebuilt projection whose files row still points at the old
+                # mtime is indistinguishable from a stale one.
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO files "
+                    "(path, source, hash, mtime, size, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, strftime('%s', 'now'))",
+                    (path, "memory", file_hash, mtime, size))
+                self.vector_backend.upsert(
+                    [self._to_vector_record(c) for c in chunks])
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
 
     def delete_by_path(self, path: str):
         """Delete all chunks and file metadata for a path."""

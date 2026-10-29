@@ -162,6 +162,73 @@ def _iter_tombstones(memory_root: Path) -> List[Path]:
     return [p for p in sorted(base.glob("*.tombstone.md")) if p.is_file()]
 
 
+def release_mismatches(workspace_root: Path | str) -> Dict[str, List[str]]:
+    """Detect front-matter / tombstone DISAGREEMENT about what is released.
+
+    The release record is written in TWO places: the tombstone under
+    ``_tombstones/`` (the authoritative release record — WR-11 says the
+    original file's front-matter is never rewritten) and the new version's
+    front-matter (``status=released``). ``resolve()`` merges both into
+    ``released_paths`` and never says whether they agreed.
+
+    But the front-matter is editable (风控 attack surface): someone can strip
+    ``status=released`` off a file to make it resurface, and the merge alone
+    would quietly accept that as long as the tombstone still hides it — a
+    silent disagreement the projection then faithfully reproduces. This
+    function names the disagreement so the rebuilder / inspector can report
+    it RED instead of papering over it.
+
+    Returns a dict with two keys:
+      ``tombstone_only`` — paths a tombstone releases but whose current
+          front-matter does NOT say released (suspect: front-matter stripped).
+      ``frontmatter_only`` — paths whose front-matter says released but for
+          which no tombstone exists (suspect: release without a record).
+
+    Both are reported; neither is silently trusted. Read-only, never writes.
+    """
+    workspace = Path(workspace_root)
+    memory_root = _memory_root(workspace)
+
+    fm_released: Set[str] = set()
+    for p in _iter_markdown(memory_root):
+        key = _norm_key(p.relative_to(workspace).as_posix())
+        try:
+            text = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue  # unreadable is resolve()'s fail-closed job, not ours
+        try:
+            fm, _body = split_frontmatter(text)
+        except Exception:
+            continue
+        if fm and classify_frontmatter(fm) == VIS_RELEASED:
+            fm_released.add(key)
+
+    tomb_released: Set[str] = set()
+    for p in _iter_tombstones(memory_root):
+        try:
+            text = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        try:
+            fm, _body = split_frontmatter(text)
+        except Exception:
+            continue
+        if not fm:
+            continue
+        original = str(fm.get("original_path") or "")
+        if not original:
+            continue
+        key = _norm_key(original)
+        if not key.startswith("memory/"):
+            key = _norm_key("memory/" + key)
+        tomb_released.add(key)
+
+    return {
+        "tombstone_only": sorted(tomb_released - fm_released),
+        "frontmatter_only": sorted(fm_released - tomb_released),
+    }
+
+
 def tree_signature(workspace_root: Path | str) -> Tuple:
     """A cheap fingerprint of the truth layer.
 
