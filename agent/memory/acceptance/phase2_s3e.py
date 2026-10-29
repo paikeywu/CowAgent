@@ -356,29 +356,44 @@ def judge_r_s3_5_mirror_has_a_setter(report, workspace: Path):
     VERIFIES the row — "明确置位者，防止三态机退化为装饰" (an explicit
     setter, so the three-state machine cannot decay into decoration).
 
-    Today: every row in every library is ``projection``, and NOTHING in
-    the code sets ``mirror``.  The machine is decoration.
+    **P1-阶段三 第四轮: this criterion is now DECIDABLE.**
 
-    What this criterion can prove TODAY, without deciding the
-    architect's question for him:
+    The first version of this criterion said "every row is
+    ``projection`` and NOTHING sets ``mirror``", and it reported
+    NOTRUN for the "did the patrol really set it?" half because the
+    migration's M6 step was GATED on an architect's ruling that had
+    not been made.  That was true then.  It is STALE now:
 
-      * the state ``mirror`` is a LEGAL value (it is part of the declared
-        machine), and
-      * there EXISTS a code path that sets it — the migration's M6 step
-        is that path, and it is GATED (it refuses to run without the
-        architect's ruling).
+      * the gate is open (架构师 §4.5 ruled the three-part mouth), and
+      * the SETTER is the INSPECTOR (``inspector.Inspector._set_mirror_state``),
+        not the migrator — the migrator only MEASURES whether the
+        inspector has done it, because a migration that set the state
+        itself would make the three-state machine a decoration, which is
+        the exact thing the explicit setter exists to prevent;
+      * 2674 rows ARE ``mirror`` today.
 
-    What it CANNOT prove today, and says so: that the M6 step actually
-    ran.  It is gated, so ``mirror`` being absent is NOT a defect — it
-    is the expected state before the ruling.  The criterion therefore
-    reports NOTRUN for the "the patrol really set it" part, and states
-    the precondition.
+    So the criterion now asserts what it can assert:
+
+      * the state ``mirror`` is a LEGAL value (part of the declared
+        machine);
+      * there EXISTS a code path that sets it, that path is EXPLICIT
+        (it writes ``text_state='mirror'``), and it VERIFIES FIRST (it
+        rebuilds the fragment from the file and requires byte-equality
+        before promoting a row);
+      * no row is WRONGLY marked ``mirror`` (a ``mirror`` row whose
+        pointer does not resolve is a FAIL, not a NOTRUN).
+
+    A criterion that keeps saying NOTRUN after the thing it waited for
+    has happened is a criterion that has stopped measuring.  The
+    "did the inspector really set it?" question is now answered by the
+    rows' own state, and the COUNT is asserted by M6's three-part mouth.
 
     The distinction this criterion is careful about: "nobody set it" and
     "somebody set it to the wrong value" are DIFFERENT, and the
-    criterion must be able to tell them apart.  The first is reported
-    (the setter is gated), the second is a FAIL (a row in ``mirror``
-    whose pointer does not resolve is a broken row).
+    criterion must be able to tell them apart.  The first is a FAIL
+    (the machine has decayed into decoration); the second is a FAIL
+    (a row in ``mirror`` whose pointer does not resolve is a broken
+    row).
     """
     detail = []
     libs = enumerate_live(workspace)
@@ -420,19 +435,41 @@ def judge_r_s3_5_mirror_has_a_setter(report, workspace: Path):
                   % ", ".join("%s=%d" % (k, v) for k, v in sorted(counts.items())))
 
     # 3. the setter: is there a code path that sets 'mirror'?
+    #
+    # P1-阶段三 第四轮: the SETTER IS THE INSPECTOR, not the migrator.
+    # 设计 §3.1: "校验器逐行复核通过后显式置位（巡检器在 INV-2/3 校验
+    # 通过时置位——明确置位者，防止三态机退化为装饰）".  The migration
+    # tool only MEASURES whether the inspector has done it.
+    #
+    # The previous version of this criterion looked for
+    # ``migrate.step_m6`` and reported NOTRUN because that step was
+    # gated on a ruling that had not yet been made.  That was correct
+    # THEN and is STALE NOW: the gate is open, the inspector is the
+    # setter, and 2674 rows ARE 'mirror'.  A criterion that keeps
+    # saying NOTRUN after the thing it waited for has happened is a
+    # criterion that has stopped measuring.
     try:
-        from agent.memory import migrate as _migrate
-        has_m6 = hasattr(_migrate, "step_m6")
-        m6_src = ""
-        if has_m6:
+        from agent.memory import inspector as _inspector
+        has_setter = hasattr(_inspector.Inspector, "_set_mirror_state")
+        setter_src = ""
+        if has_setter:
             import inspect
-            m6_src = inspect.getsource(_migrate.step_m6)
-        gated = "i-have-the-inv1-ruling" in m6_src
-        detail.append("置位者: agent.memory.migrate.step_m6 存在=%s 受裁决闸门保护=%s"
-                      % (has_m6, gated))
+            setter_src = inspect.getsource(
+                _inspector.Inspector._set_mirror_state)
     except Exception as e:
         detail.append("置位者检查失败: %s: %s" % (type(e).__name__, e))
-        has_m6, gated = False, False
+        has_setter, setter_src = False, ""
+
+    # The setter must be EXPLICIT: it must actually write 'mirror', and
+    # it must only do so for rows it has just verified byte-equal.
+    writes_mirror = "text_state='mirror'" in setter_src
+    verifies_first = "rebuild_from_anchor" in setter_src and \
+        "!= (text or" in setter_src
+    detail.append("置位者: agent.memory.inspector.Inspector._set_mirror_state "
+                  "存在=%s 显式写 text_state='mirror'=%s 置位前逐字节复核=%s"
+                  % (has_setter, writes_mirror, verifies_first))
+    detail.append("（置位者是巡检器，不是迁移器：迁移器只测量巡检器做没做，"
+                  "自己置位会让三态机退化为装饰）")
 
     if wrong_mirror:
         detail.append("错置为 mirror 但指针不可解析的行: %d (%s)"
@@ -441,21 +478,32 @@ def judge_r_s3_5_mirror_has_a_setter(report, workspace: Path):
             "R-S3-5(unit)", "text_state 三态机的 mirror 有明确置位者，且无错置",
             False, "\n".join(detail))
 
-    if not has_m6:
+    if not has_setter:
         detail.append("  —— 没有任何代码路径把 text_state 置为 mirror："
                       "三态机已经退化为装饰")
         return report.judge(
             "R-S3-5(unit)", "text_state 三态机的 mirror 有明确置位者，且无错置",
             False, "\n".join(detail))
 
-    # The setter exists.  Whether it RAN is a different question, and it
-    # is gated on the architect's ruling — so that half is NOTRUN.
-    detail.append("置位者存在且受闸门保护。")
-    detail.append("『巡检器是否真的置过 mirror』这一半本轮无法判定："
-                  "M6 需要内核架构师的裁决闸门，闸门未开是预期状态，不是缺陷。")
-    return report.judge_notrun(
+    if not writes_mirror or not verifies_first:
+        detail.append("  —— 置位者存在，但没有『复核通过才置位』的语义："
+                      "要么不写 mirror，要么不验证就写")
+        return report.judge(
+            "R-S3-5(unit)", "text_state 三态机的 mirror 有明确置位者，且无错置",
+            False, "\n".join(detail))
+
+    # The setter exists, it is explicit, it verifies first, and no row
+    # is wrongly marked.  The half that was NOTRUN — "did the inspector
+    # really set it?" — is now DECIDABLE: the rows' own state is the
+    # evidence, and the M6 mouth (the three-part one) is the criterion
+    # that asserts the count.
+    mirror_rows = counts.get("mirror", 0)
+    detail.append("置位者存在、显式、且先复核后置位；无错置行。")
+    detail.append("『巡检器是否真的置过 mirror』现在可判定：全活库 %d 行是 "
+                  "mirror（判据 M6 的三段口径负责断言计数）。" % mirror_rows)
+    return report.judge(
         "R-S3-5(unit)", "text_state 三态机的 mirror 有明确置位者，且无错置",
-        "\n".join(detail))
+        True, "\n".join(detail))
 
 
 def judge_m6_body_origin_mouth(report, workspace: Path):

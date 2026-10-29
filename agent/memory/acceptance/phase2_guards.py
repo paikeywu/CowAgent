@@ -254,9 +254,14 @@ def judge_mutation_replay_is_registered(report, workspace: Path = None):
     """
     detail = []
     repo = Path(__file__).resolve().parents[3]
-    candidates = sorted(repo.glob("tests/test_p1_stage3*.py"))
+    # Only the files that ARE mutant replays.  A broader glob would
+    # pick up every stage-3 test file, and a file that is not a replay
+    # (it names no mutant) would then be reported as "a replay that
+    # names nothing" — a false red on a file that was never supposed
+    # to be a replay.
+    candidates = sorted(repo.glob("tests/test_p1_stage3*mutant*.py"))
     if not candidates:
-        detail.append("找不到 mutant 重放测试（tests/test_p1_stage3*.py）")
+        detail.append("找不到 mutant 重放测试（tests/test_p1_stage3*mutant*.py）")
         detail.append("没有重放 = 没有证据『改坏必红』；自检不等于反例")
         return report.judge(
             "MU-REPLAY(unit)", "mutant 重放已入库并指名要重放的变异",
