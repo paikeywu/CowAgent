@@ -100,7 +100,15 @@ class MemoryManager:
     
     Provides long-term memory for agents with vector and keyword search
     """
-    
+
+    # P1 阶段二-B T2-B1: the read-path freshness probe's CLASS-level default.
+    # ``search()`` and ``get_status()`` read ``self._freshness``; an instance
+    # built via ``__new__`` never runs __init__, so an assignment inside
+    # __init__ cannot cover that path (it raised AttributeError and took the
+    # whole retrieval down). A class attribute guarantees the name exists on
+    # every instance; __init__ shadows it with the real probe.
+    _freshness = None
+
     def __init__(
         self,
         config: Optional[MemoryConfig] = None,
@@ -117,6 +125,15 @@ class MemoryManager:
             llm_model: LLM model for summarization (optional)
             reranker: Reranker that reorders search candidates (optional)
         """
+        # P1 阶段二-B T2-B1: the freshness probe is re-assigned below (in a
+        # try/except) once the config is known. The CLASS attribute below is
+        # the real guarantee: a caller may build a manager via ``__new__``
+        # WITHOUT running this __init__ at all (several tests do exactly
+        # that), so an assignment inside __init__ alone cannot cover every
+        # path. The class-level default makes the attribute exist on EVERY
+        # instance; __init__ then shadows it with the real probe.
+        self._freshness = None
+
         self.config = config or get_default_memory_config()
         
         # Initialize storage

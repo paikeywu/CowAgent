@@ -92,12 +92,22 @@ def read_changes(workspace_root: Path | str) -> List[Dict[str, Any]]:
 
 
 def latest_change_mtime(workspace_root: Path | str) -> Optional[str]:
-    """The newest recorded ``mtime`` across all change events, or None.
+    """The newest recorded change time across all change events, or None.
 
     The shelf-lag invariant compares a shelf page's generated_at against the
     newest truth-layer change — if any recorded change is newer than the page,
     the page is stale and the inspector must report it.
+
+    P1 阶段二-B T2-B3: an event whose file does not exist (a released/deleted
+    path) records ``mtime=None``. Filtering those out made the invariant
+    blind to exactly the changes that delete a memory — so the comparison
+    MISSED them. Such an event now falls back to its own ``at`` (the record
+    time), which always exists. The fallback is PER EVENT: one event with a
+    missing mtime must not push the others out of the comparison.
     """
-    mtimes = [e.get("mtime") for e in read_changes(workspace_root)]
-    mtimes = [m for m in mtimes if m]
-    return max(mtimes) if mtimes else None
+    stamps: List[str] = []
+    for e in read_changes(workspace_root):
+        stamp = e.get("mtime") or e.get("at")
+        if stamp:
+            stamps.append(str(stamp))
+    return max(stamps) if stamps else None

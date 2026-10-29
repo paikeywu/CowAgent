@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import random
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -29,6 +30,8 @@ from agent.memory.naming import canonical_text
 # SAME record, never their own (SEED 裁决: no write-time rebuild, the P0
 # batch-rebuild contract stands).
 from agent.memory import changes as _changes
+
+_CST = timezone(timedelta(hours=8))
 
 REASON_INV1 = "gap-rule:inv1-pointer-missing"
 REASON_INV2 = "gap-rule:inv2-body-not-rebuildable"
@@ -359,6 +362,42 @@ def check_inv11(conn: sqlite3.Connection, root: Path) -> Dict[str, Any]:
             "fingerprint": fp, "violations": out}
 
 
+def _parse_ts(value: str) -> Optional[datetime]:
+    """Parse a timestamp into an aware datetime, or None if unparseable.
+
+    Two spellings exist in this system and BOTH must compare correctly:
+      * ``2026-10-29T14:45:35+08:00``  — changes.py (``isoformat``)
+      * ``2026-10-29 06:45:35+00:00``  — shelf.py (``strftime``, space sep)
+    They are the SAME instant; comparing them as strings says otherwise
+    (P1 阶段二-B T2-B2). A naive timestamp (no offset) is treated as UTC+08
+    — the system's own zone — rather than being rejected, so a legacy shelf
+    page does not turn red on a formatting technicality.
+    """
+    raw = (value or "").strip().strip("'\"")
+    if not raw:
+        return None
+    text = raw.replace(" ", "T", 1) if " " in raw and "T" not in raw else raw
+    # Python < 3.11 cannot parse a trailing 'Z'; normalize it.
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        # Fall back to the handful of strftime shapes the generators use.
+        for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S",
+                    "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M:%S"):
+            try:
+                dt = datetime.strptime(raw, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_CST)
+    return dt
+
+
 def check_shelf_lag(root: Path) -> Dict[str, Any]:
     """T2 shelf 滞后判据：真源变更晚于 shelf 页 generated_at → 报红。
 
@@ -384,29 +423,65 @@ def check_shelf_lag(root: Path) -> Dict[str, Any]:
                                   f"truth-layer change at {latest} but no "
                                   f"shelf directory exists — run a batch "
                                   f"rebuild", "MID")]}
-    generated: List[str] = []
+    generated: List[Tuple[datetime, str]] = []
+    unparsable: List[str] = []
     for page in sorted(shelf_dir.glob("*.md")):
         try:
             fm, _ = split_frontmatter(page.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError):
             continue
         ga = fm.get("generated_at")
-        if ga:
-            generated.append(str(ga))
+        if not ga:
+            continue
+        parsed = _parse_ts(str(ga))
+        if parsed is None:
+            # Fail-CLOSED: an unparsable stamp is NOT green and NOT "not run".
+            # We cannot prove the shelf is fresh, so we report red and say why.
+            unparsable.append(str(ga))
+            continue
+        generated.append((parsed, str(ga)))
     if not generated:
+        if unparsable:
+            return {"inv": "SHELF-LAG", "verdict": "RED",
+                    "fingerprint": f"latest-change={latest}, "
+                                   f"unparsable={unparsable}",
+                    "violations": [_v(
+                        REASON_SHELF_LAG, CODE_SHELF_LAG, "memory/shelf",
+                        f"shelf page generated_at could not be parsed "
+                        f"({unparsable}) — freshness cannot be proven "
+                        f"(fail-closed)", "MID")]}
         return {"inv": "SHELF-LAG", "verdict": "RED",
                 "fingerprint": f"latest-change={latest}",
                 "violations": [_v(REASON_SHELF_LAG, CODE_SHELF_LAG,
                                   "memory/shelf",
                                   f"truth-layer change at {latest} but no "
                                   f"shelf page carries generated_at", "MID")]}
-    newest_gen = max(generated)
-    lag = latest > newest_gen
+    # P1 阶段二-B T2-B2: compare INSTANTS, not strings. The two timestamps
+    # come from different generators with different spellings
+    # (changes.py isoformat vs shelf.py strftime) — a string comparison said
+    # "the shelf is behind" even for the very same moment.
+    newest_dt, newest_gen = max(generated, key=lambda item: item[0])
+    latest_dt = _parse_ts(latest)
+    if latest_dt is None:
+        return {"inv": "SHELF-LAG", "verdict": "RED",
+                "fingerprint": f"latest-change={latest} (unparsable)",
+                "violations": [_v(
+                    REASON_SHELF_LAG, CODE_SHELF_LAG, "memory/shelf",
+                    f"the newest change stamp {latest!r} could not be parsed "
+                    f"— freshness cannot be proven (fail-closed)", "MID")]}
+    lag = latest_dt > newest_dt
     out = [] if not lag else [
         _v(REASON_SHELF_LAG, CODE_SHELF_LAG, "memory/shelf",
            f"shelf is stale: latest truth-layer change {latest} is newer "
            f"than the newest shelf page generated_at {newest_gen} — run a "
            f"batch rebuild (P0 批量重建)", "MID")]
+    if unparsable:
+        # A page we cannot read is a finding on its own, even if another
+        # page is fresh enough.
+        out.append(_v(
+            REASON_SHELF_LAG, CODE_SHELF_LAG, "memory/shelf",
+            f"shelf page generated_at could not be parsed ({unparsable}) — "
+            f"freshness cannot be proven (fail-closed)", "MID"))
     return {"inv": "SHELF-LAG", "verdict": "RED" if out else "GREEN",
             "fingerprint": f"latest-change={latest}, newest-shelf={newest_gen}",
             "violations": out}
