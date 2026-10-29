@@ -917,6 +917,8 @@ G4_FILES_ALLOWED_TO_MENTION = {
         "this file owns the D-A / D-C status criteria",
     "test_memory_rerank.py":
         "carries the behavioural criterion for the D-C fusion fix",
+    "test_p1_stage3a_holes.py":
+        "carries the behavioural criteria for both fixes (P1-阶段三 S3-A/S3-B)",
 }
 
 
