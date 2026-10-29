@@ -46,6 +46,32 @@ def normalize_relpath(relpath: str) -> str:
     return str(relpath or "").replace("\\", "/").lstrip("/")
 
 
+def outside_root(root_resolved: str, target_resolved: str) -> bool:
+    """The realpath boundary rule — **one implementation**.
+
+    True when ``target_resolved`` is NOT inside ``root_resolved``.
+
+    This is the primitive behind two rules that used to be spelled out
+    twice:
+      * ``path_escape_reason`` — the read side (INV-11 / the content
+        endpoint), whose root is the workspace root;
+      * the facade's WR-03 — the WRITE side, whose root is the actor's
+        memory root and which adds its own policy on top (reparse points,
+        cross-role naming, ``PathEscapeError`` vs ``CrossRoleWriteError``).
+
+    The policy stays with the caller; the BOUNDARY is decided here, so the
+    two cannot drift. C-10 showed what a duplicated rule costs: the two
+    spellings could disagree, and a criterion built on one of them proved
+    nothing about the other.
+    """
+    try:
+        return os.path.commonpath([str(root_resolved),
+                                   str(target_resolved)]) != str(root_resolved)
+    except ValueError:
+        # Cross-drive on Windows: the paths cannot share a root at all.
+        return True
+
+
 def path_escape_reason(relpath: str, root: Path | str) -> Optional[str]:
     """Return None when ``relpath`` is safely inside ``root``; else the reason.
 
@@ -77,7 +103,7 @@ def path_escape_reason(relpath: str, root: Path | str) -> Optional[str]:
     try:
         root_res = Path(root).resolve()
         real = (root_res / norm).resolve()
-        if os.path.commonpath([str(root_res), str(real)]) != str(root_res):
+        if outside_root(str(root_res), str(real)):
             return "resolves outside the workspace root"
     except (OSError, ValueError):
         return "cannot be resolved within the root"

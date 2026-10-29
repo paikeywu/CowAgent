@@ -32,7 +32,7 @@ import stat
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import yaml
 
@@ -126,6 +126,44 @@ IMMUTABLE_FM_FIELDS = frozenset({
     "supersedes", "superseded_by", "subject", "released", "released_by",
     "released_at", "consent_ref", "fm_hash", "slug", "hash8", "author_viewpoint",
 })
+
+
+def tampered_immutable_fields(old_fm: Dict[str, Any],
+                               new_fm: Dict[str, Any],
+                               fields: Iterable[str] = IMMUTABLE_FM_FIELDS
+                               ) -> List[str]:
+    """The immutable fields whose value MOVED between two front-matters.
+
+    **C-8 — the ONE place where "is this field present?" is decided.**
+
+    The distinction that matters is PRESENCE, not truthiness:
+    ``old_fm.get(key)`` returns ``None`` both for "the key was never there"
+    and for "the key is there and its value is null". A production file
+    from ``write_event`` carries ``consent_ref`` / ``released_at`` /
+    ``released_by`` as NULL, so treating a null old value as "absent"
+    meant those three were never compared: forging a consent_ref (the
+    WR-18 release credential) or pinning ``released_by`` on somebody else
+    imported as a legal edit. The audit chain was pollutable.
+
+    The rules:
+      * the key is **absent** in ``old_fm`` → skipped. It did not exist at
+        birth, so there is nothing to compare, and rejecting on it would
+        punish a legal edit on a file that simply lacks the field.
+      * the key is **present** in ``old_fm`` (even with a null value) →
+        compared. ``None -> None`` is equal; ``None -> "forged"`` is
+        tampering.
+
+    Returns a list of human-readable ``"key: old -> new"`` entries.
+    """
+    out: List[str] = []
+    for key in sorted(fields):
+        if key not in old_fm:
+            continue  # did not exist at birth
+        old_val = old_fm.get(key)
+        new_val = new_fm.get(key)
+        if str(old_val) != str(new_val):
+            out.append(f"{key}: {old_val!r} -> {new_val!r}")
+    return out
 
 # ---------------------------------------------------------------------------
 # subject 合法值域（P0-4 打回修复新增，P0-3 WR-19 的前提）
@@ -454,13 +492,14 @@ class WriteFacade:
                 raise PathEscapeError(f"reparse point in path: {node}")
 
         # WR-03: normalized path must stay inside the actor's memory root.
+        # The BOUNDARY primitive is the shared one (agent.memory.paths) —
+        # C-10: a rule spelled out twice is a rule that can drift; the
+        # policy on top of it (reparse points, cross-role naming, which
+        # error to raise) stays here.
         root_real = Path(os.path.realpath(self.memory_root))
         real = Path(os.path.realpath(self.memory_root.joinpath(*parts)))
-        escaped = False
-        try:
-            escaped = os.path.commonpath([str(real), str(root_real)]) != str(root_real)
-        except ValueError:  # cross-drive on Windows
-            escaped = True
+        from agent.memory.paths import outside_root
+        escaped = outside_root(str(root_real), str(real))
         if escaped:
             # WR-05 (realpath pass): escaped via junction/symlink into another
             # agent's memory or the shared memory → name it cross-role.
@@ -1337,17 +1376,10 @@ class WriteFacade:
             if storage is not None:
                 old_fm = self._old_fm_from_projection(storage, relpath)
                 if old_fm:
-                    tampered = []
-                    for key in sorted(IMMUTABLE_FM_FIELDS):
-                        if key not in old_fm:
-                            continue  # the field did not exist at birth
-                        old_val = old_fm.get(key)
-                        new_val = new_fm.get(key)
-                        if old_val is None:
-                            continue
-                        if str(old_val) != str(new_val):
-                            tampered.append(
-                                f"{key}: {old_val!r} -> {new_val!r}")
+                    # C-8: the presence rule lives in ONE function
+                    # (``tampered_immutable_fields``), so the "is this field
+                    # present?" decision cannot drift between call sites.
+                    tampered = tampered_immutable_fields(old_fm, new_fm)
                     if tampered:
                         raise FrontmatterTamperError(
                             f"{relpath!r}: immutable front-matter field(s) "
