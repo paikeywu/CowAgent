@@ -713,16 +713,20 @@ class MemoryManager:
         (or unreadable), this refuses with ok=False + reason, instead of
         serving. Returns the fresh body text when ok=True.
         """
-        norm = relpath.replace("\\", "/").lstrip("/")
-        # C-6 (path escape): the path rule is SHARED with INV-11
-        # (agent.memory.paths) — one rule, two callers. Fail-CLOSED: an
-        # unjudgeable path is refused, never served.
-        from agent.memory.paths import safe_join
-        real, why = safe_join(self.config.get_workspace(), norm)
+        # C-6/C-7: the path rule is SHARED with INV-11 (agent.memory.paths)
+        # — one rule, two callers, and the NORMALIZATION lives there too.
+        # The caller must NOT strip a leading "/" itself: that turned
+        # "reject this absolute path" into "serve this file inside the
+        # workspace" (C-7), and it silently defeated the absolute-path
+        # rule the design states. Fail-CLOSED: an unjudgeable path is
+        # refused, never served.
+        from agent.memory.paths import normalize_relpath, safe_join
+        real, why = safe_join(self.config.get_workspace(), relpath)
         if real is None:
-            return {"ok": False, "path": norm,
+            return {"ok": False, "path": str(relpath),
                     "reason": f"unsafe path: {why} — refusing to serve "
                               f"content outside the workspace"}
+        norm = normalize_relpath(relpath)
         indexed = self._files_mtime_map({norm}).get(norm)
         if self._freshness is None:
             return {"ok": False, "path": norm,

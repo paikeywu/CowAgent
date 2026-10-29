@@ -41,7 +41,9 @@ RELEASED_ROW_NOTE = "该条已释放"
 
 def is_facts_path(path: str) -> bool:
     """True when ``path`` is a file of the evidence room."""
-    key = str(path or "").replace("\\", "/").lstrip("/")
+    # C-7: the normalization lives in ONE place (agent.memory.paths).
+    from agent.memory.paths import normalize_relpath
+    key = normalize_relpath(path)
     return key.startswith(FACTS_DIR)
 
 

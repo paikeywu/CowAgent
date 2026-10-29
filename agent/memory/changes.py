@@ -62,7 +62,9 @@ def record_change(workspace_root: Path | str, relpath: str, source: str,
         raise ValueError(
             f"unknown change source {source!r}; must be one of {sorted(SOURCES)}")
     root = Path(workspace_root)
-    norm = relpath.replace("\\", "/").lstrip("/")
+    # C-7: the normalization lives in ONE place (agent.memory.paths).
+    from agent.memory.paths import normalize_relpath
+    norm = normalize_relpath(relpath)
     if mtime is None:
         real = root / norm
         try:

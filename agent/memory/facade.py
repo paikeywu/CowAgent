@@ -1143,7 +1143,9 @@ class WriteFacade:
     @staticmethod
     def _state_key(relpath: str) -> str:
         """The truth-layer key of a path, the way the state speaks it."""
-        key = str(relpath or "").replace("\\", "/").lstrip("/")
+        # C-7: the normalization lives in ONE place (agent.memory.paths).
+        from agent.memory.paths import normalize_relpath
+        key = normalize_relpath(relpath)
         if not key.startswith("memory/"):
             key = "memory/" + key
         return key
@@ -1404,7 +1406,9 @@ class WriteFacade:
         then strip the front-matter off the reassembled whole. Returns None
         when the path has no projection yet (a brand-new file).
         """
-        norm = relpath.replace("\\", "/").lstrip("/")
+        # C-7: the normalization lives in ONE place (agent.memory.paths).
+        from agent.memory.paths import normalize_relpath
+        norm = normalize_relpath(relpath)
         try:
             rows = storage.conn.execute(
                 "SELECT start_line, text FROM chunks WHERE path=? "
@@ -1428,7 +1432,9 @@ class WriteFacade:
         nothing to compare against, and the caller decides what that
         means.
         """
-        norm = relpath.replace("\\", "/").lstrip("/")
+        # C-7: the normalization lives in ONE place (agent.memory.paths).
+        from agent.memory.paths import normalize_relpath
+        norm = normalize_relpath(relpath)
         try:
             rows = storage.conn.execute(
                 "SELECT start_line, text FROM chunks WHERE path=? "
