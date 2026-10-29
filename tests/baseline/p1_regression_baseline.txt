@@ -8,32 +8,33 @@
 #
 # 比对的是**集合**不是数量：数量相同但内容换了，也是回归。
 #
-# 基线时间：2026-10-29
-# 基线代码：live-memory @ 569e2101
+# 基线时间：2026-10-30 04:15（S3-H 重钉）
+# 基线代码：live-memory @ 29fa86ce
 # 机器：本机（16 个活库）
 #
-# --- INV-1 RED（body_path 为空 / 锚点在文件里定位不到） ---
-agent-mvnewfyb:INV-1
-ROOT:INV-1
-agent-mvnes449:INV-1
+# --- 本次重钉的说明（2026-10-30 · S3-H） ---
 #
-# --- INV-2/3 RED（片段哈希对不上 / 正文不可重建） ---
-ROOT:INV-2/3
-agent-mvnerelm:INV-2/3
-agent-mvnes449:INV-2/3
-agent-mvnewfyb:INV-2/3
-agent-mvnf7fjl:INV-2/3
-agent-mvnfgk8p:INV-2/3
-agent-mvnfkp3d:INV-2/3
-agent-mvnlair8:INV-2/3
-app:INV-2/3
-consistency-guardian:INV-2/3
-core-architect:INV-2/3
-course-evaluator:INV-2/3
-default:INV-2/3
-learner-analyst:INV-2/3
-teaching-coach:INV-2/3
-web:INV-2/3
+# 上一版基线（2026-10-29，代码 @ 569e2101）记的是 35 条 FAIL。
+# 其中 19 条在 S3-D 落地后已经转绿（S3-D 把锚点语法升级成 +S 段序列、
+# 落了 body_origin 列、把 CHUNKER_VERSION 升到 4，并把锚点解析器收成
+# 唯一一份），所以它们从基线里移除 —— 基线记的是「已知的失败」，不是
+# 「曾经失败过的所有东西」。留着它们会让 Q5 报「失去可见性」，那是把
+# 一次修复说成一次回归。
+#
+# 新增 1 条：agent-mvnf7fjl:INV-1。
+#
+#   ⚠️ 这一条是**实时的产品缺陷**，不是判据的错：
+#   2026-10-30 03:28:10，一个跑着**旧代码**的写入者（本机装的后端
+#   cowagent-backend.exe，构建于 2026-10-13，进程启动于 2026-10-27）
+#   写入了 memory/evolution/2026-10-30.md 这一行 —— 四列全 NULL、
+#   body_origin='unresolved'，并把该库 files.chunker_version 整列擦回
+#   NULL（该库的锚点带 +S，说明它确实被 v4 chunker 重建过）。
+#   这与 2026-10-29 23:41 擦掉 agent-mvnewfyb 的四列是**同一个病**：
+#   旧写入者的 UPSERT 不带四列，把迁移/巡检填好的值擦成 NULL。
+#   修复它需要停掉那个旧进程并重跑迁移/巡检 —— 不在本轮判据侧的范围。
+#
+# --- INV-1 RED（body_origin='unresolved' 的行：没人判定过的行） ---
+agent-mvnf7fjl:INV-1
 #
 # --- SHELF-LAG RED（真源变更晚于 shelf 页生成时间） ---
 ROOT:SHELF-LAG
