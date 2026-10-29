@@ -221,10 +221,26 @@ def sha256_of(path: Path) -> str:
 #: be hashed again. ``hit_count`` / ``last_hit_at`` are in: a search that
 #: rewrites them DID modify the index, and a criterion that hides that is
 #: the false green P0-21 F2 is about.
+#:
+#: P1-阶段三 S3-E: the FOUR body-externalization columns are in as well.
+#: They were missing, and that was a REAL hole, not a theoretical one:
+#: the S-1 check compares this digest before and after the criteria run,
+#: so a criterion that WIPED ``body_path`` (set it back to NULL) changed
+#: the index in exactly the way S-1 exists to catch — and the digest did
+#: not move, because the digest did not look at those columns.  The
+#: defect this stage is about (a stale writer wiping the migration's
+#: backfill) was therefore invisible to the very check that should have
+#: caught it.
+#:
+#: ``text_state`` is in for the same reason: it is the third state of the
+#: body-externalization machine, and a criterion that flipped it was
+#: modifying the object it measured.
 _CONTENT_COLUMNS = (
     "id", "path", "scope", "user_id", "start_line", "end_line", "hash",
     "file_sealed", "element_released", "sealed_owner",
     "hit_count", "last_hit_at",
+    # P1-阶段三 S3-E: the four extern columns + the state machine.
+    "body_path", "body_anchor", "body_hash", "text_state",
 )
 
 
@@ -362,25 +378,82 @@ def resolve_workspace(explicit: Optional[str]) -> Tuple[str, str]:
     return DEFAULT_WORKSPACE, "固定默认 / fixed default (not env-dependent)"
 
 
+#: The three states a criterion can be in.
+#:
+#: P1-阶段三 S3-E (NOTRUN):
+#:
+#:   * ``PASS``  — the criterion measured something and the measurement was
+#:     good;
+#:   * ``FAIL``  — the criterion measured something and the measurement was
+#:     BAD;
+#:   * ``NOTRUN`` — the criterion could NOT measure, because its
+#:     precondition does not hold.  **NOTRUN is not green.**
+#:
+#: The line between FAIL and NOTRUN is the whole point of the third state:
+#:
+#:   * FAIL   = "I looked, and it is broken."
+#:   * NOTRUN = "I could not look."
+#:
+#: A criterion that cannot distinguish the two reports a FAIL for a missing
+#: prerequisite, and then everybody learns to read the FAIL as "the product
+#: is broken" — which is how a deployment gets blamed for a criterion that
+#: simply had nothing to measure.  (P1 阶段二踩了三次假红, each of which
+#: looked exactly like "the deployment is broken".)
+#:
+#: The subtle one, and the one this module exists to make expressible:
+#:
+#:   "The migration ran, and the check STILL cannot decide" is NOTRUN
+#:   only if the check's own precondition is absent.  If the migration ran
+#:   and the check is still unable to judge, that is a FAIL of the
+#:   CHECK, not a NOTRUN — because a NOTRUN there would let the very
+#:   defect this stage is about (a migration that did not take, or an
+#:   invariant that stays unjudgeable) hide behind "not run".
+#:
+#: See :meth:`Report.judge` and :meth:`Report.judge_notrun`.
+STATE_PASS = "PASS"
+STATE_FAIL = "FAIL"
+STATE_NOTRUN = "NOTRUN"
+
+
 class Report:
     """The result table.
 
     Every criterion prints its own fingerprint line, so the output says
     what was measured even when the criterion is about a temporary
     directory it built itself.
+
+    P1-阶段三 S3-E: the table carries THREE states (PASS / FAIL / NOTRUN),
+    not two.  The rows are ``(number, name, state)`` where ``state`` is
+    one of the three constants above — previously a plain ``bool``.
     """
 
     def __init__(self):
-        self.rows: List[Tuple[str, str, bool]] = []
+        # P1-阶段三 S3-E: the third state.  ``rows`` is a list of
+        # ``(number, name, state)`` triples; the state is a STRING, not a
+        # bool, so NOTRUN cannot be silently folded into FAIL.
+        self.rows: List[Tuple[str, str, str]] = []
         self.fingerprints: Dict[str, IndexFingerprint] = {}
 
     def set_fingerprint(self, label: str, fp: IndexFingerprint) -> None:
         self.fingerprints[label] = fp
 
-    def judge(self, number, name, ok, detail, fingerprint=None):
-        """Record one criterion and print it with its fingerprint."""
-        self.rows.append((number, name, bool(ok)))
-        mark = "PASS" if ok else "FAIL"
+    def judge(self, number, name, ok, detail, fingerprint=None, notrun=False):
+        """Record one criterion and print it with its fingerprint.
+
+        ``ok`` keeps its old meaning (a truthy value means PASS) so that
+        every existing call site — phase1.py's ten, and phase2.py's — keeps
+        working UNCHANGED.  The new keyword ``notrun=True`` moves the
+        criterion into the third state; it is the explicit way to say
+        "I could not measure this".
+
+        A criterion must not report NOTRUN for a broken object: use
+        ``judge_notrun`` for that, and pass ``ok=False`` when the thing
+        you measured is bad.
+        """
+        if notrun:
+            return self.judge_notrun(number, name, detail, fingerprint=fingerprint)
+        self.rows.append((number, name, STATE_PASS if ok else STATE_FAIL))
+        mark = STATE_PASS if ok else STATE_FAIL
         print(f"  [{mark}] {number}: {name}")
         if fingerprint is not None:
             print(f"         被测库 / index: {fingerprint.render()}")
@@ -388,13 +461,37 @@ class Report:
             print(f"         {line}")
         return ok
 
+    def judge_notrun(self, number, name, detail, fingerprint=None):
+        """Record a criterion that COULD NOT be measured.
+
+        The detail MUST say which precondition did not hold — a NOTRUN
+        without a reason is indistinguishable from a criterion that was
+        simply never run, and that is the "静默 PASS" the P1 red lines
+        forbid.
+        """
+        self.rows.append((number, name, STATE_NOTRUN))
+        print(f"  [{STATE_NOTRUN}] {number}: {name}")
+        print(f"         前置条件不成立 —— 本判据未测量，NOTRUN 不等于通过")
+        if fingerprint is not None:
+            print(f"         被测库 / index: {fingerprint.render()}")
+        for line in str(detail).splitlines():
+            print(f"         {line}")
+        return None
+
     def summary(self):
-        passed = sum(1 for r in self.rows if r[2])
+        passed = sum(1 for r in self.rows if r[2] == STATE_PASS)
+        failed = sum(1 for r in self.rows if r[2] == STATE_FAIL)
+        notrun = sum(1 for r in self.rows if r[2] == STATE_NOTRUN)
         total = len(self.rows)
         print()
         print("=" * 72)
-        print("判据通过: %d/%d" % (passed, total))
-        for number, name, ok in self.rows:
-            print("  %s  %s. %s" % ("PASS" if ok else "FAIL", number, name))
+        print("判据通过: %d/%d   （FAIL %d · NOTRUN %d）" % (passed, total, failed, notrun))
+        for number, name, state in self.rows:
+            print("  %-6s %s. %s" % (state, number, name))
         print("=" * 72)
+        if notrun:
+            print("注意：%d 条判据为 NOTRUN —— 前置条件不成立，本轮未测量。"
+                  "NOTRUN 不是通过。" % notrun)
+        # The gate is: everything PASSed.  A NOTRUN is NOT a pass, so a
+        # report with NOTRUNs must not return True.
         return passed == total

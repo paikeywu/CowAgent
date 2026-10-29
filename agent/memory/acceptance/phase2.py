@@ -346,7 +346,9 @@ def judge_ca2_add_memory_fills_four_columns(report):
             # measures a world it has already torn down measures nothing.
             if not rows:
                 return report.judge(
-                    "C-A2.1/C-A2.2(unit)", "add_memory 写出的行四列非空",
+                    "C-A2.1/C-A2.2(unit)",
+                    "add_memory 写出的行：可填的三列（body_anchor/body_hash/text_state）非空，"
+                    "body_path 为 None（blob 行无真源文件，诚实值）",
                     False, "没有写入任何 chunk 行 —— 前置条件不成立")
             for bp, ba, bh, ts in rows:
                 detail.append(f"body_path={bp!r} body_anchor={ba!r} "
@@ -360,13 +362,21 @@ def judge_ca2_add_memory_fills_four_columns(report):
                 if not ts:
                     ok = False
                     detail.append("  —— text_state 为空")
+                if bp is not None:
+                    ok = False
+                    detail.append("  —— body_path 非空：add_memory 写的是 blob，"
+                                  "没有真源文件可指，诚实值必须是 None")
     except Exception as e:
         return report.judge(
-            "C-A2.1/C-A2.2(unit)", "add_memory 写出的行四列非空",
+            "C-A2.1/C-A2.2(unit)",
+            "add_memory 写出的行：可填的三列（body_anchor/body_hash/text_state）非空，"
+            "body_path 为 None（blob 行无真源文件，诚实值）",
             False, f"{type(e).__name__}: {e}")
 
     return report.judge(
-        "C-A2.1/C-A2.2(unit)", "add_memory 写出的行四列非空",
+        "C-A2.1/C-A2.2(unit)",
+        "add_memory 写出的行：可填的三列（body_anchor/body_hash/text_state）非空，"
+        "body_path 为 None（blob 行无真源文件，诚实值）",
         ok, "\n".join(detail))
 
 
@@ -791,6 +801,75 @@ CRITERIA = [
     ("C-A5", judge_ca5_gitignore_covers_config),
 ]
 
+# ---------------------------------------------------------------------------
+# P1-阶段三 S3-E · the criteria that close the six gaps
+# ---------------------------------------------------------------------------
+#
+# They live in their own module (``phase2_s3e``) for one reason: the
+# enumeration of the live libraries is the piece most likely to be subtly
+# wrong (it picked the wrong ROOT once already), so it deserves its own
+# file where somebody will actually look at it.
+#
+# They take the workspace as an ARGUMENT, because the S3-E criteria are
+# about a workspace, not about the default one.
+
+_S3E_CRITERIA = [
+    ("C-A6", "judge_ca6_every_live_library_is_profiled"),
+    ("C-A6", "judge_ca6_agent_workspace_root_is_the_agent_dir"),
+    ("C-A1", "judge_ca1_files_columns_every_live_library"),
+    ("M1", "judge_m1_fingerprints_agree_across_libraries"),
+    ("M4", "judge_m4_every_library_was_backfilled"),
+    ("Q1", "judge_q1_inv1_every_library"),
+    ("Q2", "judge_q2_inv2_inv3_every_library"),
+    ("Q5", "judge_q5_no_library_regressed"),
+    ("R-S3-5", "judge_r_s3_5_mirror_has_a_setter"),
+    ("M6", "judge_m6_body_origin_mouth"),
+    ("S-1", "judge_s1_criteria_do_not_modify_what_they_measure"),
+    ("S-6", "judge_s6_criterion_names_say_what_they_measure"),
+]
+
+# The criteria that GUARD the criteria (MU-12 / MU-14 / the replay).
+_GUARD_CRITERIA = [
+    ("MU-12", "judge_mu12_three_states_are_real"),
+    ("MU-14", "judge_mu14_coverage_is_not_overreported"),
+    ("MU-REPLAY", "judge_mutation_replay_is_registered"),
+]
+
+
+def _load_s3e():
+    """The S3-E criterion functions, bound to the workspace."""
+    from agent.memory.acceptance import phase2_s3e
+
+    ws = Path(resolve_workspace(ARGS.workspace)[0])
+    out = []
+    for group, attr in _S3E_CRITERIA:
+        fn = getattr(phase2_s3e, attr)
+
+        def make(fn=fn, ws=ws):
+            def run(report):
+                return fn(report, ws)
+            return run
+
+        out.append((group, make()))
+    return out
+
+
+def _load_guards():
+    """The criteria that guard the criteria (they take no workspace)."""
+    from agent.memory.acceptance import phase2_guards
+
+    out = []
+    for group, attr in _GUARD_CRITERIA:
+        fn = getattr(phase2_guards, attr)
+
+        def make(fn=fn):
+            def run(report):
+                return fn(report)
+            return run
+
+        out.append((group, make()))
+    return out
+
 
 def main() -> int:
     workspace, how = resolve_workspace(ARGS.workspace)
@@ -805,7 +884,7 @@ def main() -> int:
         return 2
 
     print("=" * 72)
-    print("记忆体系升级 · 阶段三验收（S3-A 补洞）")
+    print("记忆体系升级 · 阶段三验收（S3-A 补洞 + S3-E 判据落地）")
     print("=" * 72)
     print(f"code root : {CODE_ROOT}")
     print(f"workspace : {workspace}  （{how}）")
@@ -826,6 +905,18 @@ def main() -> int:
                     traceback.format_exc().splitlines()[-4:]))
 
     for group, fn in CRITERIA:
+        if ARGS.only and not group.startswith(ARGS.only):
+            continue
+        guarded(fn, report)
+
+    # The S3-E criteria.
+    for group, fn in _load_s3e():
+        if ARGS.only and not group.startswith(ARGS.only):
+            continue
+        guarded(fn, report)
+
+    # The criteria that guard the criteria.
+    for group, fn in _load_guards():
         if ARGS.only and not group.startswith(ARGS.only):
             continue
         guarded(fn, report)
