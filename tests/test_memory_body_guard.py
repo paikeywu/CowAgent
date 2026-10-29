@@ -436,3 +436,294 @@ def test_a_stale_guard_is_detected_and_repaired(tmp_path):
         assert body_guard.is_installed(conn)
     finally:
         storage.close()
+
+
+# --------------------------------------------------------------------------
+# 7. P1-阶段三 第六轮 (S3-I): the four gaps this round closed
+# --------------------------------------------------------------------------
+
+def test_the_guard_stops_an_update_that_downgrades_the_state(tmp_path):
+    """I-1: a writer that UPDATES the row in place must not be able to
+    turn a certified 'mirror' row back into 'projection'.
+
+    Measured on this machine: the legacy build's third write shape is
+    ``INSERT ... ON CONFLICT(id) DO UPDATE SET (...)`` — and the fifth
+    round's guard had no BEFORE UPDATE trigger at all, so nothing stood
+    between that shape and the stored row.
+    """
+    db = _make_library(tmp_path)
+    storage = MemoryStorage(db_path=str(db))
+    try:
+        conn = storage.conn
+        conn.execute("UPDATE chunks SET text_state='mirror' WHERE id='row1'")
+        conn.commit()
+        assert _state(db)["text_state"] == "mirror"
+        conn.execute(
+            "UPDATE chunks SET text_state='projection', "
+            "body_origin='unresolved' WHERE id='row1'")
+        conn.commit()
+    finally:
+        storage.close()
+    st = _state(db)
+    assert st["text_state"] == "mirror", \
+        "the guard let the state be downgraded (text_state=%r)" % st["text_state"]
+    assert st["body_origin"] == "file", \
+        "the guard let the origin be downgraded (body_origin=%r)" % st["body_origin"]
+
+
+def test_the_guard_stops_our_own_rebuild_from_downgrading_the_state(tmp_path):
+    """I-1, the shape that actually bit: OUR OWN rebuild.
+
+    Measured on a copy of the live ROOT library: the real
+    ``replace_file_chunks`` (rebuilder.py:294) turns an inspector
+    certified 'mirror' row back into 'projection', because
+    ``body_pointer.four_columns_for_chunk`` returns STATE_PROJECTION for
+    every chunk it builds — it decides the POINTER, never the state.
+
+    The contract asserted here is the STATE, not the FTS index: the
+    rebuild rewrites the file's rows, and on a one-row library that
+    empties the FTS index first — a property of the fixture, measured
+    on this machine (the same rebuild on a 286-row library does not
+    report it).  The end-to-end shape on a real library is asserted by
+    ``test_the_guard_holds_on_a_real_library_copy`` below.
+    """
+    from agent.memory.storage import MemoryChunk
+
+    db = _make_library(tmp_path)
+    storage = MemoryStorage(db_path=str(db))
+    try:
+        conn = storage.conn
+        conn.execute("UPDATE chunks SET text_state='mirror' WHERE id='row1'")
+        conn.commit()
+        row = conn.execute(
+            "SELECT id, user_id, scope, source, path, start_line, end_line, "
+            "text, hash, element_released, file_sealed, sealed_owner, "
+            "body_path, body_anchor, body_hash FROM chunks WHERE id='row1'"
+        ).fetchone()
+        chunk = MemoryChunk(
+            id=row[0], user_id=row[1], scope=row[2], source=row[3],
+            path=row[4], start_line=row[5], end_line=row[6], text=row[7],
+            embedding=None, hash=row[8], metadata=None,
+            element_released=row[9], file_sealed=row[10], sealed_owner=row[11],
+            body_path=row[12], body_anchor=row[13], body_hash=row[14],
+            # what four_columns_for_chunk returns for every chunk:
+            text_state="projection", body_origin="file")
+        try:
+            storage.replace_file_chunks(row[4], [chunk], file_hash="H",
+                                        mtime=1, size=1, chunker_version=4)
+            conn.commit()
+        except sqlite3.Error as e:
+            # The FTS index of a ONE-row library cannot survive the
+            # delete-and-reinsert of its only row.  That is a property of
+            # the fixture (measured: the same rebuild on a 286-row
+            # library does not report it), so the state is read anyway.
+            assert "malformed" in str(e), \
+                "the rebuild failed for an unexpected reason: %s" % e
+    finally:
+        storage.close()
+    st = _state(db)
+    assert st["text_state"] == "mirror", \
+        "our own rebuild downgraded the certified state (%r)" % st["text_state"]
+    assert st["body_origin"] == "file", \
+        "our own rebuild downgraded the origin (%r)" % st["body_origin"]
+
+
+def test_the_guard_holds_on_a_real_library_copy(tmp_path):
+    """The end-to-end shape on a REAL library (the migration's own
+    backup of ROOT), where the FTS index is a real one.
+
+    Measured on this machine, on the 286-row ROOT backup:
+    the rebuild keeps 'mirror'; and dropping EITHER of the two
+    triggers the state defence depends on — the BEFORE DELETE snapshot
+    or the AFTER INSERT state restore — brings the downgrade back.
+    So both are load-bearing, and neither is decoration.
+    """
+    from agent.memory.storage import MemoryChunk
+
+    src = os.environ.get("P1S3I_ROOT_BACKUP")
+    if not src or not os.path.exists(src):
+        # Look for the migration's own backup of ROOT — the closest thing
+        # to a real library that this machine has.  Without it the
+        # criterion is NOTRUN rather than a false green.
+        import glob
+        candidates = sorted(
+            glob.glob(os.path.expandvars(
+                r"%LOCALAPPDATA%\\..\\..\\..\\cow\\tmp\\p1s3i-backup-migrate\\ROOT.p1-bak.db"))
+            + glob.glob(r"C:\\Users\\*\\cow\\tmp\\p1s3i-backup-migrate\\ROOT.p1-bak.db"))
+        src = candidates[0] if candidates else None
+    if not src or not os.path.exists(src):
+        pytest.skip("no real ROOT library backup is available")
+    db = tmp_path / "index.db"
+    shutil.copyfile(src, db)
+
+    def run(drop=()):
+        shutil.copyfile(src, db)
+        st = MemoryStorage(db_path=str(db))
+        try:
+            for name in drop:
+                st.conn.execute("DROP TRIGGER IF EXISTS %s" % name)
+            # The keep table of a live library may hold snapshots from an
+            # earlier run; clear it so the test measures THIS run's
+            # triggers and not a leftover.
+            st.conn.execute("DELETE FROM body_keep")
+            st.conn.commit()
+            conn = st.conn
+            conn.execute("UPDATE chunks SET text_state='mirror'")
+            conn.commit()
+            row = conn.execute(
+                "SELECT id, user_id, scope, source, path, start_line, "
+                "end_line, text, hash, element_released, file_sealed, "
+                "sealed_owner, body_path, body_anchor, body_hash FROM chunks "
+                "WHERE body_path IS NOT NULL AND body_origin='file' LIMIT 1"
+            ).fetchone()
+            chunk = MemoryChunk(
+                id=row[0], user_id=row[1], scope=row[2], source=row[3],
+                path=row[4], start_line=row[5], end_line=row[6], text=row[7],
+                embedding=None, hash=row[8], metadata=None,
+                element_released=row[9], file_sealed=row[10],
+                sealed_owner=row[11], body_path=row[12], body_anchor=row[13],
+                body_hash=row[14], text_state="projection", body_origin="file")
+            st.replace_file_chunks(row[4], [chunk], file_hash="H", mtime=1,
+                                   size=1, chunker_version=4)
+            conn.commit()
+            got = conn.execute(
+                "SELECT text_state FROM chunks WHERE id=?", (row[0],)).fetchone()
+            return got["text_state"]
+        finally:
+            st.close()
+
+    assert run() == "mirror", \
+        "the guard did not hold on a real library copy"
+    # Both triggers are load-bearing: without either one, the downgrade
+    # comes back.
+    assert run(drop=("chunks_body_keep_st_ai",)) != "mirror", \
+        "the AFTER INSERT state restore is not load-bearing"
+    assert run(drop=("chunks_body_keep_bd",)) != "mirror", \
+        "the BEFORE DELETE snapshot is not load-bearing"
+
+
+def test_the_files_statistics_columns_are_guarded(tmp_path):
+    """I-3: the legacy writer's ``INSERT OR REPLACE INTO files`` names no
+    statistics column, so ``chunk_count``/``chunker_version`` fall back
+    to their DEFAULT.  The fifth round's guard had no files-side trigger
+    at all.
+
+    The real key of ``files`` is ``path`` (PRIMARY KEY) — measured with
+    ``PRAGMA table_info``; it is NOT ``id``.
+    """
+    db = _make_library(tmp_path)
+    storage = MemoryStorage(db_path=str(db))
+    try:
+        conn = storage.conn
+        before = conn.execute(
+            "SELECT chunk_count, chunker_version FROM files "
+            "WHERE path='MEMORY.md'").fetchone()
+        assert before["chunk_count"] == 1
+        assert before["chunker_version"] == 4
+        conn.execute(
+            "INSERT OR REPLACE INTO files (path, source, hash, mtime, size, "
+            "updated_at) VALUES ('MEMORY.md', 'memory', 'fh', 1, 5, 'x')")
+        conn.commit()
+        after = conn.execute(
+            "SELECT chunk_count, chunker_version FROM files "
+            "WHERE path='MEMORY.md'").fetchone()
+    finally:
+        storage.close()
+    assert after["chunk_count"] == 1, \
+        "the legacy writer erased chunk_count (%r)" % after["chunk_count"]
+    assert after["chunker_version"] == 4, \
+        "the legacy writer erased chunker_version (%r)" % after["chunker_version"]
+
+
+def test_a_not_measured_files_row_stays_null(tmp_path):
+    """Rule D: ``chunk_count IS NULL`` means "not measured" and is a value
+    the CURRENT writer produces on purpose.  A guard that restored the
+    stored value on every NULL would destroy that distinction — which
+    ``acceptance/phase2.py`` and ``tests/test_p1_stage3a_holes.py``
+    both assert.
+    """
+    db = tmp_path / "index.db"
+    storage = MemoryStorage(db_path=str(db))
+    try:
+        storage.update_file_metadata("memory/shared/unmeasured.md", "memory",
+                                     "h", 1, 1)
+        got = storage.conn.execute(
+            "SELECT chunk_count FROM files "
+            "WHERE path='memory/shared/unmeasured.md'").fetchone()
+    finally:
+        storage.close()
+    assert got["chunk_count"] is None, \
+        "the guard turned 'not measured' into a number (%r)" % got["chunk_count"]
+
+
+def test_the_guard_triggers_stay_ahead_of_the_fts_triggers(tmp_path):
+    """The trigger ORDER is load-bearing (P1-阶段三 第六轮).
+
+    SQLite runs a table's triggers in ``sqlite_master`` rowid order, and
+    a re-created trigger lands at the END of it.  So a guard that was
+    re-installed ends up BEHIND the FTS triggers — and then the guard's
+    AFTER INSERT restore updates a row that the FTS index already holds
+    in its replaced form, and SQLite reports "database disk image is
+    malformed" on the legacy DELETE-then-INSERT shape.
+
+    Measured: with the guard ahead of the FTS triggers the shape
+    passes; with it behind, it fails.
+    """
+    db = _make_library(tmp_path)
+    storage = MemoryStorage(db_path=str(db))
+    try:
+        conn = storage.conn
+        names = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND tbl_name='chunks' ORDER BY rowid")]
+        assert "chunks_ai" in names and "chunks_body_keep_bi" in names
+        assert names.index("chunks_body_keep_bi") < names.index("chunks_ai"), (
+            "the guard must run BEFORE the FTS triggers, got %s" % names)
+    finally:
+        storage.close()
+
+
+def test_the_erasure_census_separates_never_migrated_from_erased(tmp_path):
+    """The MONITORING criterion: it must tell "the migration never ran"
+    apart from "the migration ran and something erased it afterwards".
+
+    The two look identical in the data (no pointer, no certified state),
+    so the census carries the last-write timestamp next to the counts.
+    """
+    db = _make_library(tmp_path)
+    storage = MemoryStorage(db_path=str(db))
+    try:
+        conn = storage.conn
+        census = body_guard.erasure_census(conn)
+    finally:
+        storage.close()
+    assert census["rows"] == 1
+    assert census["certified"] == 0, "the fixture row is not certified"
+    assert census["undecided"] == 1, "the fixture row is undecided"
+    assert census["no_pointer"] == 0
+    assert census["last_write"], "the census must carry the last write"
+    assert census["intact"] is False
+
+
+def test_the_guard_is_idempotent(tmp_path):
+    """Installing the guard twice must not fail and must not create the
+    triggers twice."""
+    db = _make_library(tmp_path)
+    storage = MemoryStorage(db_path=str(db))
+    try:
+        conn = storage.conn
+        first = body_guard.ensure_guard(conn)
+        assert first["status"] in ("present", "installed", "repaired")
+        names_before = sorted(r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND tbl_name IN ('chunks', 'files')"))
+        second = body_guard.ensure_guard(conn)
+        assert second["status"] == "present", second
+        names_after = sorted(r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND tbl_name IN ('chunks', 'files')"))
+        assert names_before == names_after, \
+            "a second install changed the trigger set"
+        assert body_guard.is_installed(conn)
+    finally:
+        storage.close()

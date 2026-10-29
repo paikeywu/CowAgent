@@ -745,6 +745,21 @@ class MemoryStorage:
         # the current source, it is redundant (and harmless — it only
         # fires for a row that arrives without a body_path while the
         # stored row has one, which a current writer never produces).
+        #
+        # P1-阶段三 第六轮 (S3-I): the guard's ORDER relative to the FTS
+        # triggers is load-bearing, and it is the order the fifth round
+        # had: the guard is installed BEFORE the FTS triggers, so it
+        # runs first.  SQLite runs a table's triggers in
+        # ``sqlite_master`` rowid order.  The guard's AFTER INSERT
+        # restore trigger updates the protected columns of the row the
+        # writer just inserted; that update fires the FTS AFTER UPDATE
+        # trigger, whose 'delete' command reads the content table.
+        # Measured: with the guard running AFTER the FTS triggers, the
+        # legacy DELETE-then-INSERT shape fails with "database disk
+        # image is malformed" (the FTS index holds the new text while
+        # the content table already holds the replaced one); with the
+        # guard running FIRST — the fifth round's order — the same
+        # shape passes.
         try:
             from agent.memory.body_guard import install_guard as _install_body_guard
 
@@ -758,6 +773,31 @@ class MemoryStorage:
                 f"on {self.db_path}: {e}"
             )
             raise
+
+        # P1-阶段三 第六轮 (S3-I): keep the guard's triggers AHEAD of the
+        # FTS triggers.
+        #
+        # SQLite runs a table's triggers in ``sqlite_master`` rowid
+        # order, and a re-installed trigger lands at the END of it.  So
+        # when the guard is REPAIRED (its body changed — e.g. this round
+        # changed the rules), the drop-and-create moves it BEHIND the
+        # FTS triggers, and the order flips.
+        #
+        # The flipped order is not cosmetic: the guard's AFTER INSERT
+        # restore trigger updates the protected columns of the row the
+        # writer just inserted, and that update fires the FTS AFTER
+        # UPDATE trigger — whose 'delete' command reads the content
+        # table.  When the guard runs AFTER the FTS triggers, the row is
+        # already in the FTS index while the content table already holds
+        # the REPLACED row, the tokens disagree, and SQLite reports
+        # "database disk image is malformed".  Measured: with the guard
+        # ahead of the FTS triggers the legacy DELETE-then-INSERT shape
+        # passes; with it behind, it fails with exactly that error.
+        #
+        # The repair is to re-create the FTS triggers, which puts them
+        # at the end of ``sqlite_master`` — behind the guard again.
+        if self.fts5_available:
+            self._reorder_fts_triggers_behind_guard()
 
         # Create indexes
         self.conn.execute("""
@@ -1144,6 +1184,69 @@ class MemoryStorage:
         conn.execute("DROP TRIGGER IF EXISTS chunks_trigram_ad")
         conn.execute("DROP TRIGGER IF EXISTS chunks_trigram_au")
         conn.execute("DROP TABLE IF EXISTS chunks_fts_trigram")
+
+    def _reorder_fts_triggers_behind_guard(self):
+        """Put the FTS sync triggers BEHIND the body-column guard.
+
+        P1-阶段三 第六轮 (S3-I).  SQLite runs a table's triggers in
+        ``sqlite_master`` rowid order, and a re-created trigger lands at
+        the END of it.  The body-column guard is re-installed whenever
+        its body changed — and that moves it behind the FTS triggers.
+
+        The order is not cosmetic.  The guard's AFTER INSERT restore
+        trigger updates the protected columns of the row the writer just
+        inserted; that update fires the FTS AFTER UPDATE trigger, whose
+        'delete' command reads the content table.  With the guard BEHIND
+        the FTS triggers, the FTS index already holds the row while the
+        content table already holds the REPLACED one — the tokens
+        disagree, and SQLite reports "database disk image is malformed".
+        Measured: with the guard ahead of the FTS triggers the legacy
+        DELETE-then-INSERT shape passes; with it behind, it fails.
+
+        The repair is to re-create the FTS triggers, which puts them at
+        the end of ``sqlite_master`` — behind the guard again.  It is
+        idempotent and cheap: the triggers are re-created from their
+        stored SQL, and the FTS index itself is untouched.
+        """
+        try:
+            rows = self.conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+                "AND tbl_name='chunks' AND sql IS NOT NULL"
+            ).fetchall()
+        except sqlite3.Error:
+            return
+        guard_names = ("chunks_body_keep_bi", "chunks_body_keep_bu",
+                       "chunks_body_keep_bd", "chunks_body_keep_bi_ai",
+                       "files_body_keep_bu", "files_body_keep_bi")
+        fts_rows = [r for r in rows if r[0] not in guard_names]
+        if not fts_rows:
+            return
+        # Only act when the order is actually wrong: the guard's
+        # triggers must come FIRST.
+        order = [r[0] for r in rows]
+        first_guard = min((order.index(n) for n in guard_names
+                           if n in order), default=None)
+        first_fts = min((order.index(r[0]) for r in fts_rows), default=None)
+        if first_guard is None or first_fts is None:
+            return
+        if first_guard < first_fts:
+            return  # already in the right order
+        try:
+            for r in fts_rows:
+                self.conn.execute("DROP TRIGGER IF EXISTS %s" % r[0])
+            for r in fts_rows:
+                self.conn.execute(r[1])
+            self.conn.commit()
+        except sqlite3.Error:
+            try:
+                self.conn.rollback()
+            except sqlite3.Error:
+                pass
+            from common.log import logger
+            logger.warning(
+                "[MemoryStorage] could not re-order the FTS triggers behind "
+                "the body-column guard; the legacy DELETE-then-INSERT shape "
+                "may report 'database disk image is malformed'")
 
     @staticmethod
     def _create_trigram_objects(conn: sqlite3.Connection):

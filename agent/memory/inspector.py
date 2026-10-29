@@ -295,6 +295,9 @@ class Inspector:
         report["text_inv"] = self._check_text_externalization(report)
         # P1-阶段三 第四轮: the body-origin check group.
         report["body_origin"] = self._check_body_origin(report)
+        # P1-阶段三 第六轮 (S3-I): the ERASURE check — has the certified
+        # state been erased since the migration put it there?
+        report["erasure"] = self._check_erasure(report)
         # P1-阶段三 第四轮: the inspector is the DESIGNATED SETTER of the
         # 'mirror' state (设计 §3.1).  It runs AFTER the invariants, because
         # the promotion is only legal for the rows the invariants just
@@ -1072,6 +1075,108 @@ class Inspector:
                 release_path=path, mismatch=detail)
 
     # -- check 8: index schema drift (P0-17 B-3) ----------------------------
+
+    def _check_erasure(self, report: Dict[str, Any]) -> Dict[str, Any]:
+        """P1-阶段三 第六轮 (S3-I) — the ERASURE check.
+
+        **The question:** was the certified state ERASED after the
+        migration put it there?
+
+        The desktop build from 2026-10-13 is still running on this
+        machine, and it writes with statements that do not name the
+        body columns — so a row it touches loses its pointer and its
+        certified state.  The body-column guard stops that, but a guard
+        that is silently defeated is worse than no guard, so the state
+        has to be CHECKED, not assumed.
+
+        **The check answers the question that actually matters:**
+        "has this library been erased since it was migrated?" — and it
+        distinguishes that from "this library was never migrated",
+        which looks identical in the data:
+
+        * never migrated  → every row has no pointer AND no certified
+          state, and the library's last write is OLD;
+        * migrated, then erased → the same shape, but the last write is
+          NEWER than the migration's own timestamp.
+
+        So the report carries ``last_write`` next to the counts, and
+        the reader compares it with the migration's timestamp.  A
+        library with a certified state and a recent write is a library
+        that was touched — and the certified count says whether the
+        touch was clean.
+
+        REPORT-ONLY, like every other check here.
+        """
+        from agent.memory.body_guard import erasure_census
+
+        db = self._index_db_path()
+        if not db.is_file():
+            return {"scope": "erasure", "verdict": "NOTRUN",
+                    "fingerprint": "index-missing", "violations": [],
+                    "violation_count": 0}
+        try:
+            conn = sqlite3.connect(
+                "file:" + str(db).replace("\\", "/") + "?mode=ro", uri=True)
+        except sqlite3.Error as e:
+            return {"scope": "erasure", "verdict": "NOTRUN",
+                    "fingerprint": "index-unreadable",
+                    "detail": str(e), "violations": [], "violation_count": 0}
+        try:
+            census = erasure_census(conn)
+        finally:
+            conn.close()
+        if "error" in census:
+            return {"scope": "erasure", "verdict": "NOTRUN",
+                    "fingerprint": "census-failed", "detail": census["error"],
+                    "violations": [], "violation_count": 0}
+
+        violations = []
+        # The certified state must be there.  A row that fell back to
+        # 'projection'/'unresolved' is the ERASED shape.
+        if census.get("undecided"):
+            violations.append({
+                "severity": "HIGH",
+                "reason": "erasure: the certified state was lost",
+                "path": str(db),
+                "detail": ("%s of %s rows are undecided again "
+                           "('projection'/'unresolved') — the certified "
+                           "state was erased after the migration"
+                           % (census.get("undecided"), census.get("rows"))),
+            })
+        if census.get("no_pointer"):
+            violations.append({
+                "severity": "HIGH",
+                "reason": "erasure: the pointer was lost",
+                "path": str(db),
+                "detail": ("%s of %s rows have no body_path — the pointer "
+                           "was erased after the migration"
+                           % (census.get("no_pointer"), census.get("rows"))),
+            })
+        if census.get("files_without_stats"):
+            violations.append({
+                "severity": "MID",
+                "reason": "erasure: the files statistics were lost",
+                "path": str(db),
+                "detail": ("%s files rows have no chunk_count/chunker_version "
+                           "— the statistics were erased after the migration"
+                           % census.get("files_without_stats")),
+            })
+        verdict = "RED" if violations else "GREEN"
+        return {
+            "scope": "erasure",
+            "verdict": verdict,
+            "fingerprint": ("rows=%s certified=%s undecided=%s no_pointer=%s "
+                            "files_without_stats=%s last_write=%s"
+                            % (census.get("rows"), census.get("certified"),
+                               census.get("undecided"),
+                               census.get("no_pointer"),
+                               census.get("files_without_stats"),
+                               census.get("last_write"))),
+            "census": census,
+            "last_write": census.get("last_write"),
+            "violations": violations,
+            "violation_count": len(violations),
+        }
 
     def _check_body_origin(self, report: Dict[str, Any]) -> Dict[str, Any]:
         """P1-阶段三 第四轮 — the ``body_origin`` check group.
