@@ -18,10 +18,7 @@ G-5（判据可移植性）：语料来源必须是**显式输入**，不是某�
 ``test_g5_fixture_corpus_exposes_the_fork``）。
 """
 import ast
-import json
 import os
-import shutil
-import sqlite3
 from pathlib import Path
 
 import pytest
@@ -62,14 +59,14 @@ def _corpus_root():
             return candidate, f"${CORPUS_ENV_VAR}={candidate}"
         pytest.skip(
             f"G-3: ${CORPUS_ENV_VAR} is set to {env!r} but that is not a "
-            f"directory; the real corpus is unavailable — this check did "
-            f"NOT run (no silent PASS).")
+            "directory; the real corpus is unavailable — this check did "
+            "NOT run (no silent PASS).")
     if FIXTURE_CORPUS.is_dir():
         return FIXTURE_CORPUS, f"in-repo fixture {FIXTURE_CORPUS}"
     pytest.skip(
         f"G-3: no real corpus available — ${CORPUS_ENV_VAR} is unset "
         f"and the in-repo fixture {FIXTURE_CORPUS} does not exist; "
-        f"this check did NOT run (no silent PASS).")
+        "this check did NOT run (no silent PASS).")
 
 
 def _corpus_files(limit=None, suffixes=CORPUS_SUFFIXES):
@@ -81,7 +78,7 @@ def _corpus_files(limit=None, suffixes=CORPUS_SUFFIXES):
         pytest.skip(
             f"G-3: the corpus at {source} contains no "
             f"{'/'.join(suffixes)} files; the real corpus is unavailable — "
-            f"this check did NOT run.")
+            "this check did NOT run.")
     if limit is not None:
         files = files[:limit]
     return files
@@ -149,7 +146,7 @@ def test_g1_one_bad_row_in_300_is_found(tmp_path):
     try:
         res = text_inv.check_inv2_inv3(st.conn, ws)
         assert res["verdict"] == "RED", (
-            f"G-1: a corrupted row must turn the check red, got "
+            "G-1: a corrupted row must turn the check red, got "
             f"{res['verdict']!r} (fingerprint={res.get('fingerprint')!r})")
         assert res["violations"], "RED but no violations were reported"
         chunk_ids = {v.get("chunk_id") for v in res["violations"]}
@@ -199,7 +196,7 @@ def test_g1_the_production_inspection_path_finds_the_bad_row(tmp_path):
         text_inv_report = report.get("text_inv") or {}
         check = (text_inv_report.get("checks") or {}).get("INV-2/3") or {}
         assert check.get("verdict") == "RED", (
-            f"G-1: the production inspection must find the corrupted row; "
+            "G-1: the production inspection must find the corrupted row; "
             f"verdict={check.get('verdict')!r} "
             f"fingerprint={check.get('fingerprint')!r}")
         chunk_ids = {v.get("chunk_id") for v in check.get("violations", [])}
@@ -230,7 +227,6 @@ def test_g2_rebuild_failure_makes_the_inspection_red(tmp_path):
     rebuild_file(st, ws, f)
 
     # force a rebuild failure
-    from agent.memory import rebuilder
     original = st.replace_file_chunks
 
     def boom(*a, **k):
@@ -245,7 +241,7 @@ def test_g2_rebuild_failure_makes_the_inspection_red(tmp_path):
 
     marker = ws / "memory" / ".audit" / "rebuild_failures.jsonl"
     assert marker.is_file(), (
-        f"G-2: the failure marker must be written under memory/.audit/, "
+        "G-2: the failure marker must be written under memory/.audit/, "
         f"not {ws / '.audit'} — found nothing at {marker}")
     assert "forced rebuild failure" in marker.read_text(encoding="utf-8")
 
@@ -254,7 +250,7 @@ def test_g2_rebuild_failure_makes_the_inspection_red(tmp_path):
     report = insp.inspect(trigger="manual", persist_snapshot=False)
     codes = [v.get("code") for v in report.get("violations", [])]
     assert "rebuild-failed" in codes, (
-        f"G-2: the inspection must report the failed rebuild; "
+        "G-2: the inspection must report the failed rebuild; "
         f"got codes={codes!r}")
     st.close()
 
@@ -286,7 +282,7 @@ def test_g2_release_mismatch_makes_the_inspection_red(tmp_path):
     report = insp.inspect(trigger="manual", persist_snapshot=False)
     codes = [v.get("code") for v in report.get("violations", [])]
     assert "release-mismatch" in codes, (
-        f"G-2: the inspection must report the release mismatch; "
+        "G-2: the inspection must report the release mismatch; "
         f"got codes={codes!r}")
 
 
@@ -339,7 +335,7 @@ def test_g3_real_corpus_ids_are_identical_after_rebuild(tmp_path):
         rebuild_ids = {r[0] for r in rows}
 
         assert writer_ids == rebuild_ids, (
-            f"G-3: writer and rebuilder must agree on chunk identity for "
+            "G-3: writer and rebuilder must agree on chunk identity for "
             f"{src.name} (corpus: {_corpus_source()}): "
             f"writer={len(writer_ids)} rebuild={len(rebuild_ids)} "
             f"only_writer={sorted(writer_ids - rebuild_ids)[:3]} "
@@ -364,7 +360,7 @@ def test_g3_hit_count_survives_the_rebuild(tmp_path):
     dst.write_text(raw, encoding="utf-8")
     st = MemoryStorage(db_path=ws / "memory" / "long-term" / "index.db")
     index_guard.ensure_guard(st.conn)
-    r = rebuild_file(st, ws, dst)
+    rebuild_file(st, ws, dst)
     st.conn.execute("UPDATE chunks SET hit_count=7 WHERE path=?", (rel,))
     st.conn.commit()
     before = st.conn.execute(
@@ -376,11 +372,11 @@ def test_g3_hit_count_survives_the_rebuild(tmp_path):
         "SELECT id, hit_count, body_anchor, body_hash FROM chunks "
         "WHERE path=? ORDER BY id", (rel,)).fetchall()
     assert [r[0] for r in before] == [r[0] for r in after], (
-        f"G-3: the chunk id set changed across a rebuild")
+        "G-3: the chunk id set changed across a rebuild")
     assert [r[2] for r in before] == [r[2] for r in after], (
-        f"G-3: body_anchor changed across a rebuild")
+        "G-3: body_anchor changed across a rebuild")
     assert [r[3] for r in before] == [r[3] for r in after], (
-        f"G-3: body_hash changed across a rebuild")
+        "G-3: body_hash changed across a rebuild")
     # G-5: the expected total is DERIVED from the number of chunks the
     # rebuild actually produced. The old hard-coded ``== 14`` (2 chunks x 7)
     # silently bound the criterion to one specific corpus file — on any
@@ -389,9 +385,9 @@ def test_g3_hit_count_survives_the_rebuild(tmp_path):
     n_chunks = len(after)
     assert n_chunks > 0, (
         f"G-3: the rebuild produced no chunks for {src.name}; the criterion "
-        f"would be vacuous")
+        "would be vacuous")
     assert sum(r[1] for r in after) == sum(r[1] for r in before) == n_chunks * 7, (
-        f"G-3: hit_count was lost across a rebuild: "
+        "G-3: hit_count was lost across a rebuild: "
         f"before={[r[1] for r in before]} after={[r[1] for r in after]} "
         f"(expected {n_chunks} chunks x 7 = {n_chunks * 7})")
     st.close()
@@ -407,7 +403,7 @@ def test_g3_the_decision_has_one_source():
     assert "chunk_for_file(raw, rel)" in src, (
         "G-3: the rebuilder must call the shared decision function")
     assert "chunker.chunk_markdown(raw)" not in src, (
-        "G-3: the rebuilder still decides for itself")
+        "G-3: the rebuilder still decides for itsel")
 
 
 # ---- G-5 · the criterion must be portable --------------------------------
@@ -458,13 +454,13 @@ def test_g5_no_machine_specific_absolute_path_in_this_file():
     for needle in needles:
         offenders = [lit for lit in literals if needle in lit]
         assert not offenders, (
-            f"G-5: this test file hard-codes the machine-specific path "
+            "G-5: this test file hard-codes the machine-specific path "
             f"{needle!r} (in {offenders!r}); the corpus must come from "
             f"${CORPUS_ENV_VAR} or the in-repo fixture")
         assert needle not in src, (
             f"G-5: the machine-specific path {needle!r} appears in the raw "
-            f"text of this file — a portability review greps it and finds "
-            f"it. Keep machine-specific paths out of the file entirely.")
+            "text of this file — a portability review greps it and finds "
+            "it. Keep machine-specific paths out of the file entirely.")
 
 
 def test_g5_the_corpus_comes_from_an_explicit_input():
@@ -486,7 +482,7 @@ def test_g5_the_corpus_comes_from_an_explicit_input():
     files = _corpus_files()
     assert files, (
         f"G-5: the in-repo fixture corpus {FIXTURE_CORPUS} holds no .md "
-        f"files — the criterion would have nothing to run on")
+        "files — the criterion would have nothing to run on")
 
 
 def test_g5_fixture_corpus_exposes_the_fork():
@@ -521,7 +517,7 @@ def test_g5_fixture_corpus_exposes_the_fork():
     if not files:
         pytest.skip(
             f"G-5: the in-repo fixture corpus {FIXTURE_CORPUS} holds no .md "
-            f"files — this check did NOT run.")
+            "files — this check did NOT run.")
 
     rel = "memory/markdown/events/2026-10-29/x.md"
     tc = TextChunker()
@@ -538,13 +534,13 @@ def test_g5_fixture_corpus_exposes_the_fork():
             forked.append(p.name)
 
     assert forked, (
-        f"G-5: the fixture corpus does NOT expose the chunking fork — on "
-        f"every fixture file the two decisions cut identically, so the G-3 "
-        f"checks would pass no matter how wrong the decision function is. "
+        "G-5: the fixture corpus does NOT expose the chunking fork — on "
+        "every fixture file the two decisions cut identically, so the G-3 "
+        "checks would pass no matter how wrong the decision function is. "
         f"Files: {[p.name for p in files]}. The corpus must be complex "
-        f"enough (multi-level headings, lists, code blocks, tables, blank "
-        f"lines, indentation, over-long lines) to make the two decisions "
-        f"diverge.")
+        "enough (multi-level headings, lists, code blocks, tables, blank "
+        "lines, indentation, over-long lines) to make the two decisions "
+        "diverge.")
 
 
 def test_g5_fixture_corpus_forces_the_decision_to_split():
@@ -567,7 +563,7 @@ def test_g5_fixture_corpus_forces_the_decision_to_split():
     if not files:
         pytest.skip(
             f"G-5: the in-repo fixture corpus {FIXTURE_CORPUS} holds no .md "
-            f"files — this check did NOT run.")
+            "files — this check did NOT run.")
 
     rel = "memory/markdown/events/2026-10-29/x.md"
     multi = []
@@ -582,12 +578,12 @@ def test_g5_fixture_corpus_forces_the_decision_to_split():
             interior.append(p.name)
 
     assert multi, (
-        f"G-5: no fixture file is cut into more than one chunk — the corpus "
-        f"is too small to exercise the decision function's splitting path "
+        "G-5: no fixture file is cut into more than one chunk — the corpus "
+        "is too small to exercise the decision function's splitting path "
         f"(files: {[p.name for p in files]}).")
     assert interior, (
-        f"G-5: no fixture file is cut at a boundary other than the file's "
-        f"first line — the corpus never forces the decision function to "
+        "G-5: no fixture file is cut at a boundary other than the file's "
+        "first line — the corpus never forces the decision function to "
         f"decide WHERE to cut (files: {[p.name for p in files]}).")
 
 
@@ -610,7 +606,7 @@ def test_g5_fixture_corpus_is_structurally_complex():
     if not files:
         pytest.skip(
             f"G-5: the in-repo fixture corpus {FIXTURE_CORPUS} holds no .md "
-            f"files — this check did NOT run.")
+            "files — this check did NOT run.")
 
     required = {
         "h1": lambda t: any(l.startswith("# ") for l in t.splitlines()),
@@ -634,10 +630,10 @@ def test_g5_fixture_corpus_is_structurally_complex():
     corpus = "\n".join(p.read_text(encoding="utf-8") for p in files)
     missing = [name for name, probe in required.items() if not probe(corpus)]
     assert not missing, (
-        f"G-5: the fixture corpus as a whole is missing required "
+        "G-5: the fixture corpus as a whole is missing required "
         f"structures {missing} (files: {[p.name for p in files]}). The "
-        f"corpus must be complex enough to exercise the chunking "
-        f"decision.")
+        "corpus must be complex enough to exercise the chunking "
+        "decision.")
 
 
 def test_g5_the_corpus_covers_the_part_ordinal_path():
@@ -660,9 +656,9 @@ def test_g5_the_corpus_covers_the_part_ordinal_path():
     files = [p for p in _corpus_files() if p.suffix.lower() != ".md"]
     if not files:
         pytest.skip(
-            f"G-5: the corpus carries no non-markdown file, so the `part` "
-            f"ordinal path of the id rule cannot be observed — this check "
-            f"did NOT run.")
+            "G-5: the corpus carries no non-markdown file, so the `part` "
+            "ordinal path of the id rule cannot be observed — this check "
+            "did NOT run.")
 
     rel = "memory/markdown/events/2026-10-29/x.txt"
     with_parts = []
@@ -674,11 +670,11 @@ def test_g5_the_corpus_covers_the_part_ordinal_path():
                                         for c in chunks]))
 
     assert with_parts, (
-        f"G-5: no non-markdown fixture file produced a chunk with a `part` "
+        "G-5: no non-markdown fixture file produced a chunk with a `part` "
         f"ordinal (files: {[p.name for p in files]}). The corpus must "
-        f"contain a line longer than the hard-split threshold "
-        f"(2000 chars) so that the `part` segment of the id rule "
-        f"md5(path:start:end[:part]) is actually exercised.")
+        "contain a line longer than the hard-split threshold "
+        "(2000 chars) so that the `part` segment of the id rule "
+        "md5(path:start:end[:part]) is actually exercised.")
 
     # The pieces of one over-long line share (start_line, end_line) and
     # differ ONLY in `part` — that is what makes the ordinal necessary.
@@ -691,7 +687,7 @@ def test_g5_the_corpus_covers_the_part_ordinal_path():
                 assert len(set(parts)) == len(parts), (
                     f"G-5: the pieces of the over-long line at {name}:{start} "
                     f"share the ordinal {parts} — their chunk ids would "
-                    f"collide and the UPSERT would drop all but one.")
+                    "collide and the UPSERT would drop all but one.")
 
 
 def test_g5_the_chunk_decision_is_checked_independently_of_itself():
@@ -736,7 +732,7 @@ def test_g5_the_chunk_decision_is_checked_independently_of_itself():
             if c.start_line - 1 >= len(lines):
                 violations.append(
                     f"{p.name}: chunk starts at line {c.start_line}, past "
-                    f"the end of the file")
+                    "the end of the file")
                 continue
             if not lines[c.start_line - 1].lstrip().startswith("#"):
                 violations.append(
@@ -744,15 +740,15 @@ def test_g5_the_chunk_decision_is_checked_independently_of_itself():
                     f"not a heading line ({lines[c.start_line - 1]!r})")
 
     assert checked, (
-        f"G-5: no markdown fixture file produced a chunk to check — the "
-        f"criterion would be vacuous")
+        "G-5: no markdown fixture file produced a chunk to check — the "
+        "criterion would be vacuous")
     assert not violations, (
-        f"G-5: the chunking decision does not honour the markdown heading "
+        "G-5: the chunking decision does not honour the markdown heading "
         f"boundary rule ({len(violations)} violation(s)): "
         f"{violations[:5]}. A markdown chunk must start at line 1 or at a "
-        f"heading — otherwise the decision function has fallen back to the "
-        f"plain line splitter, and the two sides of G-3 would be compared "
-        f"against different boundaries.")
+        "heading — otherwise the decision function has fallen back to the "
+        "plain line splitter, and the two sides of G-3 would be compared "
+        "against different boundaries.")
 
 
 # ---- G-4 · the real D-A / D-C status ------------------------------------
