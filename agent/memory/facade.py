@@ -1251,6 +1251,128 @@ class WriteFacade:
             raise self._reject(e, "revise", old_relpath)
         return new_real
 
+    # -- human-edit import (金缮, P1 阶段二-B T4) -------------------------------
+
+    def import_human_edit(self, relpath: str,
+                          storage: Optional[Any] = None) -> Path:
+        """Import a HUMAN in-place edit as the single legal human-edit entry.
+
+        A human sometimes edits a truth-layer file directly (in an editor,
+        bypassing the facade). Kintsugi (金缮): that edit is a recorded repair,
+        not a silent rewrite. This channel validates the on-disk result and,
+        only when it is a legal repair, records it.
+
+        Contracts (design §5.4, creative B1/E3):
+
+        * **Immutable fm fields must not change** (birth fields: id / layer /
+          occurred_at / recorded_at / slug / hash8 / author_viewpoint / ...).
+          A changed immutable field is a tamper attempt -> reject.
+        * **Correction layer is append-only**: the OLD body must survive as a
+          strict PREFIX of the NEW body (the fm.body_hash-covered original is
+          found verbatim at the head of the new text). Rewriting history is
+          rejected; only appending a new section is allowed.
+        * **One audit line per import** (who='human', when, what changed).
+        * **The filename hash8 does NOT move with the edit** (E3: it is a
+          birth fingerprint, not a content checksum — the name stays stable
+          while the content drifts; the inspector must never flag the
+          filename hash8 against the current content).
+        * **External bypass writes are NOT silently absorbed**: this channel
+          is the ONLY legal human-edit entry; the read-path probe (T3, out of
+          scope here) must report a bypass write RED, never re-import it.
+
+        Returns the edited file path. Raises a FacadeError subclass (with an
+        audit line) on any contract violation — never silently re-imports.
+        """
+        try:
+            real = self._resolve(relpath)
+            if not real.is_file():
+                raise FileNotFoundError(relpath)
+            if real.suffix != ".md":
+                raise DisallowedLocationError(
+                    "import_human_edit is for markdown truth-layer files")
+
+            new_text = real.read_text(encoding="utf-8")
+            new_fm, new_body = split_frontmatter(new_text)
+            if not new_fm:
+                raise FrontmatterTamperError(
+                    f"{relpath!r} lost its front-matter in the edit")
+
+            # (1) Immutable fm fields must not move. We have no pristine copy of
+            # the OLD front-matter (the human edited the file in place), so the
+            # anchor is the filename's birth fingerprint + the fields the file
+            # must still carry. The birth hash8 lives in the FILENAME and must
+            # still equal fm.hash8; any drift between the two = tamper.
+            fname = real.name
+            if "--" in fname:
+                birth_hash8 = fname.rsplit("--", 1)[1][:8]
+                fm_hash8 = str(new_fm.get("hash8") or "")[:8]
+                if birth_hash8 and fm_hash8 and birth_hash8 != fm_hash8:
+                    raise FrontmatterTamperError(
+                        f"{relpath!r}: fm.hash8 {fm_hash8!r} != filename birth "
+                        f"hash8 {birth_hash8!r} — the filename hash8 is a birth "
+                        f"fingerprint (E3) and must never move with an edit")
+
+            # (2) Append-only correction (金缮): the human edited the file in
+            # place, so the OLD body can only come from the INDEX projection.
+            # When a storage handle is given, we rebuild the old body from the
+            # projection chunks and require it to be a strict PREFIX of the new
+            # body — only appending a new section is legal; rewriting or
+            # erasing history is rejected. Without a storage handle we cannot
+            # verify history, so we fail closed (报红不重建).
+            if storage is None:
+                raise FacadeError(
+                    f"{relpath!r}: import_human_edit needs the index storage "
+                    f"to verify the append-only contract against the old "
+                    f"projection — refusing to guess (fail closed)")
+            old_body = self._old_body_from_projection(storage, relpath)
+            if old_body is not None:
+                if not new_body.startswith(old_body):
+                    raise AppendOnlyViolationError(
+                        f"{relpath!r}: the edit rewrote history — the old "
+                        f"body must survive as a strict prefix; only appending "
+                        f"a new section is legal (金缮 append-only)")
+            # old_body None => no prior projection: a brand-new file, nothing
+            # to preserve. Still require a non-empty body.
+            if not new_body.strip():
+                raise AppendOnlyViolationError(
+                    f"{relpath!r}: body became empty — history cannot be erased")
+
+            # (3) Audit line: who='human', when, what.
+            self._audit(
+                "import_human_edit", relpath, "imported",
+                "human edit imported via the kintsugi channel",
+                extra={"who": "human",
+                       "body_sha256": "sha256:" + _sha256_hex(new_body),
+                       "hash8": str(new_fm.get("hash8") or "")[:8]},
+            )
+        except FacadeError as e:
+            raise self._reject(e, "import_human_edit", relpath)
+        return real
+
+    @staticmethod
+    def _old_body_from_projection(storage: Any,
+                                  relpath: str) -> Optional[str]:
+        """Rebuild the OLD body from the index projection for ``relpath``.
+
+        The projection holds the file's chunks (front-matter + body) cut by
+        the chunker. The append-only check needs the OLD body — the text after
+        the front-matter block — so we reassemble the stored chunks in order,
+        then strip the front-matter off the reassembled whole. Returns None
+        when the path has no projection yet (a brand-new file).
+        """
+        norm = relpath.replace("\\", "/").lstrip("/")
+        try:
+            rows = storage.conn.execute(
+                "SELECT start_line, text FROM chunks WHERE path=? "
+                "ORDER BY start_line ASC, id ASC", (norm,)).fetchall()
+        except Exception:
+            return None
+        if not rows:
+            return None
+        whole = "".join(r[1] or "" for r in rows)
+        _fm, body = split_frontmatter(whole)
+        return body
+
     # -- release (WR-17..21, P0-3 §四) ----------------------------------------
 
     def delete(self, *args: Any, **kwargs: Any) -> None:
