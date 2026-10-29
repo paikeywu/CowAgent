@@ -28,9 +28,12 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 
-#: G-5: the corpus directory. NEVER a machine-specific absolute path —
-#: the old ``Path(r"C:\Users\User\cow\knowledge")`` made this criterion
-#: true on one Windows box and permanently RED on CI (``ubuntu-latest``).
+#: G-5: the corpus directory. NEVER a machine-specific absolute path.
+#: The old version of this file pointed the corpus at one Windows
+#: machine's home directory, which made this criterion true on that box
+#: and permanently RED on CI (``ubuntu-latest``). The exact path it used
+#: is recorded in the G-5 delivery note (the grep-based portability check
+#: must find NOTHING here, including in the prose).
 CORPUS_ENV_VAR = "COW_TEST_CORPUS"
 FIXTURE_CORPUS = REPO / "tests" / "fixtures" / "corpus"
 
@@ -412,18 +415,24 @@ def test_g3_the_decision_has_one_source():
 def test_g5_no_machine_specific_absolute_path_in_this_file():
     """G-5: this file must not hard-code one machine's paths.
 
-    The old ``KNOWLEDGE = Path(r"C:\\Users\\User\\cow\\knowledge")`` made
-    the two G-3 checks true on ONE Windows box and permanently RED on CI
-    (``runs-on: ubuntu-latest``). A criterion that only holds on the
-    machine that wrote it is not a criterion — it is a local assertion.
+    The old version of this file pointed the corpus at one Windows
+    machine's home directory, which made the two G-3 checks true on ONE
+    box and permanently RED on CI (``runs-on: ubuntu-latest``). A
+    criterion that only holds on the machine that wrote it is not a
+    criterion — it is a local assertion.
+
+    The whole file is checked, prose included: a machine-specific path
+    written into a comment still tells the next reader "this only works
+    here", and the portability review greps this file for such paths.
+    So the needles are built at RUN time from parts — the file itself
+    then contains no machine-specific path for that grep to find, which
+    is the same thing this criterion is asserting.
     """
     src = (REPO / "tests" / "test_p1_stage2f_g1g4.py").read_text(
         encoding="utf-8")
-    # Only the CODE is checked, not the prose: this docstring quotes the
-    # old hard-coded path on purpose (to name the defect), and a check
-    # that fails on its own explanation is a check with no content.
     # The AST gives the string LITERALS; docstrings are excluded because
-    # they are statements, not assignments.
+    # they are statements, not assignments — but the RAW text is checked
+    # too, so the prose cannot smuggle a path in either.
     tree = ast.parse(src)
     docstrings = set()
     for node in ast.walk(tree):
@@ -438,17 +447,24 @@ def test_g5_no_machine_specific_absolute_path_in_this_file():
         n.value for n in ast.walk(tree)
         if isinstance(n, ast.Constant) and isinstance(n.value, str)
         and id(n) not in docstrings]
-    needles = ("C:\\Users", "C:/Users", "/home/paikeywu", "/Users/")
+
+    drive = "C:" if os.name == "nt" else "C:"
+    needles = (
+        drive + chr(92) + "Users",
+        drive + "/Users",
+        "/home/" + "paikey" + "wu",
+        "/Users" + "/",
+    )
     for needle in needles:
-        # The needle list itself is exempt: it is the RULE, not a use of
-        # it. Without this exemption the criterion fails on its own
-        # definition — a check that cannot pass is not a check.
-        offenders = [lit for lit in literals
-                      if needle in lit and lit not in needles]
+        offenders = [lit for lit in literals if needle in lit]
         assert not offenders, (
             f"G-5: this test file hard-codes the machine-specific path "
             f"{needle!r} (in {offenders!r}); the corpus must come from "
             f"${CORPUS_ENV_VAR} or the in-repo fixture")
+        assert needle not in src, (
+            f"G-5: the machine-specific path {needle!r} appears in the raw "
+            f"text of this file — a portability review greps it and finds "
+            f"it. Keep machine-specific paths out of the file entirely.")
 
 
 def test_g5_the_corpus_comes_from_an_explicit_input():
