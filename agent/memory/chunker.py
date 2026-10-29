@@ -19,6 +19,35 @@ class TextChunk:
     part: int = 0
 
 
+def chunk_for_file(text: str, path: str) -> List[TextChunk]:
+    """THE chunking decision — one place, every caller (G-3).
+
+    A chunk's identity is ``md5(path:start:end[:part])`` — so WHICH
+    chunker cut the file decides the chunk's id. The writer and the
+    rebuilder must therefore make the SAME decision, or a rebuild does
+    not refresh the projection: it REPLACES the chunk identities, and
+    every hit count, reference and audit trail that pointed at the old
+    ids goes nowhere (measured on the real corpus: 56 of 86 files
+    diverged, 180 ids vs 217 ids).
+
+    The rule (the one the writer already used, kept unchanged so the
+    identities ALREADY IN THE INDEX do not move):
+
+      * ``.md`` files -> structure-aware :meth:`TextChunker.chunk_markdown`
+      * anything else -> the plain splitter :meth:`TextChunker.chunk_text`
+
+    Both the writer (``manager.add_memory`` / ``manager.sync``) and the
+    rebuilder (``rebuilder.rebuild_file``) call THIS function. A second
+    copy of the decision is how the two drifted apart in the first
+    place.
+    """
+    chunker = TextChunker()
+    name = (path or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if name.endswith(".md"):
+        return chunker.chunk_markdown(text)
+    return chunker.chunk_text(text)
+
+
 class TextChunker:
     """Chunks text by line count with token estimation"""
     

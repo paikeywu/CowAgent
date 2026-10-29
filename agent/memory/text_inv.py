@@ -165,12 +165,20 @@ def _sample_chunks(conn: sqlite3.Connection, limit: int,
 def check_inv2_inv3(conn: sqlite3.Connection, root: Path, *,
                     sample_limit: int = 20,
                     stale_paths: Optional[List[str]] = None,
-                    full: bool = False) -> Dict[str, Any]:
-    """INV-2 正文可重建 + INV-3 片段哈希（分层抽样）.
+                    full: bool = True) -> Dict[str, Any]:
+    """INV-2 正文可重建 + INV-3 片段哈希（默认全量）.
 
-    For each sampled chunk: read body_path+body_anchor -> canonical -> must be
-    byte-equal to chunks.text (CRLF/LF tolerated), and body_hash must equal
-    sha256(canonical(fragment)).
+    G-1 (P0, sampling blind spot): this used to default to ``full=False``
+    — a 20-row sample — and the PRODUCTION inspection path called it
+    without the argument, so 300 broken rows were found 1 time in 60
+    inspections (98% missed) while the gate stayed green. The default is
+    now ``full=True``: "forgot to pass the argument" must degrade to
+    EXHAUSTIVE, never to a sample. Sampling remains available ONLY as an
+    explicit ``full=False`` call, for development self-checks.
+
+    For each checked chunk: read body_path+body_anchor -> canonical ->
+    must be byte-equal to chunks.text (CRLF/LF tolerated), and body_hash
+    must equal sha256(canonical(fragment)).
     """
     out2: List[Dict[str, Any]] = []
     out3: List[Dict[str, Any]] = []
@@ -490,11 +498,11 @@ DEFERRED_INVS = {
 def run_text_invariants(conn: sqlite3.Connection, root: Path, *,
                         sample_limit: int = 20,
                         stale_paths: Optional[List[str]] = None,
-                        full: bool = False) -> Dict[str, Any]:
+                        full: bool = True) -> Dict[str, Any]:
     """Run the P1-landed INVs (1/2/3/6/9/11) over chunks + filesystem.
 
-    Returns a report naming each INV's verdict + fingerprint, so the caller
-    can never claim a blanket "INV green" — only these six, on chunks.
+    G-1: ``full`` defaults to True (exhaustive). The production
+    inspection path must not degrade into sampling by omission.
     """
     checks = {
         "INV-1": check_inv1(conn, root),

@@ -102,6 +102,20 @@ REASON_INDEX_PUBLIC = "gap-rule:index-public-row"
 # every index rather than a thing somebody did once.
 REASON_GUARD_MISSING = "gap-rule:guard-missing"
 
+# G-2: a REBUILD that FAILED. The rebuilder writes the failure to
+# ``memory/.audit/rebuild_failures.jsonl`` — and until now NOTHING read
+# that file: the marker's own docstring claimed "the inspector reads
+# it", which was false. A rebuild that fails keeps the old projection
+# (by design, atomic swap), so the index silently stays behind the truth
+# layer and the failure is invisible. This check is that reader.
+REASON_REBUILD_FAILED = "gap-rule:rebuild-failed"
+
+# G-2: the front-matter and the tombstone disagree about whether an
+# element is released. The tombstone wins (the rebuilder enforces it), so
+# this is not a leak — but an EDITABLE front-matter claiming something
+# else is a finding, and the marker had no reader.
+REASON_RELEASE_MISMATCH = "gap-rule:release-mismatch"
+
 # Short machine codes carried on every violation (the shelf view needs a
 # stable code, not a sentence).
 CODE_SHRUNK = "facts-shrunk"
@@ -113,6 +127,8 @@ CODE_READ_DEGRADED = "read-degraded"
 CODE_SCHEMA_DRIFT = "schema-drift"
 CODE_INDEX_PUBLIC = "index-public-row"
 CODE_GUARD_MISSING = "guard-missing"
+CODE_REBUILD_FAILED = "rebuild-failed"
+CODE_RELEASE_MISMATCH = "release-mismatch"
 
 # P0-22: how far back the patrol looks when it asks "was anything
 # rewritten lately?". The guard records every discard, so the window is
@@ -258,6 +274,10 @@ class Inspector:
         self._check_index_hygiene(report)
         self._check_projection_degraded(report)
         self._check_read_degraded(report)
+        # G-2: the rebuild-failure marker now has a reader.
+        self._check_rebuild_failed(report)
+        # G-2: so does the release-mismatch marker.
+        self._check_release_mismatch(report)
         self._check_schema_drift(report)
         self._check_public_rows(report)
         # P1 阶段二-B T5: INV 第 9 检查组（03 号 §八的 chunks 落地版 6 条）。
@@ -865,7 +885,16 @@ class Inspector:
                     "violations": [], "violation_count": 0, "deferred": {}}
         try:
             from agent.memory import text_inv
-            result = text_inv.run_text_invariants(conn, self.workspace_root)
+            # G-1: the production inspection path is EXHAUSTIVE. It used to
+            # call run_text_invariants() without the argument, inheriting the
+            # sampling default (20 of N rows) — so 300 broken rows were
+            # caught 1 time in 60 inspections and the gate stayed green
+            # over a corrupted library. `full=True` is passed EXPLICITLY
+            # here as well, so the intent is visible at the call site and
+            # a future default change cannot silently reintroduce the blind
+            # spot.
+            result = text_inv.run_text_invariants(
+                conn, self.workspace_root, full=True)
         finally:
             conn.close()
         for v in result["violations"]:
@@ -944,6 +973,84 @@ class Inspector:
             last_path=payload.get("last_path"),
             at=payload.get("at"),
             error=payload.get("last_error"))
+
+    # -- check 7b: a rebuild FAILED (G-2) ------------------------------------
+
+    def _check_rebuild_failed(self, report: Dict[str, Any]) -> None:
+        """Report a REBUILD that failed (G-2).
+
+        The rebuilder is atomic: when a rebuild fails, the OLD projection
+        is kept and a marker is written to
+        ``memory/.audit/rebuild_failures.jsonl``. Until now NOTHING read
+        that file — the marker's own docstring claimed "the inspector
+        reads it", which was false — so a failing rebuild was SILENT:
+        the index stayed behind the truth layer and every gate stayed
+        green.
+
+        This check is that reader. The marker is append-only history
+        (the failures happened), so the check reports what it finds; it
+        does not clear the file.
+        """
+        from agent.memory.rebuilder import read_rebuild_failures
+
+        try:
+            failures = read_rebuild_failures(self.workspace_root)
+        except Exception as e:
+            rel = (self.audit_dir / "rebuild_failures.jsonl").relative_to(
+                self.workspace_root).as_posix()
+            self._violation(
+                report, REASON_REBUILD_FAILED, rel,
+                f"the rebuild-failure log could not be read: {e}",
+                _SEV_HIGH, code=CODE_REBUILD_FAILED)
+            return
+        for rec in failures:
+            path = str(rec.get("path") or "<unknown>")
+            error = str(rec.get("error") or "<no error recorded>")
+            rel = (self.audit_dir / "rebuild_failures.jsonl").relative_to(
+                self.workspace_root).as_posix()
+            self._violation(
+                report, REASON_REBUILD_FAILED,
+                f"{rel}#{path}",
+                f"a rebuild failed and the old projection was kept "
+                f"(path={path!r}, error={error!r}); the index is behind the "
+                f"truth layer for this file until a rebuild succeeds",
+                _SEV_HIGH, code=CODE_REBUILD_FAILED,
+                rebuild_path=path, error=error)
+
+    def _check_release_mismatch(self, report: Dict[str, Any]) -> None:
+        """Report a front-matter/tombstone disagreement (G-2).
+
+        The tombstone is the final authority on release state, so the
+        index is correct even when the two disagree — but the
+        disagreement means an EDITABLE front-matter claimed something
+        different from the tombstone. That is a finding worth saying
+        out loud, and until now the marker had no reader at all.
+        """
+        from agent.memory.rebuilder import read_release_mismatches
+
+        try:
+            mismatches = read_release_mismatches(self.workspace_root)
+        except Exception as e:
+            rel = (self.audit_dir / "release_mismatch.jsonl").relative_to(
+                self.workspace_root).as_posix()
+            self._violation(
+                report, REASON_RELEASE_MISMATCH, rel,
+                f"the release-mismatch log could not be read: {e}",
+                _SEV_HIGH, code=CODE_RELEASE_MISMATCH)
+            return
+        for rec in mismatches:
+            path = str(rec.get("path") or "<unknown>")
+            detail = str(rec.get("mismatch") or "<no detail recorded>")
+            rel = (self.audit_dir / "release_mismatch.jsonl").relative_to(
+                self.workspace_root).as_posix()
+            self._violation(
+                report, REASON_RELEASE_MISMATCH,
+                f"{rel}#{path}",
+                f"front-matter and tombstone disagree about the release "
+                f"state (path={path!r}, detail={detail!r}); the tombstone "
+                f"wins, but the front-matter was edited",
+                _SEV_HIGH, code=CODE_RELEASE_MISMATCH,
+                release_path=path, mismatch=detail)
 
     # -- check 8: index schema drift (P0-17 B-3) ----------------------------
 

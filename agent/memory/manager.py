@@ -14,7 +14,7 @@ from datetime import datetime
 
 from agent.memory.config import MemoryConfig, get_default_memory_config
 from agent.memory.storage import MemoryStorage, MemoryChunk, SearchResult
-from agent.memory.chunker import TextChunker
+from agent.memory.chunker import TextChunker, chunk_for_file
 from agent.memory.embedding import EmbeddingProvider, EmbeddingCache
 from agent.memory.layers import excluded_segments
 from agent.memory.release_state import ReleaseStateCache
@@ -808,7 +808,16 @@ class MemoryManager:
             else:
                 path = f"memory/shared/memory_{content_hash}.md"
         
-        # Chunk content
+        # Chunk content.
+        #
+        # G-3: this channel is NOT part of the file-projection path — it
+        # stores a memory WITHOUT writing a truth file, so there is no
+        # rebuild that could contradict it, and its path is a synthetic
+        # name for a blob of text rather than a markdown document. It
+        # therefore keeps the plain splitter. The FILE projection path
+        # (sync() below and rebuilder.rebuild_file) is the one that must
+        # agree, and both call chunker.chunk_for_file — the single
+        # decision point.
         chunks = self.chunker.chunk_text(content)
         
         # Generate embeddings (if provider available)
@@ -1092,12 +1101,11 @@ class MemoryManager:
             previous_hash = self.storage.get_file_hash(rel_path)
             if previous_hash == file_hash:
                 continue
-            # Markdown files (memory + knowledge) get structure-aware chunking;
-            # anything else (rare) falls back to the plain char splitter.
-            if file_path.suffix.lower() == '.md':
-                chunks = self.chunker.chunk_markdown(content)
-            else:
-                chunks = self.chunker.chunk_text(content)
+            # G-3: the chunking DECISION lives in ONE place
+            # (chunker.chunk_for_file) — the rebuilder calls the same
+            # function, so a rebuild refreshes the projection instead of
+            # replacing the chunk identities.
+            chunks = chunk_for_file(content, rel_path)
             if not chunks and previous_hash is None:
                 continue
             pending.append({
@@ -1490,12 +1498,24 @@ class MemoryManager:
     def _compute_temporal_decay(path: str, half_life_days: float = 30.0) -> float:
         """
         Compute temporal decay multiplier for dated memory files.
-        
+
         Inspired by OpenClaw's temporal-decay: exponential decay based on file date.
         MEMORY.md and non-dated files are "evergreen" (no decay, multiplier=1.0).
         Daily files like memory/2025-03-01.md decay based on age.
-        
+
         Formula: multiplier = exp(-ln2/half_life * age_in_days)
+
+        G-4 · D-A · **STILL UNFIXED (registered as an open P1-阶段三 item)**:
+        the date is read from the PATH by a regex; the truth layer's own
+        ``occurred_at`` is never consulted. The design corpus defines D-A
+        as "衰减正则只匹配 memory/YYYY-MM-DD.md，v2 结构下静默失效" and
+        marks it P0-fix. The fix (read front-matter ``occurred_at`` first,
+        fall back to the regex; keep knowledge pages evergreen) is
+        specified in 00-P1详细设计-文本外置.md §… but is NOT implemented:
+        every path this regex does not match returns 1.0 silently.
+        There is NO criterion for it yet — so it must not be reported as
+        fixed. See the G-4 section of
+        2026-10-29-P1-阶段二F-G1G4修复.md.
         """
         import re
         import math
@@ -1641,6 +1661,24 @@ class MemoryManager:
         subject to temporal decay), then re-sorts. Returns ``results``
         unchanged when no reranker is configured, and falls back to them when
         rerank fails, the same way vector search degrades to keyword-only.
+
+        G-4 · D-C · **STILL UNFIXED (registered as an open P1-阶段三 item)**:
+        two things are wrong here and neither has a criterion yet.
+
+          1. The reranker score REPLACES the fused score outright (no
+             renormalization), so the keyword/vector channels' contribution
+             is discarded whenever a reranker is configured.
+          2. The temporal decay is applied to the rerank score here, while
+             the fused score was ALREADY decayed upstream — the decay is
+             multiplied twice on the rerank path.
+
+        The design corpus defines D-C as "decay 被乘了两次；有 reranker
+        时融合分被完全丢弃" and marks it P0-fix, with the target shape
+        ``score_breakdown = {bm25, rerank, decay, hit_boost, graph}``
+        (09 号 D-C2) — weighted total for ranking, breakdown for display.
+        That is NOT implemented. Do not report it as fixed without a
+        criterion. See the G-4 section of
+        2026-10-29-P1-阶段二F-G1G4修复.md.
         """
         if self.reranker is None or not results:
             return results

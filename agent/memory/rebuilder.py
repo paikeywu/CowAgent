@@ -32,12 +32,13 @@ Hard rules (design §4.3 — each one was a review verdict, not a nicety):
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from common.log import logger
 
-from agent.memory.chunker import TextChunker
+from agent.memory.chunker import TextChunker, chunk_for_file
 from agent.memory.naming import canonical_text
 from agent.memory import changes
 from agent.memory.storage import MemoryChunk, MemoryStorage
@@ -143,7 +144,15 @@ def rebuild_file(
     stat = fp.stat()
 
     chunker = TextChunker()
-    pieces = chunker.chunk_markdown(raw)
+    # G-3: the chunking DECISION lives in ONE place (chunker.chunk_for_file)
+    # and is the same one the writer makes. This used to call
+    # ``chunk_markdown`` unconditionally, while the writer's ``add_memory``
+    # called ``chunk_text`` — so a rebuild produced a DIFFERENT set of
+    # chunk ids than the write did (measured on the real corpus: 56 of 86
+    # files diverged). A rebuild must refresh the projection, not replace
+    # the chunk identities: every hit count, reference and audit trail
+    # points at an id.
+    pieces = chunk_for_file(raw, rel)
 
     # Release/sealed flags: re-derived from the truth layer, never inherited.
     # A front-matter / tombstone disagreement is reported (the tombstone wins)
@@ -232,9 +241,13 @@ def _norm(p: str) -> str:
 
 
 def _audit_mismatch(workspace: Path, rel: str, mismatches: List[str]) -> None:
-    """Report a front-matter/tombstone disagreement to .audit/ (RED signal)."""
+    """Report a front-matter/tombstone disagreement to .audit/ (RED signal).
+
+    G-2: the path now comes from the ONE definition (``audit_dir()``), so
+    the marker lands where the other audit trails live.
+    """
     try:
-        audit = workspace / ".audit"
+        audit = audit_dir(workspace)
         audit.mkdir(parents=True, exist_ok=True)
         (audit / "release_mismatch.jsonl").open("a", encoding="utf-8").write(
             '{"path": %s, "mismatch": %s}\n' % (
@@ -244,9 +257,19 @@ def _audit_mismatch(workspace: Path, rel: str, mismatches: List[str]) -> None:
 
 
 def _audit_marker(workspace: Path, rel: str, error: str) -> None:
-    """Drop a .audit/ marker for a failed rebuild — the inspector reads it."""
+    """Drop a .audit/ marker for a failed rebuild — the inspector reads it.
+
+    G-2: this used to write to ``<workspace>/.audit/`` while every other
+    audit trail (the change log, the release projection marker) lives
+    under ``<workspace>/memory/.audit/`` — so even a reader that knew
+    the name would have looked in the wrong place. The path now comes
+    from ONE definition (audit_dir()), shared with the inspector.
+
+    The docstring used to say "the inspector reads it" while NOTHING
+    read it. It does now: ``inspector._check_rebuild_failed``.
+    """
     try:
-        audit = workspace / ".audit"
+        audit = audit_dir(workspace)
         audit.mkdir(parents=True, exist_ok=True)
         (audit / "rebuild_failures.jsonl").open("a", encoding="utf-8").write(
             '{"path": %s, "error": %s}\n' % (
@@ -254,6 +277,110 @@ def _audit_marker(workspace: Path, rel: str, error: str) -> None:
     except Exception:
         # The audit marker failing must not mask the rebuild failure itself.
         logger.warning(f"[rebuilder] could not write audit marker for {rel}")
+
+
+def audit_dir(workspace: Path | str) -> Path:
+    """The ONE definition of where the audit trails live (G-2).
+
+    ``<workspace>/memory/.audit`` — the same place the change log and the
+    release-projection marker live, and the same place the inspector
+    looks. It used to be written as ``<workspace>/.audit`` by the
+    rebuilder and read as ``<workspace>/memory/.audit`` by the inspector:
+    two spellings of one directory, and a marker nobody could find.
+    """
+    return Path(workspace) / "memory" / ".audit"
+
+
+def read_release_mismatches(workspace: Path | str) -> List[Dict[str, Any]]:
+    """The recorded front-matter/tombstone disagreements — the G-2 reader.
+
+    A mismatch means the truth layer says two different things about
+    whether an element is released. The tombstone wins (the rebuilder
+    enforces it), but the disagreement itself is a finding: an editable
+    front-matter tried to smuggle a released file back into public view.
+    """
+    out: List[Dict[str, Any]] = []
+    path = audit_dir(workspace) / "release_mismatch.jsonl"
+    if not path.is_file():
+        return out
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        return [{"path": "<unreadable>", "mismatch": f"cannot read: {e}"}]
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            out.append({"path": "<malformed>", "mismatch": line[:120]})
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
+def read_release_mismatches(workspace: Path | str) -> List[Dict[str, Any]]:
+    """The recorded front-matter/tombstone disagreements — the G-2 reader.
+
+    A mismatch means the truth layer says two different things about
+    whether an element is released. The tombstone wins (the rebuilder
+    enforces it), but the disagreement itself is a finding: an editable
+    front-matter tried to smuggle a released file back into public view.
+    """
+    out: List[Dict[str, Any]] = []
+    path = audit_dir(workspace) / "release_mismatch.jsonl"
+    if not path.is_file():
+        return out
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        return [{"path": "<unreadable>", "mismatch": f"cannot read: {e}"}]
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            out.append({"path": "<malformed>", "mismatch": line[:120]})
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
+def read_rebuild_failures(workspace: Path | str) -> List[Dict[str, Any]]:
+    """The recorded rebuild failures — the reader for the G-2 check.
+
+    Returns one dict per line of ``rebuild_failures.jsonl``. An
+    unreadable/malformed log is NOT swallowed: it is returned as a
+    synthetic entry so the caller reports it (a marker that cannot be
+    parsed is itself a finding — fail-visible, never fail-silent).
+    """
+    out: List[Dict[str, Any]] = []
+    path = audit_dir(workspace) / "rebuild_failures.jsonl"
+    if not path.is_file():
+        return out
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        return [{"path": "<unreadable>", "error": f"cannot read the log: {e}"}]
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            out.append({"path": "<malformed>", "error": f"cannot parse: {line[:120]}"})
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+        else:
+            out.append({"path": "<malformed>", "error": f"not a record: {line[:120]}"})
+    return out
 
 
 def _json_str(s: str) -> str:

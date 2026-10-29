@@ -17,7 +17,20 @@ def _new_db(tmp_path):
     return MemoryStorage(db_path=tmp_path / "index.db")
 
 
-# --- T1 · D-C：四列进库，写入透传 -------------------------------------------
+# --- T1 · 外置四列（body_path/body_anchor/body_hash/text_state）-----------
+#
+# G-4: this section header used to read "T1 · D-C：四列进库" and the T2
+# header used to read "T2 · D-A：单一真源 + 旧库原地迁移". Those labels
+# were a NUMBER COLLISION: in the design corpus, "D-A" is the temporal
+# decay regex (manager.py's date-from-path) and "D-C" is the reranker
+# fusion/decay double-multiplication — two UNFIXED P0 defects. A reader
+# grepping for "D-A" found these sections and could reasonably conclude
+# the defects were covered. They are not.
+#
+# The labels now name what the tests actually assert. The real D-A/D-C
+# status is registered in the P1 delivery docs (see the G-4 section of
+# 2026-10-29-P1-阶段二F-G1G4修复.md): both are STILL UNFIXED, tracked
+# as P1-阶段三 items. The fresh numbering for this round is G1/G2/G3/G4.
 
 def test_a_fresh_index_has_the_four_columns(tmp_path):
     """T1 正向：新建库的 chunks 表含四个外置列。"""
@@ -68,12 +81,12 @@ def test_row_to_chunk_round_trips_the_four_columns(tmp_path):
     assert back.text_state == "externalized" and back.body_path == "bp"
 
 
-# --- T2 · D-A：单一真源 + 旧库原地迁移 -------------------------------------
+# --- T2 · 单一真源（schema_migrate）+ 旧库原地迁移 ------------------------
 
 def _legacy_db(path: Path):
     """一个 P0-14 时代的旧 schema 库（含 sealed_owner，无四个外置列）。
 
-    它**已有** hit/release 三列，只缺 D-C 外置四列 —— 这正是阶段一要
+    它**已有** hit/release 三列，只缺外置四列 —— 这正是阶段一要
     原地迁移的真实旧库形态（P0-14 之后的库）。
     """
     conn = sqlite3.connect(str(path))

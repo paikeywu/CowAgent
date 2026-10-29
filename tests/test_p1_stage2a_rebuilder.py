@@ -83,8 +83,12 @@ def test_atomic_swap_leaves_old_projection_on_failure(tmp_path):
     ).fetchall()
     st.close()
     assert before == after, "old projection was clobbered by a failed swap"
-    assert (ws / ".audit" / "rebuild_failures.jsonl").is_file(), \
-        "failed rebuild left no .audit/ marker"
+    # G-2: the marker now lives in the ONE audit directory (memory/.audit/),
+    # the same place the inspector looks. The path comes from the shared
+    # definition rather than a second spelling of it.
+    marker = rebuilder.audit_dir(ws) / "rebuild_failures.jsonl"
+    assert marker.is_file(), (
+        f"failed rebuild left no .audit/ marker at {marker}")
 
 
 def test_body_path_is_posix_and_relative(tmp_path):
@@ -122,7 +126,8 @@ def test_release_mismatch_detected_and_tombstone_wins(tmp_path):
     ).fetchone()[0]
     st.close()
     assert flag == 1, "tombstone did not win — the file should be released"
-    assert (ws / ".audit" / "release_mismatch.jsonl").is_file()
+    # G-2: the marker lives in the ONE audit directory (memory/.audit/).
+    assert (rebuilder.audit_dir(ws) / "release_mismatch.jsonl").is_file()
 
 
 def test_no_mismatch_when_consistent(tmp_path):
