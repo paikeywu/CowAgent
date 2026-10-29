@@ -840,6 +840,23 @@ def judge_s1_criteria_do_not_modify_what_they_measure(report, workspace: Path):
     The criterion proves it in the only way that counts: it CHANGES the
     four columns on a COPY, and shows that the digest MOVES.  If the
     digest does not move, the check is blind.
+
+    **The guard's triggers are dropped from the copy first.**  MEASURED
+    (S3-J): the S3-I guard installs a BEFORE UPDATE trigger that
+    RESTORES the protected columns when the incoming value is NULL —
+    so the mutation this criterion performs is reverted by the very
+    statement that performs it, and the digest never moves.  The
+    criterion then reports "the digest is blind to the four columns",
+    which is a FALSE RED: the digest is fine, the mutation simply
+    never landed.
+
+    A criterion that reports the wrong reason for a red is worse than
+    one that stays silent, because the reader goes and fixes the wrong
+    thing.  So the guard is removed from the copy, the mutation is
+    applied, and the row is READ BACK to confirm the mutation landed
+    before the digests are compared.  If the row still holds its
+    pointer after the UPDATE, the criterion says so and does NOT claim
+    the digest is blind.
     """
     detail = []
     import shutil
@@ -863,6 +880,17 @@ def judge_s1_criteria_do_not_modify_what_they_measure(report, workspace: Path):
                 shutil.copy2(s, Path(str(copy) + suffix))
         conn = sqlite3.connect(str(copy))
         try:
+            # The guard's triggers come off the COPY: the guard exists
+            # to revert exactly this mutation, so leaving it on would
+            # make the criterion measure the guard instead of the
+            # digest.  (The LIVE library is never touched.)
+            dropped = []
+            for trig in ("chunks_body_keep_bu", "chunks_body_keep_bi",
+                         "chunks_body_keep_bd", "chunks_body_keep_bi_ai",
+                         "chunks_body_keep_st_ai"):
+                conn.execute("DROP TRIGGER IF EXISTS %s" % trig)
+                dropped.append(trig)
+            conn.commit()
             before = content_digest(conn)
             row = conn.execute("SELECT id FROM chunks WHERE body_path IS NOT NULL "
                                "LIMIT 1").fetchone()
@@ -875,6 +903,24 @@ def judge_s1_criteria_do_not_modify_what_they_measure(report, workspace: Path):
             conn.execute("UPDATE chunks SET body_path=NULL, body_anchor=NULL, "
                          "body_hash=NULL WHERE id=?", (row[0],))
             conn.commit()
+            # --- did the mutation actually LAND? --------------------
+            # Read the row back.  If it still holds its pointer, the
+            # mutation was reverted by something (a trigger), and the
+            # digest comparison below would be measuring nothing.
+            landed = conn.execute(
+                "SELECT body_path FROM chunks WHERE id=?", (row[0],)).fetchone()[0]
+            if landed is not None:
+                conn.close()
+                detail.append("被测库（副本）: %s" % lib.db)
+                detail.append("改坏的行 id=%s" % row[0])
+                detail.append("改坏后该行的 body_path 仍是 %r —— 变异【没有落地】"
+                              % landed)
+                detail.append("已从副本上移除的守卫触发器: %s" % ", ".join(dropped))
+                detail.append("结论: 无法判定 —— 变异被别的东西改回去了，"
+                              "此时比较指纹没有意义（不是『指纹瞎了』）。")
+                return report.judge_notrun(
+                    "S-1(unit)", "内容指纹覆盖四列：改坏 body_path 会让指纹变化",
+                    "\n".join(detail))
             after = content_digest(conn)
         finally:
             conn.close()
@@ -1022,10 +1068,12 @@ def judge_s6_criterion_names_say_what_they_measure(report, workspace: Path = Non
     detail = []
     here = Path(__file__).resolve()
     if targets is None:
-        # ALL THREE criterion files.  The S3-H module is included: a
-        # criterion that lives in a new file must not be able to slip a
-        # lying name past this check by living somewhere else.
-        targets = [here, here.parent / "phase2.py", here.parent / "phase2_s3h.py"]
+        # ALL FOUR criterion files.  The S3-H and S3-J modules are
+        # included: a criterion that lives in a new file must not be
+        # able to slip a lying name past this check by living
+        # somewhere else.
+        targets = [here, here.parent / "phase2.py", here.parent / "phase2_s3h.py",
+                   here.parent / "phase2_s3j.py"]
     else:
         targets = [Path(t) for t in targets]
 

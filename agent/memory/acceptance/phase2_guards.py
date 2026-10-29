@@ -79,7 +79,8 @@ OUT_OF_SCOPE: Dict[str, str] = {
 }
 
 #: The criterion files.
-CRITERION_FILES = ("phase2.py", "phase2_s3e.py", "phase2_s3h.py", "live_libs.py")
+CRITERION_FILES = ("phase2.py", "phase2_s3e.py", "phase2_s3h.py",
+                   "phase2_s3j.py", "live_libs.py")
 
 #: The mutants this round's replay must name, per file.  The replay
 #: criterion checks that the MUTANT NAMES appear in a tracked test file —
@@ -89,12 +90,24 @@ CRITERION_FILES = ("phase2.py", "phase2_s3e.py", "phase2_s3h.py", "live_libs.py"
 #:   MU-15  the anti-downgrade UPSERT is broken (an unconditional overwrite)
 #:   MU-16  the ``~N`` gap count takes part in the join (it must not)
 #:   MU-17  ``body_origin`` is dispatched as ``'file'`` for every row
+#:
+#: MU-18/19/20 are this round's three new ones — and all three are
+#: mutations of the CRITERION itself, because this round's subject IS
+#: the criterion:
+#:   MU-18  the F-chain loses F4 ⇒ the "never migrated" state vanishes
+#:   MU-19  the version comparison becomes textual ⇒ every library
+#:          looks unmigrated (MEASURED: this was a real bug)
+#:   MU-20  the verdict order is inverted ⇒ a measured defect is
+#:          hidden behind an unmet prerequisite
 REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
     "test_p1_stage3e_criteria_mutants.py": (
         "MU-1", "MU-2", "MU-3", "MU-4", "MU-5", "MU-6", "MU-7", "MU-8", "MU-9",
     ),
     "test_p1_stage3h_criteria_mutants.py": (
         "MU-15", "MU-16", "MU-17",
+    ),
+    "test_p1_stage3j_criteria_mutants.py": (
+        "MU-18", "MU-19", "MU-20",
     ),
 }
 

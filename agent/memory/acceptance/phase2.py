@@ -850,6 +850,23 @@ _S3H_CRITERIA = [
     ("PARSER", "judge_anchor_parser_is_single"),
 ]
 
+# ---------------------------------------------------------------------------
+# S3-J · the criteria that tell 「没迁移」 and 「迁移后被擦」 apart.
+#
+# They live in their own module (``phase2_s3j``) because they answer a
+# question none of the others do: WHEN a library's state looks wrong, is
+# that because the migration never ran (a missing prerequisite) or
+# because the migration ran and something overwrote its work (a live
+# defect)?  Those two need different verdicts, and a criterion that
+# cannot tell them apart is either crying wolf or waving things
+# through.
+_S3J_CRITERIA = [
+    ("J-2", "judge_migration_state_is_discriminable"),
+    ("J-3", "judge_files_statistics_are_not_erased"),
+    ("J-4", "judge_last_bulk_rewrite_is_reported"),
+    ("J-5", "judge_old_writer_erasure_monitor"),
+]
+
 # The criteria that GUARD the criteria (MU-12 / MU-14 / the replay).
 _GUARD_CRITERIA = [
     ("MU-12", "judge_mu12_three_states_are_real"),
@@ -911,6 +928,24 @@ def _load_s3h():
     return out
 
 
+def _load_s3j():
+    """The S3-J criterion functions, bound to the workspace."""
+    from agent.memory.acceptance import phase2_s3j
+
+    ws = Path(resolve_workspace(ARGS.workspace)[0])
+    out = []
+    for group, attr in _S3J_CRITERIA:
+        fn = getattr(phase2_s3j, attr)
+
+        def make(fn=fn, ws=ws):
+            def run(report):
+                return fn(report, ws)
+            return run
+
+        out.append((group, make()))
+    return out
+
+
 def main() -> int:
     workspace, how = resolve_workspace(ARGS.workspace)
 
@@ -957,6 +992,12 @@ def main() -> int:
 
     # The S3-H criteria (aligned with S3-D's landed implementation).
     for group, fn in _load_s3h():
+        if ARGS.only and not group.startswith(ARGS.only):
+            continue
+        guarded(fn, report)
+
+    # The S3-J criteria (「没迁移」 vs 「迁移后被擦」).
+    for group, fn in _load_s3j():
         if ARGS.only and not group.startswith(ARGS.only):
             continue
         guarded(fn, report)
