@@ -459,87 +459,41 @@ def judge_r_s3_5_mirror_has_a_setter(report, workspace: Path):
 
 
 def judge_m6_body_origin_mouth(report, workspace: Path):
-    """M6 (REAL): the new mouth — ``body_origin='file' AND text_state<>'mirror'``
-    is 0, AND ``unresolved`` is 0.
+    """M6 (REAL): SUPERSEDED by the S3-H criterion — see below.
 
-    The architect's ruling replaced the old mouth.  The old one was
-    ``text_state NOT IN ('mirror') == 0`` — which is **unsatisfiable**
-    whenever a library holds a blob row (a row with no truth file
-    behind it, whose honest ``body_path`` is NULL): the blob row can
-    never be ``mirror``, so the count could never reach zero.  A
-    criterion that guards an unsatisfiable invariant is a criterion that
-    is permanently red, and then nobody trusts it.
+    **This function is no longer wired into the gate.**  The S3-H module
+    (``phase2_s3h.judge_m6_body_origin_mouth``) replaces it, because this
+    one used the OLD mouth (``text_state NOT IN ('mirror') == 0``), which
+    is UNSATISFIABLE once a blob row exists: a blob row has no truth
+    source to mirror, so the count could never reach zero.  A criterion
+    that guards an unsatisfiable invariant is permanently red, and a
+    permanently red criterion is one nobody reads.
 
-    The new mouth is satisfiable and says what it means:
+    It is kept (not deleted) for two reasons: the mutant replay and any
+    external caller still refer to it, and deleting a superseded
+    criterion loses the record of WHY it was superseded — which is the
+    part a future reader needs.
 
-      * rows that came from a FILE must have reached ``mirror``;
-      * rows that could not be resolved must be counted as
-        ``unresolved`` — i.e. they must be VISIBLE, not silently fine.
+    The old mouth's flaw, for the record:
 
-    ``body_origin`` **does not exist yet** (the architect's ruling is
-    for the next round).  So this criterion CANNOT be measured today:
-    it reports NOTRUN and says exactly which column is missing — not
-    FAIL (the product is not broken; the column was never added) and
-    certainly not PASS (that would be a silent green on a criterion
-    that measured nothing).
+      * the old mouth was ``text_state NOT IN ('mirror') == 0`` — i.e.
+        EVERY row must be ``'mirror'``.  But a ``'blob'`` row has NO
+        truth source to mirror: its text lives only in the row.  So the
+        old criterion could never be satisfied once a blob row exists.
 
-    This is the third state earning its keep: before it, this criterion
-    would have been FAIL, and FAIL here reads as "the migration is
-    broken" — which is exactly the kind of false red that P1 hit three
-    times in stage two.
+    The new mouth (架构师 §4.5):
+
+      * ``body_origin='file' AND text_state<>'mirror'``  == 0
+      * ``body_origin='unresolved'``                      == 0
+      * ``body_origin='orphan'``                          == 0
+
+    and ``blob`` is a legal terminal state whose count is REPORTED but
+    not judged.
     """
-    detail = []
-    libs = enumerate_live(workspace)
-    if not libs:
-        return report.judge_notrun(
-            "M6(REAL)", "M6 新口径：body_origin='file' 的行全部 mirror，unresolved 为 0",
-            "本工作区没有活库，前置条件不成立（这不是通过）")
-
-    # Is the column there?
-    missing_in = []
-    for lib in libs:
-        conn = open_ro(lib.db)
-        try:
-            cols = set(table_columns(conn, "chunks"))
-        finally:
-            conn.close()
-        if "body_origin" not in cols:
-            missing_in.append(lib.name)
-    detail.append("body_origin 列存在的库: %d/%d"
-                  % (len(libs) - len(missing_in), len(libs)))
-    if missing_in:
-        detail.append("缺少 body_origin 列的库: %s" % ", ".join(missing_in))
-        detail.append("该列由内核架构师的裁决落地，尚未实现（下一轮由后台工程师做）。")
-        detail.append("本判据需要它才能测量：没有它，M6 的新口径无法计算，"
-                      "旧的『text_state NOT IN (mirror) == 0』口径又不可满足"
-                      "（有 blob 行时永远非零）。")
-        return report.judge_notrun(
-            "M6(REAL)", "M6 新口径：body_origin='file' 的行全部 mirror，unresolved 为 0",
-            "\n".join(detail))
-
-    # The column exists: measure it.
-    detail.append("")
-    ok = True
-    for lib in libs:
-        conn = open_ro(lib.db)
-        try:
-            file_not_mirror = count(
-                conn, "SELECT COUNT(*) FROM chunks "
-                     "WHERE body_origin='file' AND text_state<>'mirror'")
-            unresolved = count(
-                conn, "SELECT COUNT(*) FROM chunks WHERE body_origin='unresolved'")
-            states = dict(conn.execute(
-                "SELECT body_origin, COUNT(*) FROM chunks GROUP BY 1").fetchall())
-        finally:
-            conn.close()
-        detail.append("  %-22s body_origin=%s" % (lib.name, states))
-        detail.append("      file 且非 mirror = %d   unresolved = %d"
-                      % (file_not_mirror, unresolved))
-        if file_not_mirror or unresolved:
-            ok = False
-    return report.judge(
-        "M6(REAL)", "M6 新口径：body_origin='file' 的行全部 mirror，unresolved 为 0",
-        ok, "\n".join(detail))
+    from agent.memory.acceptance.phase2_s3h import (
+        judge_m6_body_origin_mouth as _s3h_m6,
+    )
+    return _s3h_m6(report, workspace)
 
 
 # ---------------------------------------------------------------------------
@@ -582,9 +536,24 @@ def judge_q1_inv1_every_library(report, workspace: Path):
             conn.close()
         inv1 = r["checks"]["INV-1"]
         v = inv1["verdict"]
-        n = len(inv1.get("violations") or [])
+        violations = inv1.get("violations") or []
+        n = len(violations)
         detail.append("  %-22s INV-1=%-7s 违规=%-5d 指纹=%s"
                       % (lib.name, v, n, inv1.get("fingerprint", "-")))
+        # The REASON CODES, per library.  They are what the operator
+        # acts on: "the pointer is missing" and "nobody has decided
+        # whether this row has a truth source" are two DIFFERENT
+        # repairs, and a report that only says "RED" sends the reader
+        # to the wrong one.  (The architect's §6.2 requires the codes
+        # to be separate precisely so they can be counted.)
+        codes: Dict[str, int] = {}
+        for viol in violations:
+            code = viol.get("code") or viol.get("reason") or "?"
+            codes[code] = codes.get(code, 0) + 1
+        if codes:
+            detail.append("      违规 reason code: %s"
+                          % ", ".join("%s×%d" % (c, k)
+                                      for c, k in sorted(codes.items())))
         if v == "RED":
             red.append("%s(%d)" % (lib.name, n))
         elif v == "NOTRUN":

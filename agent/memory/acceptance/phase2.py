@@ -823,9 +823,31 @@ _S3E_CRITERIA = [
     ("Q2", "judge_q2_inv2_inv3_every_library"),
     ("Q5", "judge_q5_no_library_regressed"),
     ("R-S3-5", "judge_r_s3_5_mirror_has_a_setter"),
-    ("M6", "judge_m6_body_origin_mouth"),
     ("S-1", "judge_s1_criteria_do_not_modify_what_they_measure"),
     ("S-6", "judge_s6_criterion_names_say_what_they_measure"),
+]
+
+# ---------------------------------------------------------------------------
+# S3-H · the criteria that align with S3-D's landed reality.
+#
+# They live in their own module (``phase2_s3h``) because they are the
+# ones that had to CHANGE against the implementation: the chunker version
+# in three states, the M6 three-part mouth, the byte-equality assertion
+# computed independently, the anti-downgrade UPSERT and the single
+# parser.  Each of those has a reason to exist that the S3-E ones do
+# not, and burying them in the S3-E module would hide that.
+#
+# M6 is REPLACED, not duplicated: the S3-E ``judge_m6_body_origin_mouth``
+# used the old (unsatisfiable) mouth, and keeping two M6 criteria in the
+# report would mean one of them is always red for a reason nobody can
+# fix.  The S3-H one replaces it.
+_S3H_CRITERIA = [
+    ("C-A3", "judge_ca3_chunker_version_is_consistent"),
+    ("M6", "judge_m6_body_origin_mouth"),
+    ("INV-2", "judge_inv2_anchor_rebuild_is_byte_equal"),
+    ("ANCHOR", "judge_anchor_segments_are_self_consistent"),
+    ("UPSERT", "judge_upsert_does_not_downgrade_the_body_columns"),
+    ("PARSER", "judge_anchor_parser_is_single"),
 ]
 
 # The criteria that GUARD the criteria (MU-12 / MU-14 / the replay).
@@ -865,6 +887,24 @@ def _load_guards():
         def make(fn=fn):
             def run(report):
                 return fn(report)
+            return run
+
+        out.append((group, make()))
+    return out
+
+
+def _load_s3h():
+    """The S3-H criterion functions, bound to the workspace."""
+    from agent.memory.acceptance import phase2_s3h
+
+    ws = Path(resolve_workspace(ARGS.workspace)[0])
+    out = []
+    for group, attr in _S3H_CRITERIA:
+        fn = getattr(phase2_s3h, attr)
+
+        def make(fn=fn, ws=ws):
+            def run(report):
+                return fn(report, ws)
             return run
 
         out.append((group, make()))
@@ -911,6 +951,12 @@ def main() -> int:
 
     # The S3-E criteria.
     for group, fn in _load_s3e():
+        if ARGS.only and not group.startswith(ARGS.only):
+            continue
+        guarded(fn, report)
+
+    # The S3-H criteria (aligned with S3-D's landed implementation).
+    for group, fn in _load_s3h():
         if ARGS.only and not group.startswith(ARGS.only):
             continue
         guarded(fn, report)

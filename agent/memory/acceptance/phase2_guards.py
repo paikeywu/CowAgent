@@ -79,7 +79,24 @@ OUT_OF_SCOPE: Dict[str, str] = {
 }
 
 #: The criterion files.
-CRITERION_FILES = ("phase2.py", "phase2_s3e.py", "live_libs.py")
+CRITERION_FILES = ("phase2.py", "phase2_s3e.py", "phase2_s3h.py", "live_libs.py")
+
+#: The mutants this round's replay must name, per file.  The replay
+#: criterion checks that the MUTANT NAMES appear in a tracked test file —
+#: a replay that names nothing proves nothing.
+#:
+#: MU-15/16/17 are the fourth round's three new ones:
+#:   MU-15  the anti-downgrade UPSERT is broken (an unconditional overwrite)
+#:   MU-16  the ``~N`` gap count takes part in the join (it must not)
+#:   MU-17  ``body_origin`` is dispatched as ``'file'`` for every row
+REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
+    "test_p1_stage3e_criteria_mutants.py": (
+        "MU-1", "MU-2", "MU-3", "MU-4", "MU-5", "MU-6", "MU-7", "MU-8", "MU-9",
+    ),
+    "test_p1_stage3h_criteria_mutants.py": (
+        "MU-15", "MU-16", "MU-17",
+    ),
+}
 
 
 def _criterion_dir() -> Path:
@@ -237,14 +254,15 @@ def judge_mutation_replay_is_registered(report, workspace: Path = None):
     """
     detail = []
     repo = Path(__file__).resolve().parents[3]
-    candidates = list(repo.glob("tests/test_p1_stage3e*.py"))
+    candidates = sorted(repo.glob("tests/test_p1_stage3*.py"))
     if not candidates:
-        detail.append("找不到 mutant 重放测试（tests/test_p1_stage3e*.py）")
+        detail.append("找不到 mutant 重放测试（tests/test_p1_stage3*.py）")
         detail.append("没有重放 = 没有证据『改坏必红』；自检不等于反例")
         return report.judge(
             "MU-REPLAY(unit)", "mutant 重放已入库并指名要重放的变异",
             False, "\n".join(detail))
     ok = True
+    seen_names: set = set()
     for path in candidates:
         src = path.read_text(encoding="utf-8")
         tracked = False
@@ -258,6 +276,7 @@ def judge_mutation_replay_is_registered(report, workspace: Path = None):
         except Exception as e:
             detail.append("git ls-files 失败: %s" % e)
         names = sorted(set(re.findall(r"MU-(\d+)", src)))
+        seen_names.update("MU-%s" % n for n in names)
         detail.append("  %s  入库=%s  重放的变异=MU-%s"
                       % (path.name, tracked, ", ".join(names) if names else "无"))
         if not tracked:
@@ -266,6 +285,21 @@ def judge_mutation_replay_is_registered(report, workspace: Path = None):
         if not names:
             ok = False
             detail.append("  —— 重放测试没有指名任何变异")
+
+    # The REQUIRED names: a replay that dropped a mutant would still
+    # pass the checks above (it names SOMETHING), and the dropped mutant
+    # would silently stop being tested.  This is the "coverage
+    # over-reported" failure in the replay's own clothes.
+    for fname, required in REQUIRED_MUTANT_NAMES.items():
+        missing = [m for m in required if m not in seen_names]
+        detail.append("  %s 必须重放的变异: %s —— 缺: %s"
+                      % (fname, ", ".join(required),
+                         ", ".join(missing) if missing else "无"))
+        if missing:
+            ok = False
+            detail.append("  —— 变异的重放被漏掉了：%s（一条被漏掉的 mutant "
+                          "就是一条不再被检验的不变量）" % ", ".join(missing))
+
     return report.judge(
         "MU-REPLAY(unit)", "mutant 重放已入库并指名要重放的变异",
         ok, "\n".join(detail))
