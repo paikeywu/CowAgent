@@ -139,6 +139,35 @@ def _fm_expr(col: str) -> str:
     )
 
 
+def _fm_owner_expr(col: str) -> str:
+    """SQL expression: the owner token declared in the front-matter, or NULL.
+
+    Reads the value of the ``author_viewpoint:`` line inside the
+    front-matter block (``_fm_expr`` already refuses to guess when the
+    block is half-read), from after the key to the end of that line,
+    trimmed. A line that carries the key mid-sentence (an indented or
+    commented occurrence) is still found by ``instr`` — the value is
+    validated downstream as a token, not trusted blindly. When the key is
+    absent the expression returns NULL, never a wrong value: the safe
+    reading of "owner unknown" is "visible to nobody".
+
+    This is what lets the guard's CORRECTION path (a dark page written as
+    ``scope='shared'`` by the facade or the old desktop build) hand the
+    row back its owner instead of sealing it into invisibility (F-A1).
+    """
+    fm = _fm_expr(col)
+    key = "author_viewpoint:"
+    pos = f"instr({fm}, '{key}')"
+    after = f"substr({fm}, {pos} + {len(key)})"
+    nl = f"instr({after}, {_NL})"
+    return (
+        f"CASE WHEN {pos} > 0 "
+        f"THEN NULLIF(trim(substr({after}, 1, "
+        f"CASE WHEN {nl} > 0 THEN {nl} - 1 ELSE length({after}) END)), '') "
+        f"ELSE NULL END"
+    )
+
+
 def _path_has_segment(path_col: str, segment: str) -> str:
     """SQL expression: does ``path_col`` sit under a ``segment`` DIRECTORY?
 
@@ -223,6 +252,7 @@ def _build_trigger_sql() -> List[str]:
     sealed_by_guard = _guard_says("NEW.path", CLASS_SEALED)
     released_by_guard = _guard_says("NEW.path", CLASS_RELEASED)
     excluded_by_guard = _guard_says("NEW.path", CLASS_EXCLUDED)
+    fm_owner = _fm_owner_expr("NEW.text")
 
     # The trigger only fires on a row that is trying to be PUBLIC. A row
     # that already carries a non-public scope is none of its business.
@@ -245,12 +275,16 @@ def _build_trigger_sql() -> List[str]:
         "NEW.updated_at, 1, "
         f"CASE WHEN {released_by_text} OR {released_by_guard} THEN 1 ELSE 0 END, "
         # The owner token is taken from the guard table when the truth
-        # layer has recorded it. The front-matter fallback does NOT guess
-        # an owner: a dark page whose owner is unknown is invisible to
-        # everybody, and the next sync by this code fills the owner in.
+        # layer has recorded it. Otherwise, when the row seals ITSELF by
+        # its front-matter (the facade/old-desktop direct write, F-A1
+        # first path), the owner is derived from the front-matter's
+        # author_viewpoint — the page declares who owns it. Only when
+        # neither source knows the owner is it NULL: a dark page whose
+        # owner is unknown is invisible to everybody.
         f"CASE WHEN {sealed_by_guard} "
         f"THEN (SELECT g.owner_token FROM {GUARD_TABLE} g "
         f"      WHERE g.path = NEW.path AND g.class = '{CLASS_SEALED}') "
+        f"WHEN {sealed_by_text} THEN {fm_owner} "
         f"ELSE NULL END, "
         # P1-阶段一 (M2): carry the externalization columns through — a
         # corrected row must not come back with text_state=NULL.
@@ -261,10 +295,13 @@ def _build_trigger_sql() -> List[str]:
     # Self-registration: a dark page whose chunks are indexed BEFORE this
     # code ever synced it must still have every one of its chunks sealed,
     # and only the first chunk carries the front-matter. Recording the
-    # path here is what lets the trigger recognise the rest.
+    # path here is what lets the trigger recognise the rest — and the
+    # owner token is derived from the front-matter at registration time,
+    # so the later chunks (which carry no front-matter) are corrected
+    # with the SAME owner instead of NULL (F-A1 first path).
     register = (
         f"INSERT OR IGNORE INTO {GUARD_TABLE} (path, class, owner_token, updated_at) "
-        f"SELECT NEW.path, '{CLASS_SEALED}', NULL, datetime('now') "
+        f"SELECT NEW.path, '{CLASS_SEALED}', {fm_owner}, datetime('now') "
         f"WHERE {sealed_by_text};"
     )
     register_released = (
@@ -323,6 +360,7 @@ BEGIN
         sealed_owner = CASE WHEN {sealed_by_guard}
                             THEN (SELECT g.owner_token FROM {GUARD_TABLE} g
                                   WHERE g.path = NEW.path AND g.class = '{CLASS_SEALED}')
+                            WHEN {sealed_by_text} THEN {fm_owner}
                             ELSE NULL END
     WHERE id = NEW.id;
     SELECT RAISE(IGNORE);

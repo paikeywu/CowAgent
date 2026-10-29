@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.memory.storage import MemoryStorage
+from agent.memory.storage import MemoryChunk, MemoryStorage
 from agent.memory import index_guard, rebuilder
 from agent.memory.release_state import release_mismatches
 
@@ -162,6 +162,35 @@ def test_sealed_dark_page_owner_survives(tmp_path):
     assert row[2] is not None and "primus" in row[2], \
         f"F-A1: sealed_owner lost -> {row[2]!r}"
     st.close()
+
+
+def test_guard_correction_derives_owner_from_frontmatter(tmp_path):
+    """F-A1 第一路径反向用例：facade/旧桌面版以 scope='shared' 直写暗页。
+
+    守卫 BEFORE 触发器矫正它时，owner 不能只查 guard 表（自注册时
+    owner_token 恒 NULL），必须从 front-matter 的 author_viewpoint
+    派生 —— 否则矫正后 chunks.sealed_owner=NULL，主人格读不到自己的
+    暗页（P0-21）。
+    """
+    ws, md = _ws(tmp_path)
+    st = _storage(ws)
+    index_guard.ensure_guard(st.conn)
+    text = ("---\nid: s9\nvisibility: sealed\n"
+            "author_viewpoint: agent--primus\n---\n\nprivate thought\n")
+    st.save_chunk(MemoryChunk(
+        id="guard-path-c1", user_id=None, scope="shared", source="memory",
+        path="memory/markdown/letters/2026-10-01-secret--bbbbbbbb.md",
+        start_line=1, end_line=6, text=text, embedding=None,
+        hash=hashlib.sha256(text.encode("utf-8")).hexdigest()))
+    row = st.conn.execute(
+        "SELECT scope, file_sealed, sealed_owner FROM chunks WHERE id=?",
+        ("guard-path-c1",)).fetchone()
+    st.close()
+    assert row is not None
+    assert row[0] == "sealed", f"guard must correct shared dark page, got {row[0]}"
+    assert row[1] == 1, "file_sealed must be 1 after correction"
+    assert row[2] is not None and "primus" in row[2], \
+        f"F-A1 first path: sealed_owner lost -> {row[2]!r}"
 
 
 def test_files_row_carries_chunk_count_and_version(tmp_path):
