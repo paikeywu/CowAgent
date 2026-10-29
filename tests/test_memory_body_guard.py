@@ -154,6 +154,8 @@ def _state(db: Path) -> dict:
             "SELECT body_hash FROM chunks WHERE id='row1'").fetchone()[0],
         "body_origin": cur.execute(
             "SELECT body_origin FROM chunks WHERE id='row1'").fetchone()[0],
+        "text_state": cur.execute(
+            "SELECT text_state FROM chunks WHERE id='row1'").fetchone()[0],
     }
     try:
         out["fts_rows"] = cur.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
@@ -230,6 +232,41 @@ def test_legacy_delete_then_insert_does_not_erase_the_body_columns(tmp_path):
     assert st["body_anchor"] == "L1-2"
     assert st["body_hash"] == "sha256:abc"
     assert st["body_origin"] == "file"
+
+
+def test_the_backfill_does_not_downgrade_the_inspectors_mirror_verdict(tmp_path):
+    """P1-阶段三 第五轮: the migration must not undo the three-state machine.
+
+    The inspector is the DESIGNATED SETTER of 'mirror' (设计 §3.1): it
+    promotes a row only after rebuilding the fragment from the FILE and
+    finding it byte-equal.  The backfill has done no such verification —
+    it decided the POINTER, not the state — so writing 'projection' over
+    a 'mirror' row would undo the inspector's verdict.
+
+    Measured: a second backfill turned all 2663 rows from 'mirror' back
+    to 'projection'.
+    """
+    from agent.memory.migrate import Report, step_m4
+
+    db = _make_library(tmp_path)
+    storage = MemoryStorage(db_path=str(db))
+    try:
+        storage.conn.execute(
+            "UPDATE chunks SET text_state='mirror' WHERE id='row1'")
+        storage.conn.commit()
+        assert _state(db)["text_state"] == "mirror"
+    finally:
+        storage.close()
+
+    lib = {"name": "fixture", "db": db, "workspace": tmp_path}
+    step_m4([lib], Report())
+
+    conn = sqlite3.connect("file:" + str(db).replace("\\", "/") + "?mode=ro",
+                           uri=True)
+    got = conn.execute("SELECT text_state FROM chunks WHERE id='row1'").fetchone()[0]
+    conn.close()
+    assert got == "mirror", \
+        "the backfill downgraded the inspector's 'mirror' verdict to %r" % got
 
 
 def test_legacy_write_does_not_desync_fts(tmp_path):

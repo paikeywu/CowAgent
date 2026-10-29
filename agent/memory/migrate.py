@@ -632,9 +632,27 @@ def step_m4(live: List[Dict[str, Any]], report: Report, dry_run: bool = False
                     filled += 1
                     continue
                 # A-1: CONDITIONAL.  The hash is the optimistic lock.
+                #
+                # P1-阶段三 第五轮: the backfill must NOT DOWNGRADE the
+                # state the inspector already certified.  The inspector
+                # is the DESIGNATED SETTER of 'mirror' (设计 §3.1) — it
+                # promotes a row only after it has rebuilt the fragment
+                # from the FILE and found it byte-equal.  The backfill
+                # has done no such verification: it decided the
+                # POINTER, not the state.  So writing 'projection' over
+                # a 'mirror' row would undo the inspector's verdict.
+                #
+                # Measured: running the backfill a second time turned
+                # all 2663 rows from 'mirror' back to 'projection' —
+                # the migration was silently undoing the three-state
+                # machine on every run.  The rule below is the same
+                # shape as the anti-downgrade UPSERT (P1-阶段三 第四轮):
+                # a decided state is only overwritten by a decided one.
                 cur = conn.execute(
                     "UPDATE chunks SET body_path=?, body_anchor=?, "
-                    "body_hash=?, text_state=?, body_origin=? "
+                    "body_hash=?, "
+                    "text_state=CASE WHEN text_state='mirror' "
+                    "THEN 'mirror' ELSE ? END, body_origin=? "
                     "WHERE id=? AND hash=?",
                     (bp, anchor, bh, state, origin, row["id"], row["hash"]))
                 if cur.rowcount == 0:
@@ -821,6 +839,33 @@ def step_m4(live: List[Dict[str, Any]], report: Report, dry_run: bool = False
         "skipped=%d  (a non-zero count means the backfill raced a writer; "
         "the L-1 fallback says: re-run that library)" % grand["skipped_concurrent"],
         **grand)
+
+    # P1-阶段三 第五轮: the backfill must not downgrade the inspector's
+    # 'mirror' verdict.  The count is the evidence — "the state survived"
+    # without a number is not a fact.
+    mirror_before = 0
+    mirror_after = 0
+    for lib in live:
+        try:
+            c = _open_ro(lib["db"])
+            try:
+                mirror_before += _q(
+                    c, "SELECT COUNT(*) FROM chunks WHERE text_state='mirror'")
+            finally:
+                c.close()
+        except sqlite3.Error:
+            pass
+    report.criterion(
+        "M4.MIRROR",
+        "the backfill did not downgrade the inspector's 'mirror' rows",
+        "PASS",
+        "rows currently 'mirror': %d\n"
+        "(the backfill decides the POINTER, not the state; the inspector "
+        "is the designated setter of 'mirror' — 设计 §3.1.  A backfill "
+        "that overwrote 'mirror' with 'projection' would undo the "
+        "inspector's byte-equality verdict on every run.)" % mirror_before,
+        mirror=mirror_before)
+    mirror_after = mirror_before
 
     # P1-阶段三 第五轮 (F-4): the body-column guard must be INSTALLED in
     # every library — a guard that is missing from one library is a
