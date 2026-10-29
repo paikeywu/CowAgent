@@ -71,13 +71,19 @@ def test_row_to_chunk_round_trips_the_four_columns(tmp_path):
 # --- T2 · D-A：单一真源 + 旧库原地迁移 -------------------------------------
 
 def _legacy_db(path: Path):
-    """一个**没有**任何 projection/externalization 列的旧 schema 库。"""
+    """一个 P0-14 时代的旧 schema 库（含 sealed_owner，无四个外置列）。
+
+    它**已有** hit/release 三列，只缺 D-C 外置四列 —— 这正是阶段一要
+    原地迁移的真实旧库形态（P0-14 之后的库）。
+    """
     conn = sqlite3.connect(str(path))
     conn.execute(
         "CREATE TABLE chunks (id TEXT PRIMARY KEY, user_id TEXT, scope TEXT, "
         "source TEXT, path TEXT, start_line INTEGER, end_line INTEGER, text TEXT, "
         "embedding TEXT, hash TEXT, metadata TEXT, created_at INTEGER, "
-        "updated_at INTEGER, hit_count INTEGER NOT NULL DEFAULT 0, last_hit_at INTEGER)")
+        "updated_at INTEGER, hit_count INTEGER NOT NULL DEFAULT 0, last_hit_at INTEGER, "
+        "element_released INTEGER NOT NULL DEFAULT 0, file_sealed INTEGER NOT NULL DEFAULT 0, "
+        "sealed_owner TEXT)")
     conn.commit()
     conn.close()
 
@@ -143,6 +149,23 @@ def test_two_differently_migrated_dbs_share_a_fingerprint(tmp_path):
     MemoryStorage(db_path=a).close()
     MemoryStorage(db_path=b).close()
     assert schema_drift.schema_fingerprint(a) == schema_drift.schema_fingerprint(b)
+
+
+def test_fresh_and_migrated_index_share_a_fingerprint(tmp_path):
+    """F-1 反向用例：全新库与迁移库的指纹必须一致。
+
+    全新库一次 CREATE 出全部列；迁移库靠 ALTER 把新列追加到表尾。列集合
+    相同、物理列序不同 —— 指纹若按表内列序哈希，两者永不一致，fleet 里
+    将来出现新工作区时 M0 会假红（风控 F-1 实测 f41fdf12 != caf5e91b）。
+    指纹必须按列名排序、对列序不敏感。
+    """
+    fresh = tmp_path / "fresh.db"
+    MemoryStorage(db_path=fresh).close()
+    old = tmp_path / "old.db"
+    _legacy_db(old)
+    MemoryStorage(db_path=old).close()   # ALTER 追加到表尾
+    assert schema_drift.schema_fingerprint(fresh) == \
+        schema_drift.schema_fingerprint(old)
 
 
 # --- T5 · M2：守卫矫正行透传四列 ---------------------------------------------

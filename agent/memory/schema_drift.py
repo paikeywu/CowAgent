@@ -216,7 +216,14 @@ def schema_fingerprint(db_path: Union[str, Path]) -> Optional[str]:
         conn.close()
     if not rows:
         return None
-    # cid, name, type, notnull, dflt, pk — the shape that decides whether
-    # a query can run, in the order the table defines it.
-    material = "|".join(":".join(str(p) for p in row) for row in rows)
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+    # The fingerprint must describe the column SET, not the order it was
+    # physically laid down nor the constraints each build happened to
+    # declare. A fresh database CREATES every column in one statement; a
+    # migrated one gains the newer columns by ALTER TABLE, which APPENDS
+    # them to the end — same set, different order — and an older build may
+    # not have declared NOT NULL / defaults the current build does (F-1:
+    # fresh vs migrated could never agree). The gate cares about ONE
+    # question — "can these queries run" — which the column NAMES answer.
+    # So the fingerprint is the sorted set of names.
+    names = sorted(str(row[1]) for row in rows)
+    return hashlib.sha256("|".join(names).encode("utf-8")).hexdigest()

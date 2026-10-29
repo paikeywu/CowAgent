@@ -598,6 +598,8 @@ class MemoryStorage:
                 updated_at INTEGER DEFAULT (strftime('%s', 'now')),
                 hit_count INTEGER NOT NULL DEFAULT 0,
                 last_hit_at INTEGER,
+                element_released INTEGER NOT NULL DEFAULT 0,
+                file_sealed INTEGER NOT NULL DEFAULT 0,
                 sealed_owner TEXT,
                 body_path TEXT,
                 body_anchor TEXT,
@@ -660,25 +662,6 @@ class MemoryStorage:
             )
         """)
 
-        # P1-阶段一 (M1): persist the schema fingerprint. The gate that
-        # decides whether this index may serve reads one comparable token
-        # from ``_meta`` instead of re-deriving the column set; the writer
-        # and the reader compare tokens, and a mismatch is what a
-        # NOTRUN / refuse-to-serve decision keys on.
-        try:
-            from agent.memory.schema_drift import schema_fingerprint
-            fp = schema_fingerprint(self.db_path)
-            if fp:
-                self.conn.execute(
-                    "INSERT OR REPLACE INTO _meta(key, value) "
-                    "VALUES('schema_fingerprint', ?)",
-                    (fp,),
-                )
-        except Exception:
-            # A fingerprint that cannot be written must not block startup;
-            # the reader treats a missing token as "unknown", not "wrong".
-            pass
-
         repair_pending = False
         # Create FTS5 virtual table + triggers (only if supported).
         # If the previous process crashed mid-rebuild and left triggers
@@ -740,6 +723,33 @@ class MemoryStorage:
         """)
 
         self.conn.commit()
+
+        # P1-阶段一 (M1): persist the schema fingerprint AFTER the schema is
+        # committed, so the token describes a schema that actually landed
+        # rather than one still in a transaction (F-5). The gate that decides
+        # whether this index may serve reads one comparable token from
+        # ``_meta``; the writer and reader compare tokens, and a mismatch is
+        # what a NOTRUN / refuse-to-serve decision keys on.
+        try:
+            from agent.memory.schema_drift import schema_fingerprint
+            fp = schema_fingerprint(self.db_path)
+            if fp:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO _meta(key, value) "
+                    "VALUES('schema_fingerprint', ?)",
+                    (fp,),
+                )
+                self.conn.commit()
+        except Exception as e:
+            # A fingerprint that cannot be written must not block startup —
+            # the reader treats a missing token as "unknown", not "wrong" —
+            # but it is recorded, not silent (F-2).
+            from common.log import logger
+            logger.debug(
+                f"[MemoryStorage] schema fingerprint not written to "
+                f"{self.db_path}: {e}"
+            )
+
         self._schedule_maintenance(repair_pending)
 
     def _disable_trigram_index(self):
