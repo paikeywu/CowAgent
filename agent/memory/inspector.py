@@ -260,6 +260,8 @@ class Inspector:
         self._check_read_degraded(report)
         self._check_schema_drift(report)
         self._check_public_rows(report)
+        # P1 阶段二-B T5: INV 第 9 检查组（03 号 §八的 chunks 落地版 6 条）。
+        report["text_inv"] = self._check_text_externalization(report)
         # P0-22: the sweep over EVERY index of the family. The checks above
         # look at THIS workspace; the sweep looks at every index that
         # exists — including the ones nobody has addressed in a session,
@@ -829,6 +831,51 @@ class Inspector:
                 _SEV_HIGH, code=CODE_INDEX_PUBLIC,
                 chunk_count=n, scope=scope, user_id=user_id,
                 guard_class=klass)
+
+    # -- check 9: text-externalization invariants (P1 阶段二-B T5) -------------
+
+    def _check_text_externalization(self, report: Dict[str, Any]
+                                    ) -> Dict[str, Any]:
+        """INV 第 9 检查组：03 号 §八 INV-1/2/3/6/9/11 的 chunks 落地版。
+
+        These run over the chunks table + filesystem (NOT a copy of 03 号's
+        SQL, which targets the P2 element-system tables that do not exist
+        yet). INV-4/5/7/8 are deferred and registered in the report with
+        their trigger condition. REPORT-ONLY, like every other check — each
+        INV carries its own verdict + fingerprint, and each violation is also
+        surfaced into report["violations"] so the CLI exit code and the audit
+        trail turn red.
+        """
+        db = self._index_db_path()
+        if not db.is_file():
+            return {"scope": "03 号 INV chunks 落地版", "verdict": "NOTRUN",
+                    "fingerprint": "index-missing", "checks": {},
+                    "violations": [], "violation_count": 0,
+                    "deferred": {}}
+        try:
+            conn = sqlite3.connect(
+                "file:" + str(db).replace("\\", "/") + "?mode=ro", uri=True)
+        except sqlite3.Error as e:
+            self._violation(report, REASON_INDEX_ORPHAN,
+                            db.relative_to(self.workspace_root).as_posix(),
+                            f"cannot open index for INV checks: {e}",
+                            _SEV_MID, code=CODE_INDEX_ORPHAN)
+            return {"scope": "03 号 INV chunks 落地版", "verdict": "NOTRUN",
+                    "fingerprint": f"open-error:{e}", "checks": {},
+                    "violations": [], "violation_count": 0, "deferred": {}}
+        try:
+            from agent.memory import text_inv
+            result = text_inv.run_text_invariants(conn, self.workspace_root)
+        finally:
+            conn.close()
+        for v in result["violations"]:
+            self._violation(report, v["reason"], v["path"], v["detail"],
+                            v.get("severity", _SEV_HIGH),
+                            code=v.get("code"),
+                            **{k: val for k, val in v.items()
+                               if k not in ("reason", "code", "path",
+                                            "detail", "severity")})
+        return result
 
     # -- check 6: the release projection's health (P0-13 L-3) -----------------
 
