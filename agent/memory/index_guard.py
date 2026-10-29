@@ -122,6 +122,12 @@ def _excluded_segments() -> Tuple[str, ...]:
 
 _NL = "char(10)"
 
+#: The owner-token namespace prefix. Sourced from the ONE definition
+#: (visibility.AGENT_OWNER_PREFIX) — C-4: the guard must write the SAME
+#: canonical token the read path matches, or the owner cannot read its own
+#: dark page (P0-21).
+from agent.memory.visibility import AGENT_OWNER_PREFIX as _OWNER_PREFIX
+
 
 def _fm_expr(col: str) -> str:
     """SQL expression: the front-matter block of ``col``, or '' when absent.
@@ -154,17 +160,33 @@ def _fm_owner_expr(col: str) -> str:
     This is what lets the guard's CORRECTION path (a dark page written as
     ``scope='shared'`` by the facade or the old desktop build) hand the
     row back its owner instead of sealing it into invisibility (F-A1).
+
+    C-4 (P1): the value is **NORMALIZED to the canonical owner token**
+    ``agent--<id>`` here — at the PRODUCTION end, not at the read end.
+    The front-matter carries the bare viewpoint id (``primus``), but the
+    read path matches ``agent--primus``; writing the bare id made the
+    owner unable to read its own dark page (P0-21 violation). An id that
+    already carries the prefix is not prefixed twice. The prefix literal
+    must stay in sync with ``visibility.AGENT_OWNER_PREFIX`` — asserted
+    by a test that compares the two constants.
     """
     fm = _fm_expr(col)
     key = "author_viewpoint:"
     pos = f"instr({fm}, '{key}')"
     after = f"substr({fm}, {pos} + {len(key)})"
     nl = f"instr({after}, {_NL})"
-    return (
+    raw = (
         f"CASE WHEN {pos} > 0 "
         f"THEN NULLIF(trim(substr({after}, 1, "
         f"CASE WHEN {nl} > 0 THEN {nl} - 1 ELSE length({after}) END)), '') "
         f"ELSE NULL END"
+    )
+    # Canonical form: 'agent--' || raw, unless raw already starts with it.
+    return (
+        f"CASE WHEN {raw} IS NULL THEN NULL "
+        f"WHEN substr({raw}, 1, {len(_OWNER_PREFIX)}) = '{_OWNER_PREFIX}' "
+        f"THEN {raw} "
+        f"ELSE '{_OWNER_PREFIX}' || {raw} END"
     )
 
 

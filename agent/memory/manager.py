@@ -6,6 +6,7 @@ Provides high-level interface for memory operations
 
 import json
 import os
+import time
 from typing import FrozenSet, List, Optional, Dict, Any, Sequence, Tuple
 from pathlib import Path
 import hashlib
@@ -713,6 +714,15 @@ class MemoryManager:
         serving. Returns the fresh body text when ok=True.
         """
         norm = relpath.replace("\\", "/").lstrip("/")
+        # C-6 (path escape): the path rule is SHARED with INV-11
+        # (agent.memory.paths) — one rule, two callers. Fail-CLOSED: an
+        # unjudgeable path is refused, never served.
+        from agent.memory.paths import safe_join
+        real, why = safe_join(self.config.get_workspace(), norm)
+        if real is None:
+            return {"ok": False, "path": norm,
+                    "reason": f"unsafe path: {why} — refusing to serve "
+                              f"content outside the workspace"}
         indexed = self._files_mtime_map({norm}).get(norm)
         if self._freshness is None:
             return {"ok": False, "path": norm,
@@ -721,7 +731,6 @@ class MemoryManager:
             return {"ok": False, "path": norm, "stale": True,
                     "reason": "content is stale (index behind truth file); "
                               "refusing to serve old content as fact"}
-        real = self.config.get_workspace() / norm
         try:
             body = real.read_text(encoding="utf-8")
         except OSError as e:
@@ -835,7 +844,15 @@ class MemoryManager:
             path=path,
             source=source,
             file_hash=file_hash,
-            mtime=int(os.path.getmtime(__file__)),  # Use current time
+            # C-5: this used to be ``int(os.path.getmtime(__file__))`` — the
+            # mtime of manager.py ITSELF, with a comment claiming "current
+            # time". That is a CONSTANT (frozen at deploy time), so the
+            # recorded mtime never tracked the content: the freshness probe
+            # compared a content that changed against a timestamp that
+            # could not — a permanent verdict, in either direction. Same
+            # class of bug as C-3. Now it is the actual write moment, in
+            # whole seconds — the same precision the other writers use.
+            mtime=int(time.time()),
             size=len(content)
         )
     

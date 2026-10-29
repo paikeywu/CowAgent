@@ -25,7 +25,20 @@ from typing import Any, Dict, List, Optional
 _CST = timezone(timedelta(hours=8))
 
 #: 变更来源（谁触发的）。facade 写入 / 人类编辑导入 / 重建器重建。
-SOURCES = frozenset({"facade-write", "import-human-edit", "rebuilder"})
+#:
+#: C-2: the set had only three members, and the FOURTH path — the regular
+#: facade entries (``write_event`` / ``write_letter`` / ``write_entity`` /
+#: ``revise``) and the release machinery — wrote no events at all. A missing
+#: source is not a missing log line: it is the shelf-lag invariant sitting
+#: at NOTRUN (silently green) while the truth layer moved.
+SOURCES = frozenset({
+    "facade-write",
+    "import-human-edit",
+    "rebuilder",
+    # C-2: the element/release paths.
+    "facade-element",
+    "facade-release",
+})
 
 
 def _now() -> str:

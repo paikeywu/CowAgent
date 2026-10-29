@@ -1002,6 +1002,13 @@ class WriteFacade:
         real.parent.mkdir(parents=True, exist_ok=True)
         real.write_text(self._render(fm, body), encoding="utf-8", newline="\n")
         self._audit("new_element", rel, "ok", f"id={fm['id']}")
+        # C-2: EVERY path that produces a truth-layer file records one change
+        # event in the single log. This is the choke point all four public
+        # entries (write_event/write_letter/write_entity/revise) and the
+        # release machinery funnel through — the regular entries were the
+        # ones going unrecorded, so the shelf-lag invariant stayed NOTRUN
+        # (silently green) while the truth layer moved.
+        changes.record_change(self.workspace_root, rel, "facade-element")
         return real, fm
 
     def write_event(self, slug: str, title: str, body: str,
@@ -1318,6 +1325,34 @@ class WriteFacade:
                         f"hash8 {birth_hash8!r} — the filename hash8 is a birth "
                         f"fingerprint (E3) and must never move with an edit")
 
+            # (1b) C-1: EVERY immutable field, not just the filename hash8.
+            # The definition of "immutable" is ``IMMUTABLE_FM_FIELDS`` (the
+            # one list the facade enforces on every write) — so the edit
+            # channel enforces the SAME list, field by field, against the
+            # pristine front-matter rebuilt from the index projection.
+            # Without this, `id` / `occurred_at` / `author_viewpoint` could be
+            # tampered with and the edit would import as legal.
+            if storage is not None:
+                old_fm = self._old_fm_from_projection(storage, relpath)
+                if old_fm:
+                    tampered = []
+                    for key in sorted(IMMUTABLE_FM_FIELDS):
+                        if key not in old_fm:
+                            continue  # the field did not exist at birth
+                        old_val = old_fm.get(key)
+                        new_val = new_fm.get(key)
+                        if old_val is None:
+                            continue
+                        if str(old_val) != str(new_val):
+                            tampered.append(
+                                f"{key}: {old_val!r} -> {new_val!r}")
+                    if tampered:
+                        raise FrontmatterTamperError(
+                            f"{relpath!r}: immutable front-matter field(s) "
+                            f"changed — {', '.join(tampered)}. Immutable "
+                            f"fields are birth facts (WR-09) and cannot move "
+                            f"with an edit.")
+
             # (2) Append-only correction (金缮): the human edited the file in
             # place, so the OLD body can only come from the INDEX projection.
             # When a storage handle is given, we rebuild the old body from the
@@ -1381,6 +1416,30 @@ class WriteFacade:
         whole = "".join(r[1] or "" for r in rows)
         _fm, body = split_frontmatter(whole)
         return body
+
+    @staticmethod
+    def _old_fm_from_projection(storage: Any,
+                                relpath: str) -> Optional[Dict[str, Any]]:
+        """Rebuild the OLD front-matter from the index projection.
+
+        The same reassembly as :meth:`_old_body_from_projection`, but keeps
+        the front-matter block instead of the body. Returns None when the
+        path has no projection yet (a brand-new file) — then there is
+        nothing to compare against, and the caller decides what that
+        means.
+        """
+        norm = relpath.replace("\\", "/").lstrip("/")
+        try:
+            rows = storage.conn.execute(
+                "SELECT start_line, text FROM chunks WHERE path=? "
+                "ORDER BY start_line ASC, id ASC", (norm,)).fetchall()
+        except Exception:
+            return None
+        if not rows:
+            return None
+        whole = "".join(r[1] or "" for r in rows)
+        fm, _body = split_frontmatter(whole)
+        return fm or None
 
     # -- release (WR-17..21, P0-3 §四) ----------------------------------------
 
@@ -1592,6 +1651,14 @@ class WriteFacade:
                 f"---\n\n墓碑：原档案已释放。本文件永久保留、不可被释放。\n",
                 encoding="utf-8", newline="\n")
             created.append(tomb)
+            # C-2: the tombstone is a truth-layer file too — the release
+            # machinery produced FOUR files (release request, released
+            # version, tombstone, ...); recording only some of them left
+            # the shelf-lag invariant NOTRUN while the truth layer moved.
+            changes.record_change(
+                self.workspace_root,
+                str(tomb.relative_to(self.workspace_root)).replace("\\", "/"),
+                "facade-release")
         except Exception:
             for c in created:  # WR-21: all three or nothing
                 try:

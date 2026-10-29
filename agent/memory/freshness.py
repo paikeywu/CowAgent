@@ -46,8 +46,18 @@ class FreshnessProbe:
         self.checked_count = 0
         self.cache_hits = 0
 
-    def _real_mtime(self, relpath: str) -> Optional[float]:
-        """The truth file's current mtime, cached. None when unreadable."""
+    def _real_mtime(self, relpath: str) -> Optional[int]:
+        """The truth file's current mtime, cached. None when unreadable.
+
+        C-3: the value is TRUNCATED to whole seconds — the same precision
+        the index stores. ``files.mtime`` is an INTEGER column written as
+        ``int(stat.st_mtime)``, so comparing it against a float
+        ``st_mtime`` made every freshly rebuilt file look stale (the float
+        is always >= the truncated int, and the comparison was strict
+        ``>``). That constant false red drowned the real ones — and masked
+        other defects behind it. Same precision on both sides = the
+        comparison means what it says.
+        """
         now = self._clock()
         cached = self._cache.get(relpath)
         if cached is not None and (now - cached[0]) < self.ttl:
@@ -55,7 +65,7 @@ class FreshnessProbe:
             return cached[1]
         real = self.workspace_root / relpath.replace("\\", "/")
         try:
-            mtime = self._statter(real)
+            mtime = int(self._statter(real))
         except OSError:
             mtime = None
         self._cache[relpath] = (now, mtime)
@@ -71,7 +81,9 @@ class FreshnessProbe:
         """
         self.checked_count += 1
         real = self._real_mtime(relpath)
-        stale = real is None or indexed_mtime is None or real > indexed_mtime
+        # C-3: both sides in whole seconds (the index column is INTEGER).
+        indexed = int(indexed_mtime) if indexed_mtime is not None else None
+        stale = real is None or indexed is None or real > indexed
         if stale:
             self.stale_count += 1
         return stale

@@ -30,6 +30,7 @@ from agent.memory.naming import canonical_text
 # SAME record, never their own (SEED 裁决: no write-time rebuild, the P0
 # batch-rebuild contract stands).
 from agent.memory import changes as _changes
+from agent.memory import paths as _paths
 
 _CST = timezone(timedelta(hours=8))
 
@@ -336,25 +337,13 @@ def check_inv11(conn: sqlite3.Connection, root: Path) -> Dict[str, Any]:
         return {"inv": "INV-11", "verdict": "NOTRUN",
                 "fingerprint": "body_paths=0", "violations": []}
     fp = f"body_paths={len(rows)}"
-    root_res = root.resolve()
     for (bpath,) in rows:
         if not bpath:
             continue
-        bad = None
-        if "\\" in bpath:
-            bad = "contains a backslash"
-        elif bpath.startswith("/") or (len(bpath) > 1 and bpath[1] == ":"):
-            bad = "absolute path"
-        elif ".." in bpath.split("/"):
-            bad = "contains a '..' segment"
-        if bad is None:
-            try:
-                real = (root / bpath).resolve()
-                import os as _os
-                if _os.path.commonpath([str(root_res), str(real)]) != str(root_res):
-                    bad = "resolves outside the workspace root"
-            except (OSError, ValueError):
-                bad = "cannot be resolved within the root"
+        # C-6: the path rule lives in ONE place (agent.memory.paths) and is
+        # shared with the content endpoint (manager.read_content_fresh). A
+        # second copy of the rules is how the two drift apart.
+        bad = _paths.path_escape_reason(bpath, root)
         if bad:
             out.append(_v(REASON_INV11, CODE_INV11, bpath,
                           f"unsafe body_path: {bad}", "high"))
