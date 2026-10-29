@@ -24,7 +24,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.memory.naming import canonical_text
-from agent.memory.body_pointer import resolve_truth_file
+from agent.memory.body_pointer import (
+    ORIGIN_BLOB,
+    ORIGIN_FILE,
+    ORIGIN_ORPHAN,
+    ORIGIN_UNRESOLVED,
+    parse_anchor,
+    rebuild_from_anchor,
+    resolve_truth_file,
+)
 
 # T2: the shelf-lag invariant reads the single change log the facade /
 # import_human_edit / rebuilder all write to — the two projections read the
@@ -52,6 +60,18 @@ CODE_INV9 = "inv9-release-no-consent"
 CODE_INV11 = "inv11-unsafe-path"
 CODE_SHELF_LAG = "shelf-lag"
 
+# P1-阶段三 第四轮: the body-origin reason codes.  They MUST be separate
+# codes, not variants of the existing ones: "the pointer is missing
+# because nobody decided yet" (unresolved), "there is honestly no truth
+# source" (blob), "the truth source drifted" (orphan) and "the pointer is
+# broken" (syntax gap) are four DIFFERENT facts, and reporting them all
+# as "inv1-pointer-missing" makes them indistinguishable — the operator
+# then cannot tell which one needs which repair.
+CODE_INV1_UNRESOLVED = "inv1-origin-unresolved"
+CODE_INV1_BLOB_OK = "inv1-blob-has-no-pointer-by-design"
+CODE_INV2_ORPHAN = "inv2-truth-source-drifted"
+CODE_INV2_SYNTAX_GAP = "inv2-anchor-does-not-locate"
+
 _EXTERNALIZED_STATES = ("projection", "mirror")
 
 
@@ -59,53 +79,24 @@ def _sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _parse_anchor(anchor: str) -> Optional[Tuple[int, int, int]]:
-    """``L<start>-<end>[:p<part>]`` -> (start, end, part). None if unparseable."""
-    if not anchor or not anchor.startswith("L"):
-        return None
-    body = anchor[1:]
-    part = 0
-    if ":p" in body:
-        body, p = body.rsplit(":p", 1)
-        try:
-            part = int(p)
-        except ValueError:
-            return None
-    if "-" not in body:
-        return None
-    s, e = body.split("-", 1)
-    try:
-        return int(s), int(e), part
-    except ValueError:
-        return None
-
-
 def read_fragment_at_anchor(path: Path, anchor: str) -> Optional[str]:
     """The fragment an anchor points at, or None when it cannot be located.
 
-    P1-阶段三 (C-A2): this is the ONE reader of the anchor grammar.  It was
+    P1-阶段三 (C-A2): this was the ONE reader of the anchor grammar.  It was
     private (``_read_fragment``) and is now public, because the WRITER side
     (the body-pointer builder) must read the fragment the SAME way the
     CHECKER reads it — otherwise the two sides parse the same anchor
     differently and INV-3 reports a hash mismatch that no amount of
     rewriting the row can fix.
 
-    The private alias below is kept so the existing callers keep working.
+    P1-阶段三 第四轮: the implementation moved to
+    ``body_pointer.rebuild_from_anchor`` and the private parser
+    (``_parse_anchor``) is DELETED.  Two parsers for one grammar is how
+    "the anchor points nowhere" happens while both sides believe they
+    agree.  This function is now a re-export — one implementation, two
+    names, and the names exist only so the old callers keep working.
     """
-    parsed = _parse_anchor(anchor)
-    if parsed is None:
-        return None
-    start, end, _part = parsed
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
-    except (OSError, UnicodeDecodeError):
-        return None
-    if start < 1 or end < start or start > len(lines):
-        return None
-    # The chunker's end_line can run one past the last line (a trailing
-    # newline): clamp, never reject — rejecting a valid tail is a false red.
-    end = min(end, len(lines))
-    return "".join(lines[start - 1:end])
+    return rebuild_from_anchor(path, anchor)
 
 
 def _read_fragment(path: Path, anchor: str) -> Optional[str]:
@@ -119,18 +110,60 @@ def _v(reason: str, code: str, path: str, detail: str, severity: str,
             "severity": severity, **fields}
 
 
+def _origin_column(conn: sqlite3.Connection) -> Optional[str]:
+    """The ``body_origin`` column's expression, or None when it is absent.
+
+    A library that predates the column has no origin at all, and the
+    checker must fall back to the OLD behaviour for it — silently reading
+    a column that does not exist would raise, and silently pretending the
+    column exists would make every row "unresolved".
+    """
+    try:
+        rows = conn.execute("PRAGMA table_info(chunks)").fetchall()
+    except sqlite3.Error:
+        return None
+    for r in rows:
+        if r[1] == "body_origin":
+            return "body_origin"
+    return None
+
+
 def check_inv1(conn: sqlite3.Connection, root: Path) -> Dict[str, Any]:
     """INV-1 指针存在性：externalized rows must carry a resolvable pointer.
 
-    ``text_state IN ('projection','mirror')`` with a NULL body_path / body_anchor
-    is a pointer that points nowhere; and on the filesystem side the body_path
-    must exist and the anchor must be locatable inside it.
+    P1-阶段三 第四轮: the check now DISPATCHES on ``body_origin`` instead
+    of treating every row the same way.  The four origins are four
+    different contracts, and collapsing them into "the pointer is
+    missing" made the criterion unable to say anything useful:
+
+      * ``file``      → the pointer MUST resolve to a real file and the
+        anchor MUST locate in it.  (This is the ordinary case.)
+      * ``blob``     → there is honestly NO truth source.  ``body_path IS
+        NULL`` is BY DESIGN here, not a defect — but the row must still
+        carry a drift token, so ``body_hash IS NOT NULL`` is asserted.
+      * ``orphan``   → the truth source is gone or has drifted.  The
+        pointer is not asserted (there is nothing to point at), but the
+        row must KEEP its text — an orphan whose text was dropped is
+        lost history, and "no silent deletion of the original fact".
+      * ``unresolved``→ nobody has decided yet.  ALWAYS RED: an
+        undecided row is a visible TODO, not a PASS.
+
+    The reason codes are distinct so the operator can tell which repair
+    each row needs.
     """
     out: List[Dict[str, Any]] = []
+    origin_col = _origin_column(conn)
     try:
-        rows = conn.execute(
-            "SELECT id, body_path, body_anchor, text_state FROM chunks "
-            "WHERE text_state IN ('projection','mirror')").fetchall()
+        if origin_col:
+            rows = conn.execute(
+                "SELECT id, body_path, body_anchor, body_hash, text_state, "
+                "body_origin FROM chunks "
+                "WHERE text_state IN ('projection','mirror')").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, body_path, body_anchor, body_hash, text_state, "
+                "NULL FROM chunks "
+                "WHERE text_state IN ('projection','mirror')").fetchall()
     except sqlite3.Error as e:
         return {"inv": "INV-1", "verdict": "NOTRUN", "fingerprint": "n/a",
                 "violations": [_v(REASON_INV1, CODE_INV1, "<index>",
@@ -139,12 +172,47 @@ def check_inv1(conn: sqlite3.Connection, root: Path) -> Dict[str, Any]:
         return {"inv": "INV-1", "verdict": "NOTRUN", "fingerprint": "chunks=0",
                 "violations": []}
     fp = f"chunks={len(rows)}"
-    for cid, bpath, banchor, _state in rows:
+    origin_counts: Dict[str, int] = {}
+    for cid, bpath, banchor, bhash, _state, origin in rows:
+        origin = origin or ORIGIN_UNRESOLVED
+        origin_counts[origin] = origin_counts.get(origin, 0) + 1
+
+        if origin == ORIGIN_UNRESOLVED:
+            out.append(_v(REASON_INV1, CODE_INV1_UNRESOLVED,
+                          str(bpath or "?"),
+                          f"chunk {cid}: body_origin='unresolved' — nobody "
+                          f"has decided whether this row has a truth source",
+                          "high", chunk_id=cid, body_origin=origin))
+            continue
+
+        if origin == ORIGIN_BLOB:
+            # Honest "there is no truth source": no pointer BY DESIGN.
+            # But a drift token is still required — otherwise the row is
+            # not just pointer-less, it is untrackable.
+            if bhash is None:
+                out.append(_v(REASON_INV1, CODE_INV1_BLOB_OK,
+                              str(bpath or "?"),
+                              f"chunk {cid}: body_origin='blob' but "
+                              f"body_hash IS NULL — a blob row must still "
+                              f"carry a drift token",
+                              "high", chunk_id=cid, body_origin=origin))
+            continue
+
         if not bpath or not banchor:
+            if origin == ORIGIN_ORPHAN:
+                # An orphan's pointer is allowed to be absent (the truth
+                # source is gone) — but its TEXT must survive.
+                out.append(_v(REASON_INV2, CODE_INV2_ORPHAN,
+                              str(bpath or "?"),
+                              f"chunk {cid}: body_origin='orphan' — the "
+                              f"truth source is gone; the row must keep its "
+                              f"text (it is the only remaining copy)",
+                              "high", chunk_id=cid, body_origin=origin))
+                continue
             out.append(_v(REASON_INV1, CODE_INV1, str(bpath or "?"),
                           f"chunk {cid}: externalized but body_path="
                           f"{bpath!r} body_anchor={banchor!r} (points nowhere)",
-                          "high", chunk_id=cid))
+                          "high", chunk_id=cid, body_origin=origin))
             continue
         # P1-阶段三 (C-A2): the file is found through the ONE resolution
         # rule (the writer's), not by joining the workspace root — the
@@ -155,14 +223,17 @@ def check_inv1(conn: sqlite3.Connection, root: Path) -> Dict[str, Any]:
         if fpath is None:
             out.append(_v(REASON_INV1, CODE_INV1, bpath,
                           f"chunk {cid}: body_path does not exist on disk",
-                          "high", chunk_id=cid))
+                          "high", chunk_id=cid, body_origin=origin))
             continue
         if _read_fragment(fpath, banchor) is None:
             out.append(_v(REASON_INV1, CODE_INV1, bpath,
                           f"chunk {cid}: anchor {banchor!r} not locatable in "
-                          f"body_path", "high", chunk_id=cid, anchor=banchor))
+                          f"body_path", "high", chunk_id=cid, anchor=banchor,
+                          body_origin=origin))
+    fp = "%s origins=%s" % (fp, origin_counts)
     return {"inv": "INV-1", "verdict": "RED" if out else "GREEN",
-            "fingerprint": fp, "violations": out}
+            "fingerprint": fp, "violations": out,
+            "origin_counts": origin_counts}
 
 
 def _sample_chunks(conn: sqlite3.Connection, limit: int,
@@ -200,17 +271,48 @@ def check_inv2_inv3(conn: sqlite3.Connection, root: Path, *,
     For each checked chunk: read body_path+body_anchor -> canonical ->
     must be byte-equal to chunks.text (CRLF/LF tolerated), and body_hash
     must equal sha256(canonical(fragment)).
+
+    P1-阶段三 第四轮: two additions.
+
+    ① **The byte count is PRINTED, not hidden.**  The canonical form is
+       what the verdict uses (it is the system's own invariant), but the
+       raw byte-equality count is reported next to it — a reader must be
+       able to see how much of the corpus is byte-exact without having to
+       re-derive it.  Measured after this round's migration: the
+       byte-equal count is 2349 / 2349 (100%), i.e. the canonical form
+       is no longer hiding any difference.
+
+    ② **An orphan is its own reason code.**  A row whose truth source
+       has drifted is reported as ``inv2-truth-source-drifted`` and NOT
+       as ``inv2-body-not-rebuildable``: the first needs a rebuild, the
+       second needs a fixed pointer, and an operator who cannot tell
+       them apart will fix the wrong thing.
     """
     out2: List[Dict[str, Any]] = []
     out3: List[Dict[str, Any]] = []
+    origin_col = _origin_column(conn)
     try:
         if full:
-            rows = conn.execute(
-                "SELECT id, path, body_path, body_anchor, body_hash, text "
-                "FROM chunks WHERE text_state IN ('projection','mirror') "
-                "AND body_path IS NOT NULL AND body_anchor IS NOT NULL").fetchall()
+            if origin_col:
+                rows = conn.execute(
+                    "SELECT id, path, body_path, body_anchor, body_hash, "
+                    "text, body_origin FROM chunks "
+                    "WHERE text_state IN ('projection','mirror') "
+                    "AND body_path IS NOT NULL AND body_anchor IS NOT NULL"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, path, body_path, body_anchor, body_hash, "
+                    "text, NULL FROM chunks "
+                    "WHERE text_state IN ('projection','mirror') "
+                    "AND body_path IS NOT NULL AND body_anchor IS NOT NULL"
+                ).fetchall()
         else:
             rows = _sample_chunks(conn, sample_limit, stale_paths)
+            if origin_col:
+                rows = [tuple(r) + (None,) for r in rows]
+            else:
+                rows = [tuple(r) + (None,) for r in rows]
     except sqlite3.Error as e:
         return {"inv": "INV-2/3", "verdict": "NOTRUN", "fingerprint": "n/a",
                 "violations": [_v(REASON_INV2, CODE_INV2, "<index>",
@@ -218,8 +320,18 @@ def check_inv2_inv3(conn: sqlite3.Connection, root: Path, *,
     if not rows:
         return {"inv": "INV-2/3", "verdict": "NOTRUN",
                 "fingerprint": "sampled=0", "violations": []}
-    fp = f"sampled={len(rows)} full={bool(full)}"
-    for cid, _cpath, bpath, banchor, bhash, text in rows:
+    byte_equal = 0
+    canon_equal = 0
+    orphan_skipped = 0
+    for row in rows:
+        cid, _cpath, bpath, banchor, bhash, text = row[:6]
+        origin = (row[6] if len(row) > 6 else None) or ORIGIN_UNRESOLVED
+        if origin == ORIGIN_ORPHAN:
+            # The truth source has drifted: the row is reported by
+            # INV-1 with the orphan code, and INV-2 does not ALSO report
+            # it as "not rebuildable" — one fact, one report.
+            orphan_skipped += 1
+            continue
         # P1-阶段三 (C-A2): the SAME resolution rule as the writer and as
         # INV-1 — one rule for "where the truth file is".
         fpath = resolve_truth_file(root, bpath)
@@ -230,12 +342,16 @@ def check_inv2_inv3(conn: sqlite3.Connection, root: Path, *,
             continue
         frag = _read_fragment(fpath, banchor)
         if frag is None:
-            out2.append(_v(REASON_INV2, CODE_INV2, bpath,
+            out2.append(_v(REASON_INV2, CODE_INV2_SYNTAX_GAP, bpath,
                            f"chunk {cid}: anchor {banchor!r} not locatable",
                            "high", chunk_id=cid, anchor=banchor))
             continue
         # INV-2: canonical byte-equality (CRLF/LF tolerated via canonical_text).
-        if canonical_text(frag) != canonical_text(text or ""):
+        if frag == (text or ""):
+            byte_equal += 1
+        if canonical_text(frag) == canonical_text(text or ""):
+            canon_equal += 1
+        else:
             out2.append(_v(REASON_INV2, CODE_INV2, bpath,
                            f"chunk {cid}: rebuilt fragment != chunks.text "
                            f"(truth drifted)", "high", chunk_id=cid,
@@ -248,8 +364,13 @@ def check_inv2_inv3(conn: sqlite3.Connection, root: Path, *,
                            f"actual {actual[:23]}…", "high", chunk_id=cid,
                            anchor=banchor))
     violations = out2 + out3
+    fp = ("sampled=%d full=%s byte_equal=%d canon_equal=%d "
+          "orphan_skipped=%d" % (len(rows), bool(full), byte_equal,
+                                 canon_equal, orphan_skipped))
     return {"inv": "INV-2/3", "verdict": "RED" if violations else "GREEN",
-            "fingerprint": fp, "violations": violations}
+            "fingerprint": fp, "violations": violations,
+            "byte_equal": byte_equal, "canon_equal": canon_equal,
+            "orphan_skipped": orphan_skipped}
 
 
 def check_inv6(conn: sqlite3.Connection) -> Dict[str, Any]:

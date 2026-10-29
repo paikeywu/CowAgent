@@ -5,8 +5,8 @@ Splits text into chunks with token limits and overlap
 """
 
 from __future__ import annotations
-from typing import List
-from dataclasses import dataclass
+from typing import List, Optional, Tuple
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -17,6 +17,19 @@ class TextChunk:
     end_line: int
     # Ordinal of a hard-split piece of one over-long line; 0 for ordinary chunks.
     part: int = 0
+    # P1-阶段三 第四轮: the SEGMENT SEQUENCE this chunk was assembled from.
+    #
+    # A markdown chunk may be built from several NON-CONTIGUOUS line ranges
+    # (the chunker merges adjacent heading blocks).  ``segments`` lists them
+    # in order; ``gaps[i]`` is the number of trailing BLANK lines the
+    # chunker's ``rstrip()`` removed from segment ``i``.
+    #
+    # Both default to empty, so every OLD caller (and every plain-text
+    # chunk) keeps working unchanged: an empty ``segments`` means "this
+    # chunk is one contiguous span", which is exactly what the bare anchor
+    # ``L<start>-<end>`` already says.
+    segments: List[Tuple[int, int]] = field(default_factory=list)
+    gaps: List[int] = field(default_factory=list)
 
 
 def chunk_for_file(text: str, path: str) -> List[TextChunk]:
@@ -186,7 +199,16 @@ class TextChunker:
     # v2: keep text before the first heading; end a heading's body at the next
     # heading of any level (skipped levels used to be indexed twice).
     # v3: hard-split pieces of one over-long line carry a part ordinal in their id.
-    CHUNKER_VERSION = 3
+    # v4 (P1-阶段三 第四轮): the chunk now CARRIES ITS SEGMENT SEQUENCE
+    # (the non-contiguous line ranges it was assembled from) and the
+    # tail-blank count of each segment.  The chunk TEXT and the chunk ID are
+    # UNCHANGED — only the anchor string gains a ``+S`` suffix — but the
+    # index must be able to tell a v3 row from a v4 row, and
+    # ``files.chunker_version`` is the one place that says which algorithm
+    # produced a projection.  Not bumping it would leave the inspector
+    # unable to tell "this row has no segment sequence" from "this row was
+    # cut by an algorithm that did not need one".
+    CHUNKER_VERSION = 4
 
     def chunk_markdown(self, text: str) -> List[TextChunk]:
         """Chunk a markdown file while respecting its heading structure.
@@ -255,8 +277,37 @@ class TextChunker:
             content = '\n\n'.join(s['text'] for s in blk)
             start_line = blk[0]['start_line']           # already 1-based
             end_line = blk[-1]['end_line']               # already 1-based
-            result.append(TextChunk(text=content, start_line=start_line, end_line=end_line))
+            # P1-阶段三 第四轮: the segment sequence and the tail-blank
+            # count of each segment.  The chunk TEXT is unchanged — the
+            # sequence is extra INFORMATION, so the chunk id (which is
+            # built from the span alone) does not move.
+            segs = [(s['start_line'], s['end_line']) for s in blk]
+            gaps = [self._tail_blanks(lines, a, b) for (a, b) in segs]
+            result.append(TextChunk(text=content, start_line=start_line,
+                                    end_line=end_line,
+                                    segments=segs, gaps=gaps))
         return result
+
+    @staticmethod
+    def _tail_blanks(lines: List[str], a: int, b: int) -> int:
+        """How many trailing BLANK lines the segment's ``rstrip()`` removed.
+
+        The chunker builds a segment's text as
+        ``'\\n'.join(lines[a-1:b]).rstrip()`` — the ``rstrip`` eats the
+        segment's trailing blank lines, and that is information the truth
+        layer holds but the chunk text does not.  Recording the count is
+        what lets a reader explain WHY a rebuilt fragment differs from the
+        stored text instead of just reporting "not equal".
+
+        It is a RECORD, not a rebuild input: the rebuild joins the
+        segments with a fixed blank line (measured — see
+        ``body_pointer.rebuild_from_anchor``).
+        """
+        seg = lines[a - 1:b]
+        n = 0
+        while n < len(seg) and seg[len(seg) - 1 - n].strip() == "":
+            n += 1
+        return n
 
     def _md_leaf_segments(self, text: str, lines: List[str], markdown_it) -> List[dict]:
         """Return every heading's OWN direct body as a candidate segment.

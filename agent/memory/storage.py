@@ -253,6 +253,63 @@ def _split_fts5_damage(report: str) -> tuple[list[str], list[str]]:
     return fts5, other
 
 
+# ---------------------------------------------------------------------------
+# The anti-downgrade UPSERT rule (P1-阶段三 第四轮 · 交办第 1 项).
+# ---------------------------------------------------------------------------
+#: The body columns an UPSERT must NOT downgrade.
+#:
+#: **The defect this fixes (measured).**  The three UPSERTs in this module
+#: wrote ``body_path = excluded.body_path`` UNCONDITIONALLY.  A writer that
+#: does not know about the body columns — the OLD desktop build
+#: (``cowagent-backend.exe``, built 2026-10-13, running since 2026-10-27)
+#: is one — writes NULL, and the UPSERT then OVERWRITES the value a
+#: migration had just backfilled.  Measured effect on this machine: the
+#: ``agent-mvnewfyb`` library went from "backfilled" to
+#: ``body_path IS NULL`` on 255 of 255 rows, and the migration had to be
+#: re-run — which makes "migrate → erased → migrate again" an infinite
+#: loop rather than a converging operation.
+#:
+#: **The rule.**  A body column is only overwritten when the incoming value
+#: is actually PRESENT:
+#:
+#:   * ``body_path`` / ``body_anchor`` / ``body_hash`` → overwrite only
+#:     when ``excluded.<col> IS NOT NULL``.  A writer that does not know
+#:     about them leaves them alone.
+#:   * ``text_state`` → overwrite only when the incoming value is NOT
+#:     ``'projection'``.  ``'projection'`` is the DEFAULT of the column,
+#:     so a writer that merely fills the default would otherwise "reset" a
+#:     row the inspector had already certified as ``'mirror'``.  A
+#:     writer that does not know about the column at all passes NULL,
+#:     which is also excluded.
+#:   * ``body_origin`` → same rule as ``text_state``: overwrite only
+#:     when the incoming value is a DECIDED one (``'file'`` / ``'blob'``
+#:     / ``'orphan'``), never ``'unresolved'`` and never NULL.  An
+#:     undecided row must not erase a decided one.
+#:
+#: **One rule, three call sites.**  The SQL fragment is defined ONCE
+#: (:data:`BODY_COLUMN_UPSERT_SQL`) and interpolated into all three
+#: UPSERTs.  Three hand-written spellings of the same rule is how they
+#: drift apart — and a fourth UPSERT written later would not know to ask.
+BODY_COLUMN_UPSERT_SQL = """\
+                    body_path        = CASE WHEN excluded.body_path IS NOT NULL
+                                             THEN excluded.body_path
+                                             ELSE chunks.body_path END,
+                    body_anchor      = CASE WHEN excluded.body_anchor IS NOT NULL
+                                             THEN excluded.body_anchor
+                                             ELSE chunks.body_anchor END,
+                    body_hash        = CASE WHEN excluded.body_hash IS NOT NULL
+                                             THEN excluded.body_hash
+                                             ELSE chunks.body_hash END,
+                    text_state       = CASE WHEN excluded.text_state IS NOT NULL
+                                             AND excluded.text_state <> 'projection'
+                                             THEN excluded.text_state
+                                             ELSE chunks.text_state END,
+                    body_origin      = CASE WHEN excluded.body_origin IS NOT NULL
+                                             AND excluded.body_origin <> 'unresolved'
+                                             THEN excluded.body_origin
+                                             ELSE chunks.body_origin END"""
+
+
 @dataclass
 class MemoryChunk:
     """Represents a memory chunk with text and embedding"""
@@ -300,6 +357,15 @@ class MemoryChunk:
     # 'projection' (text here) | 'externalized' (text moved to body_path)
     # | 'stale' (hash drifted) | 'missing' (body file gone).
     text_state: Optional[str] = "projection"
+    # P1-阶段三 第四轮: WHERE the body comes from.  Four values, four
+    # contracts (see agent.memory.body_pointer):
+    #   'unresolved' — nobody has decided yet (a visible TODO, never a PASS)
+    #   'file'       — there IS a truth file; the pointer must resolve
+    #   'blob'       — there is honestly NO truth source (body_path IS NULL)
+    #   'orphan'     — there WAS one and it no longer matches (drift)
+    # ``None`` means "this writer does not carry the column" — the UPSERT
+    # then leaves the stored value alone (the anti-downgrade rule).
+    body_origin: Optional[str] = None
 
 
 @dataclass
@@ -621,7 +687,8 @@ class MemoryStorage:
                 body_path TEXT,
                 body_anchor TEXT,
                 body_hash TEXT,
-                text_state TEXT NOT NULL DEFAULT 'projection'
+                text_state TEXT NOT NULL DEFAULT 'projection',
+                body_origin TEXT NOT NULL DEFAULT 'unresolved'
             )
         """)
 
@@ -630,6 +697,11 @@ class MemoryStorage:
         self._migrate_hit_columns()
         # P0-11 P-2: same for the release projection flags.
         self._migrate_release_columns()
+        # P1-阶段三 第四轮: the body-origin column.  It is added here (not
+        # only in the schema_drift repair path) so a FRESH database has it
+        # from the start — a column that only the migration adds means a
+        # new workspace starts without it.
+        self._migrate_body_origin_column()
         # P0-17 B-1/B-2: the schema is now CHECKED. The migration adds what
         # this build knows; this proves the result is queryable, so a
         # database that could not be migrated fails here — loudly, at open
@@ -815,6 +887,25 @@ class MemoryStorage:
             )
         if "last_hit_at" not in cols:
             self.conn.execute("ALTER TABLE chunks ADD COLUMN last_hit_at INTEGER")
+
+    def _migrate_body_origin_column(self):
+        """Add the ``body_origin`` column to a chunks table an older build wrote.
+
+        P1-阶段三 第四轮.  The column is ``NOT NULL DEFAULT 'unresolved'``:
+        an existing row that has never been judged reads as **'unresolved'**
+        — a VISIBLE TODO — rather than as NULL, which would be
+        indistinguishable from "judged, and the answer is nothing".
+
+        Idempotent: PRAGMA table_info is metadata-only and ALTER TABLE only
+        fires when the column is missing.
+        """
+        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(chunks)")}
+        if "body_origin" in cols:
+            return
+        self.conn.execute(
+            "ALTER TABLE chunks ADD COLUMN body_origin "
+            "TEXT NOT NULL DEFAULT 'unresolved'"
+        )
 
     def _migrate_files_columns(self):
         """Add chunk_count / chunker_version to a files table an older build wrote.
@@ -1111,6 +1202,10 @@ class MemoryStorage:
         "fts5: missing row N from content table" errors.
         ON CONFLICT DO UPDATE fires the AFTER UPDATE trigger (chunks_au /
         chunks_trigram_au) and keeps the original rowid intact.
+
+        P1-阶段三 第四轮: the body columns are updated under the
+        ANTI-DOWNGRADE rule (:data:`BODY_COLUMN_UPSERT_SQL`) — a writer
+        that does not carry them must not erase them.
         """
         if _HAS_UPSERT:
             _SQL = """
@@ -1118,8 +1213,8 @@ class MemoryStorage:
                 (id, user_id, scope, source, path, start_line, end_line,
                  text, embedding, hash, metadata, element_released,
                  file_sealed, sealed_owner, body_path, body_anchor,
-                 body_hash, text_state, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                 body_hash, text_state, body_origin, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
                 ON CONFLICT(id) DO UPDATE SET
                     user_id     = excluded.user_id,
                     scope       = excluded.scope,
@@ -1134,10 +1229,7 @@ class MemoryStorage:
                     element_released = excluded.element_released,
                     file_sealed      = excluded.file_sealed,
                     sealed_owner     = excluded.sealed_owner,
-                    body_path        = excluded.body_path,
-                    body_anchor      = excluded.body_anchor,
-                    body_hash        = excluded.body_hash,
-                    text_state       = excluded.text_state,
+""" + BODY_COLUMN_UPSERT_SQL + """,
                     updated_at  = strftime('%s', 'now')
             """
         else:
@@ -1146,8 +1238,8 @@ class MemoryStorage:
                 (id, user_id, scope, source, path, start_line, end_line,
                  text, embedding, hash, metadata, element_released,
                  file_sealed, sealed_owner, body_path, body_anchor,
-                 body_hash, text_state, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                 body_hash, text_state, body_origin, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
             """
         params = (
             chunk.id, chunk.user_id, chunk.scope, chunk.source, chunk.path,
@@ -1162,6 +1254,7 @@ class MemoryStorage:
             chunk.body_anchor or None,
             chunk.body_hash or None,
             chunk.text_state or "projection",
+            chunk.body_origin or "unresolved",
         )
         with self._lock:
             try:
@@ -1175,7 +1268,8 @@ class MemoryStorage:
     def save_chunks_batch(self, chunks: List[MemoryChunk]):
         """Save multiple chunks in a batch (insert or update by id).
 
-        See save_chunk for why UPSERT is used instead of INSERT OR REPLACE.
+        See save_chunk for why UPSERT is used instead of INSERT OR REPLACE,
+        and for the anti-downgrade rule on the body columns.
         """
         if _HAS_UPSERT:
             _SQL = """
@@ -1183,8 +1277,8 @@ class MemoryStorage:
                 (id, user_id, scope, source, path, start_line, end_line,
                  text, embedding, hash, metadata, element_released,
                  file_sealed, sealed_owner, body_path, body_anchor,
-                 body_hash, text_state, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                 body_hash, text_state, body_origin, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
                 ON CONFLICT(id) DO UPDATE SET
                     user_id     = excluded.user_id,
                     scope       = excluded.scope,
@@ -1199,10 +1293,7 @@ class MemoryStorage:
                     element_released = excluded.element_released,
                     file_sealed      = excluded.file_sealed,
                     sealed_owner     = excluded.sealed_owner,
-                    body_path        = excluded.body_path,
-                    body_anchor      = excluded.body_anchor,
-                    body_hash        = excluded.body_hash,
-                    text_state       = excluded.text_state,
+""" + BODY_COLUMN_UPSERT_SQL + """,
                     updated_at  = strftime('%s', 'now')
             """
         else:
@@ -1211,8 +1302,8 @@ class MemoryStorage:
                 (id, user_id, scope, source, path, start_line, end_line,
                  text, embedding, hash, metadata, element_released,
                  file_sealed, sealed_owner, body_path, body_anchor,
-                 body_hash, text_state, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                 body_hash, text_state, body_origin, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
             """
         params_list = [
             (
@@ -1232,6 +1323,7 @@ class MemoryStorage:
                 c.body_anchor or None,
                 c.body_hash or None,
                 c.text_state or "projection",
+                c.body_origin or "unresolved",
             )
             for c in chunks
         ]
@@ -1839,8 +1931,8 @@ class MemoryStorage:
                 (id, user_id, scope, source, path, start_line, end_line,
                  text, embedding, hash, metadata, element_released,
                  file_sealed, sealed_owner, body_path, body_anchor,
-                 body_hash, text_state, hit_count, last_hit_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                 body_hash, text_state, body_origin, hit_count, last_hit_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
                 ON CONFLICT(id) DO UPDATE SET
                     user_id = excluded.user_id, scope = excluded.scope,
                     source = excluded.source, path = excluded.path,
@@ -1850,8 +1942,7 @@ class MemoryStorage:
                     element_released = excluded.element_released,
                     file_sealed = excluded.file_sealed,
                     sealed_owner = excluded.sealed_owner,
-                    body_path = excluded.body_path, body_anchor = excluded.body_anchor,
-                    body_hash = excluded.body_hash, text_state = excluded.text_state,
+""" + BODY_COLUMN_UPSERT_SQL + """,
                     hit_count = excluded.hit_count, last_hit_at = excluded.last_hit_at,
                     updated_at = strftime('%s', 'now')
             """
@@ -1861,8 +1952,8 @@ class MemoryStorage:
                 (id, user_id, scope, source, path, start_line, end_line,
                  text, embedding, hash, metadata, element_released,
                  file_sealed, sealed_owner, body_path, body_anchor,
-                 body_hash, text_state, hit_count, last_hit_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
+                 body_hash, text_state, body_origin, hit_count, last_hit_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
             """
 
         params_list = []
@@ -1881,6 +1972,7 @@ class MemoryStorage:
                 c.body_anchor or None,
                 c.body_hash or None,
                 c.text_state or "projection",
+                c.body_origin or "unresolved",
                 hc,
                 lha,
             ))
@@ -2203,7 +2295,14 @@ class MemoryStorage:
         predates them — but the open-time migration adds them, and
         ``_verify_schema`` fails loudly when they still are not there, so a
         missing column here is a genuine surprise worth not masking.
+
+        P1-阶段三 第四轮: ``body_origin`` is read defensively (``row.keys()``)
+        so a row from a database that has not been migrated yet still
+        converts — the column is added by the open-time migration, and a
+        read path that raises on a not-yet-migrated row would turn a
+        pending migration into a total outage.
         """
+        keys = row.keys()
         return MemoryChunk(
             id=row['id'],
             user_id=row['user_id'],
@@ -2220,6 +2319,8 @@ class MemoryStorage:
             body_anchor=row['body_anchor'],
             body_hash=row['body_hash'],
             text_state=row['text_state'],
+            body_origin=(row['body_origin'] if 'body_origin' in keys
+                         else None),
         )
     
     @staticmethod

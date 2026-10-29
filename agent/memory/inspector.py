@@ -87,6 +87,12 @@ REASON_READ_DEGRADED = "gap-rule:read-degraded"
 # healthy and knows nothing. Naming the workspace and the columns is what
 # turns it into something a human can act on.
 REASON_SCHEMA_DRIFT = "gap-rule:schema-drift"
+# P1-阶段三 第四轮: the body-origin column's own criteria.  They get
+# their OWN reason and their OWN codes, because the four origins are four
+# different contracts — "nobody decided yet", "there is honestly no truth
+# source", "the truth source drifted" and "the pointer does not resolve"
+# each need a different repair, and one shared code would hide which.
+REASON_BODY_ORIGIN = "gap-rule:body-origin"
 
 # P0-21: a page the truth layer says is a dark page (or a release), whose
 # index row still has a PUBLIC shape. The row is the leak: the truth
@@ -129,6 +135,11 @@ CODE_INDEX_PUBLIC = "index-public-row"
 CODE_GUARD_MISSING = "guard-missing"
 CODE_REBUILD_FAILED = "rebuild-failed"
 CODE_RELEASE_MISMATCH = "release-mismatch"
+# P1-阶段三 第四轮: the body-origin codes (O-1..O-4).
+CODE_BODY_ORIGIN_UNRESOLVED = "body-origin-unresolved"
+CODE_BODY_ORIGIN_FILE_UNRESOLVED = "body-origin-file-does-not-resolve"
+CODE_BODY_ORIGIN_BLOB_SHAPE = "body-origin-blob-shape-wrong"
+CODE_BODY_ORIGIN_ORPHAN_TEXT_LOST = "body-origin-orphan-text-lost"
 
 # P0-22: how far back the patrol looks when it asks "was anything
 # rewritten lately?". The guard records every discard, so the window is
@@ -282,6 +293,14 @@ class Inspector:
         self._check_public_rows(report)
         # P1 阶段二-B T5: INV 第 9 检查组（03 号 §八的 chunks 落地版 6 条）。
         report["text_inv"] = self._check_text_externalization(report)
+        # P1-阶段三 第四轮: the body-origin check group.
+        report["body_origin"] = self._check_body_origin(report)
+        # P1-阶段三 第四轮: the inspector is the DESIGNATED SETTER of the
+        # 'mirror' state (设计 §3.1).  It runs AFTER the invariants, because
+        # the promotion is only legal for the rows the invariants just
+        # verified byte-for-byte.  The count is reported, so the state is
+        # never a silent decoration.
+        report["mirror_state"] = self._set_mirror_state()
         # P0-22: the sweep over EVERY index of the family. The checks above
         # look at THIS workspace; the sweep looks at every index that
         # exists — including the ones nobody has addressed in a session,
@@ -1053,6 +1072,218 @@ class Inspector:
                 release_path=path, mismatch=detail)
 
     # -- check 8: index schema drift (P0-17 B-3) ----------------------------
+
+    def _check_body_origin(self, report: Dict[str, Any]) -> Dict[str, Any]:
+        """P1-阶段三 第四轮 — the ``body_origin`` check group.
+
+        Four criteria, one per origin, each with its own contract:
+
+        * **O-1** ``body_origin='unresolved'`` == 0 — a row nobody
+          judged is a VISIBLE TODO, and it is always RED.  (This is the
+          criterion that makes "the migration has not run yet" a fact
+          rather than a silent NULL.)
+        * **O-2** every ``'file'`` row's pointer RESOLVES to a real file.
+        * **O-3** every ``'blob'`` row has ``body_path IS NULL`` **and**
+          ``body_hash IS NOT NULL`` — "there is honestly no truth
+          source" is a design, not a defect; but a blob row with no
+          drift token is untrackable, and that IS a defect.
+        * **O-4** every ``'orphan'`` row KEEPS its text — an orphan is
+          the last remaining copy of a fact whose source is gone, and
+          dropping its text is silent deletion of history.
+
+        REPORT-ONLY, like every other check: the inspector reports, the
+        migration decides.  (The ONE thing the inspector writes is the
+        ``'mirror'`` state — see :meth:`_set_mirror_state`.)
+        """
+        from agent.memory.body_pointer import (
+            ORIGIN_BLOB,
+            ORIGIN_FILE,
+            ORIGIN_ORPHAN,
+            ORIGIN_UNRESOLVED,
+            resolve_truth_file,
+        )
+
+        db = self._index_db_path()
+        if not db.is_file():
+            return {"scope": "body_origin", "verdict": "NOTRUN",
+                    "fingerprint": "index-missing", "violations": [],
+                    "violation_count": 0}
+        try:
+            conn = sqlite3.connect(
+                "file:" + str(db).replace("\\", "/") + "?mode=ro", uri=True)
+        except sqlite3.Error as e:
+            return {"scope": "body_origin", "verdict": "NOTRUN",
+                    "fingerprint": "open-error:%s" % e, "violations": [],
+                    "violation_count": 0}
+        violations: List[Dict[str, Any]] = []
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)")}
+            if "body_origin" not in cols:
+                # The column is not there yet — that is schema drift, and
+                # the drift check reports it.  This check is NOTRUN, not
+                # PASS: "I cannot judge" and "there is nothing wrong" are
+                # different answers.
+                return {"scope": "body_origin", "verdict": "NOTRUN",
+                        "fingerprint": "body_origin-column-absent",
+                        "violations": [], "violation_count": 0}
+            dist = dict(conn.execute(
+                "SELECT body_origin, COUNT(*) FROM chunks "
+                "GROUP BY body_origin").fetchall())
+            rows = conn.execute(
+                "SELECT id, path, body_path, body_anchor, body_hash, text, "
+                "body_origin FROM chunks WHERE body_origin='unresolved'"
+            ).fetchall()
+            for cid, rel, bpath, banchor, bhash, _text, _o in rows:
+                violations.append({
+                    "reason": REASON_BODY_ORIGIN,
+                    "code": CODE_BODY_ORIGIN_UNRESOLVED,
+                    "path": str(rel or "?"),
+                    "detail": ("chunk %s: body_origin='unresolved' — nobody "
+                               "has decided whether this row has a truth "
+                               "source" % cid),
+                    "severity": _SEV_HIGH,
+                    "chunk_id": cid,
+                })
+            # O-2: a 'file' row must resolve.
+            for cid, rel, bpath, banchor, _bh, _t, _o in conn.execute(
+                    "SELECT id, path, body_path, body_anchor, body_hash, "
+                    "text, body_origin FROM chunks WHERE body_origin='file'"):
+                if not bpath or resolve_truth_file(
+                        self.workspace_root, bpath) is None:
+                    violations.append({
+                        "reason": REASON_BODY_ORIGIN,
+                        "code": CODE_BODY_ORIGIN_FILE_UNRESOLVED,
+                        "path": str(rel or "?"),
+                        "detail": ("chunk %s: body_origin='file' but the "
+                                   "pointer %r does not resolve to a truth "
+                                   "file" % (cid, bpath)),
+                        "severity": _SEV_HIGH,
+                        "chunk_id": cid,
+                    })
+            # O-3: a 'blob' row has no pointer but has a drift token.
+            for cid, rel, bpath, _banchor, bhash, _t, _o in conn.execute(
+                    "SELECT id, path, body_path, body_anchor, body_hash, "
+                    "text, body_origin FROM chunks WHERE body_origin='blob'"):
+                if bpath is not None or bhash is None:
+                    violations.append({
+                        "reason": REASON_BODY_ORIGIN,
+                        "code": CODE_BODY_ORIGIN_BLOB_SHAPE,
+                        "path": str(rel or "?"),
+                        "detail": ("chunk %s: body_origin='blob' must have "
+                                   "body_path IS NULL and body_hash NOT "
+                                   "NULL (has path=%r hash=%r)"
+                                   % (cid, bpath, bhash)),
+                        "severity": _SEV_HIGH,
+                        "chunk_id": cid,
+                    })
+            # O-4: an orphan keeps its text.
+            for cid, rel, _bpath, _banchor, _bh, text, _o in conn.execute(
+                    "SELECT id, path, body_path, body_anchor, body_hash, "
+                    "text, body_origin FROM chunks WHERE body_origin='orphan'"):
+                if text is None:
+                    violations.append({
+                        "reason": REASON_BODY_ORIGIN,
+                        "code": CODE_BODY_ORIGIN_ORPHAN_TEXT_LOST,
+                        "path": str(rel or "?"),
+                        "detail": ("chunk %s: body_origin='orphan' and its "
+                                   "text is NULL — the orphan is the last "
+                                   "remaining copy of that fact" % cid),
+                        "severity": _SEV_HIGH,
+                        "chunk_id": cid,
+                    })
+        finally:
+            conn.close()
+        for v in violations:
+            self._violation(report, v["reason"], v["path"], v["detail"],
+                            v["severity"], code=v["code"],
+                            chunk_id=v.get("chunk_id"))
+        return {"scope": "body_origin", "verdict": "RED" if violations else "GREEN",
+                "fingerprint": "distribution=%s" % (dist or "none"),
+                "violations": violations, "violation_count": len(violations),
+                "distribution": dist}
+
+    def _set_mirror_state(self) -> Dict[str, Any]:
+        """Flip ``text_state`` to ``'mirror'`` for the rows WE verified.
+
+        P1-阶段三 第四轮.  The inspector is the DESIGNATED SETTER of the
+        ``'mirror'`` state (设计 §3.1): "校验器逐行复核通过后显式置位
+        （巡检器在 INV-2/3 校验通过时置位——明确置位者，防止三态机退化
+        为装饰）".
+
+        **The rule:** a row becomes ``'mirror'`` only when the inspector
+        has just rebuilt its fragment from the FILE and found it
+        BYTE-equal to the stored text.  Nothing else promotes a row:
+        not the migration (which only knows what it wrote), not the
+        writer (which is the party being judged), and not the mere
+        absence of an error.
+
+        **Why the setter must be explicit.**  A three-state machine whose
+        states are set by "whoever wrote last" is a decoration: every
+        row would be ``'projection'`` forever, and the state would
+        carry no information.  A state that only ONE party may set, and
+        only after that party has actually checked, carries the
+        information it exists to carry.
+
+        **Why the state must not be set for the rows that do not
+        qualify.**  A ``'blob'`` row has no truth source to mirror, and
+        an ``'orphan'`` row's truth source has drifted — marking either
+        as ``'mirror'`` would be a false claim about the truth layer.
+
+        The write is counted and reported: "how many rows were promoted"
+        is a number the delivery document carries.
+        """
+        from agent.memory.body_pointer import ORIGIN_FILE
+
+        db = self._index_db_path()
+        out: Dict[str, Any] = {"promoted": 0, "checked": 0, "skipped": 0}
+        if not db.is_file():
+            return out
+        try:
+            conn = sqlite3.connect(str(db))
+        except sqlite3.Error:
+            return out
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)")}
+            if "body_origin" not in cols:
+                return out
+            from agent.memory.body_pointer import rebuild_from_anchor
+            from agent.memory.body_pointer import resolve_truth_file
+
+            rows = conn.execute(
+                "SELECT id, body_path, body_anchor, text, text_state "
+                "FROM chunks WHERE body_origin=? AND text_state<>'mirror'",
+                (ORIGIN_FILE,)).fetchall()
+            promoted = []
+            for cid, bpath, banchor, text, _state in rows:
+                out["checked"] += 1
+                if not bpath or not banchor:
+                    out["skipped"] += 1
+                    continue
+                truth = resolve_truth_file(self.workspace_root, bpath)
+                if truth is None:
+                    out["skipped"] += 1
+                    continue
+                frag = rebuild_from_anchor(truth, banchor)
+                if frag is None or frag != (text or ""):
+                    # Not byte-equal -> NOT verified -> NOT promoted.
+                    out["skipped"] += 1
+                    continue
+                promoted.append(cid)
+            if promoted:
+                conn.executemany(
+                    "UPDATE chunks SET text_state='mirror' WHERE id=? "
+                    "AND body_origin=? AND text_state<>'mirror'",
+                    [(cid, ORIGIN_FILE) for cid in promoted])
+                conn.commit()
+            out["promoted"] = len(promoted)
+        except sqlite3.Error:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+        finally:
+            conn.close()
+        return out
 
     def _check_schema_drift(self, report: Dict[str, Any]) -> None:
         """Report an index whose SCHEMA is behind the current code.

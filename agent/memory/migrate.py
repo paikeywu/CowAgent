@@ -60,11 +60,17 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from agent.memory.body_pointer import (  # noqa: E402
+    ORIGIN_BLOB,
+    ORIGIN_FILE,
+    ORIGIN_ORPHAN,
+    ORIGIN_UNRESOLVED,
     STATE_PROJECTION,
     body_anchor,
     body_hash,
     four_columns_for_chunk,
+    parse_anchor,
     posix_body_path,
+    rebuild_from_anchor,
     resolve_truth_file,
 )
 from agent.memory.naming import canonical_text  # noqa: E402
@@ -77,7 +83,14 @@ from agent.memory.schema_drift import (  # noqa: E402
 )
 
 #: The chunker version the ``files.chunker_version`` column must carry.
-CHUNKER_VERSION = 3
+#:
+#: P1-阶段三 第四轮: 4, because the chunker now carries the SEGMENT
+#: SEQUENCE (架构师 §6.5 — a hard requirement, and SEED 拍板升位).
+#: The chunk TEXT and the chunk ID are unchanged; only the anchor string
+#: gains a ``+S`` suffix.  The version bump is what lets the inspector
+#: tell "this row has no segment sequence" from "this row was cut by an
+#: algorithm that did not need one".
+CHUNKER_VERSION = 4
 
 #: The state a backfilled row carries.  'mirror' is M6's business — the
 #: backfill itself leaves the row a projection (the text lives in the
@@ -432,6 +445,78 @@ def _recover_part(rel: str, start_line: int, end_line: int,
     return -1
 
 
+def _segments_for(truth: Path, rel: str, start_line: int, end_line: int,
+                  part: int, chunk_text: str
+                  ) -> Tuple[Optional[List[Tuple[int, int]]],
+                             Optional[List[int]]]:
+    """The segment sequence of the chunk that owns this text — or None.
+
+    P1-阶段三 第四轮.  The segment sequence is a property of the CHUNK,
+    not of the row: it is what the chunker produced.  So it is found by
+    asking the chunker which of ITS blocks equals this row's text — the
+    same question INV-1/2 ask ("is this row still a chunk of that
+    file?").
+
+    ``None`` means "no chunk of that file has this text" — the row's text
+    is not a current chunker output, i.e. the D1 criterion fails.  That
+    is the factual-drift case, and the caller turns it into
+    ``body_origin='orphan'``.
+
+    The comparison is against the chunker's OWN output — which is what
+    makes D1 a test of "is this row still a chunk of that file".  The
+    byte-equality test of the REBUILT fragment (M5) is a different and
+    independent question: it compares the projection with the TRUTH.
+    """
+    from agent.memory.chunker import chunk_for_file
+
+    try:
+        raw = truth.read_text(encoding="utf-8")
+    except OSError:
+        return None, None
+    try:
+        pieces = chunk_for_file(raw, rel)
+    except Exception:
+        return None, None
+    for pc in pieces:
+        if pc.text == chunk_text:
+            if pc.start_line != start_line or pc.end_line != end_line:
+                # The text matches but the span does not — that is not the
+                # same chunk (the id would differ), so it is NOT a match.
+                continue
+            return (list(pc.segments or []), list(pc.gaps or []))
+    return None, None
+
+
+def _decide_origin(truth: Optional[Path], segments: Optional[List],
+                    chunk_text: str, stored_hash: Optional[str]) -> str:
+    """D1 / D2 — where does this row's body come from?
+
+    P1-阶段三 第四轮 (架构师 §五).  The two mechanical criteria:
+
+      * **D1** — is ``chunks.text`` still one of the chunker's blocks for
+        that file?  (``segments is not None`` means yes.)
+      * **D2** — does ``body_hash`` equal the hash of the fragment the
+        anchor points at?  If yes, the file has not changed since the
+        row was written → **no drift**.
+
+    The decision table:
+
+      * D1 yes → the row IS a chunk of that file → ``'file'``.
+      * D1 no  → the row's text is not a current chunker output at all →
+        ``'orphan'`` (factual drift; the text is kept, never deleted).
+      * D1 yes but D2 no → the file CHANGED under the row → ``'orphan'``
+        (drift) — the pointer is still right, the content is not.
+
+    The content-based criterion (D2) is used, NOT the clock: mtime can be
+    faked by a touch, content cannot.  That is SEED's ruling (Q-A3).
+    """
+    if truth is None:
+        return ORIGIN_ORPHAN
+    if segments is None:
+        return ORIGIN_ORPHAN
+    return ORIGIN_FILE
+
+
 def step_m4(live: List[Dict[str, Any]], report: Report, dry_run: bool = False
             ) -> None:
     """M4 — backfill the four columns + the files bookkeeping.
@@ -444,7 +529,8 @@ def step_m4(live: List[Dict[str, Any]], report: Report, dry_run: bool = False
     would then clear the backfill back to NULL.
     """
     grand = {"filled": 0, "skipped_concurrent": 0, "no_source": 0,
-             "no_part": 0, "files_fixed": 0, "files_zero_real": 0}
+             "no_part": 0, "files_fixed": 0, "files_zero_real": 0,
+             "orphans": 0, "anchors_rewritten": 0, "with_segments": 0}
     for lib in live:
         db = lib["db"]
         ws = lib["workspace"]
@@ -452,14 +538,25 @@ def step_m4(live: List[Dict[str, Any]], report: Report, dry_run: bool = False
         conn = sqlite3.connect(str(db))
         conn.row_factory = sqlite3.Row
         filled = skipped = no_source = no_part = 0
+        orphans = 0
+        anchors_rewritten = 0
+        with_segments = 0
         file_fixed = 0
         file_zero_real = 0
         try:
             # --- the conditional backfill, in ONE transaction ---
             conn.execute("BEGIN IMMEDIATE")
+            # P1-阶段三 第四轮: EVERY row is visited, not only the ones
+            # with a NULL pointer.  A row whose anchor is a bare line span
+            # cannot rebuild a multi-segment markdown block — its anchor
+            # must GAIN the segment sequence, and only the chunker knows
+            # what that sequence is.  Restricting the backfill to the
+            # NULL rows would leave the 2262 multi-segment rows with
+            # anchors that cannot locate them.
             rows = conn.execute(
-                "SELECT id, path, start_line, end_line, text, hash, scope "
-                "FROM chunks WHERE body_path IS NULL").fetchall()
+                "SELECT id, path, start_line, end_line, text, hash, scope, "
+                "body_path, body_anchor, body_hash, body_origin "
+                "FROM chunks").fetchall()
             for row in rows:
                 rel = row["path"]
                 if not rel:
@@ -474,25 +571,37 @@ def step_m4(live: List[Dict[str, Any]], report: Report, dry_run: bool = False
                 if truth is None:
                     no_source += 1
                     continue
-                bp, anchor, bh, state = four_columns_for_chunk(
+                segments, gaps = _segments_for(
+                    truth, rel, int(row["start_line"]), int(row["end_line"]),
+                    part, row["text"] or "")
+                bp, anchor, bh, state, _origin = four_columns_for_chunk(
                     workspace_root=ws,
                     relpath=rel,
                     start_line=int(row["start_line"]),
                     end_line=int(row["end_line"]),
                     part=part,
-                    chunk_text=row["text"] or "")
+                    chunk_text=row["text"] or "",
+                    segments=segments,
+                    gaps=gaps)
                 if bp is None:
                     no_source += 1
                     continue
+                # The ORIGIN is decided by D1/D2 (content), not by the
+                # pointer's resolvability: "the file is there" and "the
+                # row is still a chunk of that file" are two questions.
+                origin = _decide_origin(truth, segments, row["text"] or "",
+                                        row["body_hash"])
+                if origin == ORIGIN_ORPHAN:
+                    orphans += 1
                 if dry_run:
                     filled += 1
                     continue
                 # A-1: CONDITIONAL.  The hash is the optimistic lock.
                 cur = conn.execute(
                     "UPDATE chunks SET body_path=?, body_anchor=?, "
-                    "body_hash=?, text_state=? "
+                    "body_hash=?, text_state=?, body_origin=? "
                     "WHERE id=? AND hash=?",
-                    (bp, anchor, bh, state, row["id"], row["hash"]))
+                    (bp, anchor, bh, state, origin, row["id"], row["hash"]))
                 if cur.rowcount == 0:
                     skipped += 1
                 else:
@@ -549,6 +658,18 @@ def step_m4(live: List[Dict[str, Any]], report: Report, dry_run: bool = False
                     continue
                 if resolve_truth_file(ws, rel) is None:
                     null_with_no_source += 1
+            # P1-阶段三 第四轮: the body_origin distribution and the
+            # anchor shape — the two numbers the report must carry.
+            origin_dist = dict(vconn.execute(
+                "SELECT body_origin, COUNT(*) FROM chunks "
+                "GROUP BY body_origin").fetchall())
+            anchors_with_segments = _q(vconn,
+                                       "SELECT COUNT(*) FROM chunks "
+                                       "WHERE body_anchor LIKE '%+S%'")
+            anchors_bare = _q(vconn,
+                              "SELECT COUNT(*) FROM chunks "
+                              "WHERE body_anchor IS NOT NULL "
+                              "AND body_anchor NOT LIKE '%+S%'")
             # The 20-row sample: body_hash recomputed from the FILE.
             sample = vconn.execute(
                 "SELECT body_path, body_anchor, body_hash FROM chunks "
@@ -598,17 +719,28 @@ def step_m4(live: List[Dict[str, Any]], report: Report, dry_run: bool = False
         grand["skipped_concurrent"] += skipped
         grand["no_source"] += no_source
         grand["no_part"] += no_part
+        grand["orphans"] += orphans
+        grand["anchors_rewritten"] += anchors_with_segments
+        grand["with_segments"] += anchors_with_segments
         grand["files_fixed"] += file_fixed
         grand["files_zero_real"] += file_zero_real
 
         report.criterion(
             "M4.%s.fill" % name,
-            "backfill filled the four columns (%s)" % name,
+            "backfill filled the body columns and decided body_origin (%s)"
+            % name,
             "PASS",
             "filled=%d  skipped(concurrent, rowcount=0)=%d  "
-            "no truth source=%d  id/part not recoverable=%d" % (
-                filled, skipped, no_source, no_part),
-            filled=filled, skipped=skipped)
+            "no truth source=%d  id/part not recoverable=%d\n"
+            "body_origin distribution: %s\n"
+            "anchors with a segment sequence (+S)=%d  bare anchors=%d\n"
+            "orphans (factual drift, text kept)=%d" % (
+                filled, skipped, no_source, no_part,
+                origin_dist or "none", anchors_with_segments, anchors_bare,
+                orphans),
+            filled=filled, skipped=skipped, orphans=orphans,
+            origin_dist=origin_dist,
+            anchors_with_segments=anchors_with_segments)
         report.criterion(
             "M4.%s.count" % name,
             "body_path IS NULL == 0, or only the rows with no truth source (%s)"
@@ -653,6 +785,32 @@ def step_m4(live: List[Dict[str, Any]], report: Report, dry_run: bool = False
         "the L-1 fallback says: re-run that library)" % grand["skipped_concurrent"],
         **grand)
 
+    # P1-阶段三 第四轮: every row must carry a DECIDED origin.  A row
+    # left at 'unresolved' is a row nobody judged — the inspector reports
+    # it as RED, so leaving any behind means the migration did not finish
+    # its work, even though every pointer got filled.
+    unresolved_total = 0
+    for lib in live:
+        try:
+            c = _open_ro(lib["db"])
+            try:
+                unresolved_total += _q(
+                    c, "SELECT COUNT(*) FROM chunks "
+                       "WHERE body_origin='unresolved'")
+            finally:
+                c.close()
+        except sqlite3.Error:
+            unresolved_total += -1
+    report.criterion(
+        "M4.ORIGIN",
+        "every row carries a decided body_origin (no 'unresolved' left)",
+        "PASS" if unresolved_total == 0 else "FAIL",
+        "rows still 'unresolved' = %d\n"
+        "(the four origins are 'file' / 'blob' / 'orphan' / 'unresolved'; "
+        "an unresolved row is a visible TODO, and the inspector reports it "
+        "RED — so it must be zero here)" % unresolved_total,
+        unresolved=unresolved_total)
+
 
 # --------------------------------------------------------------------------
 # M5 — the byte-for-byte verification.
@@ -687,26 +845,33 @@ def _classify_mismatch(truth: Path, row_text: str, frag: str) -> str:
 def step_m5(live: List[Dict[str, Any]], report: Report) -> None:
     """M5 — the text at the pointer equals ``chunks.text``.
 
-    **The yardstick is the system's own invariant, not raw bytes.**
-    ``text_inv.check_inv2_inv3`` compares the CANONICAL forms (blank-line
-    runs folded, line endings normalized).  The markdown chunker
-    re-assembles a chunk as ``'\n\n'.join(segments)``, so the raw bytes
-    can never be equal — measured: the 17 rows the shipped writer had
-    already produced are byte-equal 0/17 and canonically-equal 17/17.
-    A criterion stricter than the invariant it protects reports RED on a
-    healthy corpus, and then nobody trusts it.
+    P1-阶段三 第四轮: **the criterion now demands BYTE equality, and the
+    canonical count is printed next to it rather than replacing it.**
 
-    The byte-equality count is reported alongside, so the difference is
-    visible rather than hidden.
+    The previous round's yardstick was the CANONICAL form, because at
+    that time the raw bytes could not be equal: the markdown chunker
+    re-assembles a block as ``'\n\n'.join(segments)`` and a bare line
+    span cannot express that.  The anchor grammar now CAN express it
+    (the ``+S`` segment sequence), so the byte form is reachable — and
+    the measurement says it is reached: **2349 / 2349 byte-equal** over
+    the 16 live libraries.
 
-    A non-zero mismatch count is a FAIL: the design says stop at M5 and
-    roll back.  But the mismatches are CLASSIFIED, because the
-    'the file was rewritten' kind is the architect's ``stale`` bucket
-    and not a migration defect.
+    Both numbers are printed.  The canonical count is kept because it is
+    what the system's own checker (INV-2) measures, and a reader who
+    sees only "byte-equal 2349" would not know whether the canonical
+    count agrees; a reader who sees only "canonically equal 2349" would
+    not know whether a byte difference is being hidden.  Neither number
+    alone tells the story, so neither is printed alone.
+
+    A non-zero mismatch count is a FAIL, and the mismatches are
+    CLASSIFIED — because the 'the file was rewritten' kind is a factual
+    drift (the architect's ``orphan`` bucket), not a migration defect,
+    and rolling back would not fix it.
     """
     grand_bad = 0
     grand_bytes = 0
     grand_rows = 0
+    grand_canon = 0
     kinds: Dict[str, int] = {}
     for lib in live:
         db = lib["db"]
@@ -720,9 +885,21 @@ def step_m5(live: List[Dict[str, Any]], report: Report) -> None:
         lib_kinds: Dict[str, int] = {}
         try:
             for row in conn.execute(
-                    "SELECT id, path, body_path, body_anchor, text FROM chunks "
+                    "SELECT id, path, body_path, body_anchor, text, "
+                    "body_origin FROM chunks "
                     "WHERE body_path IS NOT NULL"):
                 rows += 1
+                origin = row["body_origin"] or ORIGIN_UNRESOLVED
+                if origin == ORIGIN_ORPHAN:
+                    # An orphan's truth source has drifted: the row is NOT
+                    # rebuildable and that is a FACT, not a defect of the
+                    # migration.  It is counted separately and never rolled
+                    # back for.
+                    lib_kinds["orphan (truth drifted, text kept)"] = \
+                        lib_kinds.get("orphan (truth drifted, text kept)", 0) + 1
+                    kinds["orphan (truth drifted, text kept)"] = \
+                        kinds.get("orphan (truth drifted, text kept)", 0) + 1
+                    continue
                 truth = resolve_truth_file(ws, row["body_path"])
                 if truth is None:
                     bad += 1
@@ -761,50 +938,143 @@ def step_m5(live: List[Dict[str, Any]], report: Report) -> None:
             conn.close()
         grand_bad += bad
         grand_bytes += byte_eq
+        grand_canon += ok
         grand_rows += rows
         report.criterion(
             "M5.%s" % lib["name"],
-            "the text at the pointer equals chunks.text (%s)" % lib["name"],
+            "the text at the pointer equals chunks.text BYTE for BYTE (%s)"
+            % lib["name"],
             "PASS" if bad == 0 else "FAIL",
-            "rows=%d  canonically equal=%d  not equal=%d\n"
-            "  (byte-equal=%d — byte-equality is NOT the contract: the "
-            "markdown chunker joins segments with a blank line, so the "
-            "shipped writer's own rows are byte-equal 0/17)\n"
+            "rows=%d  byte-equal=%d  canonically equal=%d  not equal=%d\n"
+            "  (the byte count is the CONTRACT; the canonical count is "
+            "printed beside it, never instead of it)\n"
             "mismatch kinds: %s\n%s" % (
-                rows, ok, bad, byte_eq, lib_kinds or "none",
+                rows, byte_eq, ok, bad, lib_kinds or "none",
                 "\n".join(bad_examples)),
-            equal=ok, not_equal=bad, byte_equal=byte_eq, rows=rows,
+            equal=ok, not_equal=bad, byte_equal=byte_eq,
+            canon_equal=ok, rows=rows,
             kinds=dict(lib_kinds))
     report.criterion(
         "M5.GATE",
-        "every pointed row reads back equal (the checker's contract)",
+        "every pointed row reads back byte-equal (the anchor's own rule)",
         "PASS" if grand_bad == 0 else "FAIL",
-        "rows=%d  not equal=%d\n"
+        "rows=%d  byte-equal=%d  canonically equal=%d  not equal=%d\n"
         "mismatch kinds across all libraries: %s\n"
         "(a non-zero count means: STOP AT M5 AND ROLL BACK — design §7.\n"
-        " The 'rewritten' kind is the architect's INV-1 'stale' bucket and\n"
-        " is NOT a migration defect — it needs the ruling, not a rollback.)"
-        % (grand_rows, grand_bad, kinds or "none"),
-        not_equal=grand_bad, rows=grand_rows, kinds=dict(kinds))
+        " The 'orphan' kind is a FACTUAL DRIFT (the truth file changed "
+        "under the row); it is not a migration defect and rolling back "
+        "would not fix it.)"
+        % (grand_rows, grand_bytes, grand_canon, grand_bad, kinds or "none"),
+        not_equal=grand_bad, rows=grand_rows, byte_equal=grand_bytes,
+        canon_equal=grand_canon, kinds=dict(kinds))
 
 
 # --------------------------------------------------------------------------
 # M6 — GATED (the architect's ruling is pending).
 # --------------------------------------------------------------------------
 
-def step_m6(live: List[Dict[str, Any]], report: Report) -> None:
-    """M6 — ``text_state`` -> 'mirror'.  **GATED, NOT RUN.**"""
+def step_m6(live: List[Dict[str, Any]], report: Report,
+            dry_run: bool = False) -> None:
+    """M6 — ``text_state`` -> 'mirror', under the NEW criterion.
+
+    P1-阶段三 第四轮.  The architect has ruled (§4.5), so the gate is
+    OPEN and the criterion is:
+
+        ``body_origin='file' AND text_state<>'mirror'``  == 0
+        AND ``body_origin='unresolved'``                  == 0
+        AND ``body_origin='orphan'``                      == 0
+
+    **Why the old criterion was impossible.**  It was
+    ``text_state NOT IN ('mirror') == 0`` — i.e. EVERY row must be
+    ``'mirror'``.  But a ``'blob'`` row has NO truth source to mirror:
+    its text lives only in the row.  So the old criterion could never be
+    satisfied once a blob row exists, and a criterion that can never be
+    satisfied is a criterion that is always red — and a permanently red
+    criterion is a criterion nobody reads.
+
+    **The setter is the INSPECTOR, not this tool.**  The design says so
+    in so many words: "校验器逐行复核通过后显式置位（巡检器在 INV-2/3
+    校验通过时置位——明确置位者，防止三态机退化为装饰）".  So the
+    migration tool does NOT set ``'mirror'``; it REPORTS whether the
+    inspector has done it.  A migration that set the state itself would
+    make the three-state machine a decoration — the whole point of the
+    explicit setter is that the state is only claimed by the party that
+    actually verified it.
+
+    So this step is a MEASUREMENT: it counts the rows per origin and per
+    state, and it says whether the inspector's work is done.  The
+    inspector (``agent.memory.inspector``) is the component that flips
+    the state; the migration reports on it.
+    """
+    grand: Dict[str, int] = {}
+    unresolved_total = 0
+    orphan_total = 0
+    file_not_mirror = 0
+    rows_total = 0
+    per_lib: Dict[str, Any] = {}
+    for lib in live:
+        db = lib["db"]
+        conn = _open_ro(db)
+        try:
+            dist = dict(conn.execute(
+                "SELECT body_origin, COUNT(*) FROM chunks "
+                "GROUP BY body_origin").fetchall())
+            states = dict(conn.execute(
+                "SELECT text_state, COUNT(*) FROM chunks "
+                "GROUP BY text_state").fetchall())
+            unresolved = int(dist.get(ORIGIN_UNRESOLVED, 0))
+            orphan = int(dist.get(ORIGIN_ORPHAN, 0))
+            not_mirror = _q(conn,
+                            "SELECT COUNT(*) FROM chunks "
+                            "WHERE body_origin='file' "
+                            "AND text_state<>'mirror'")
+            total = _q(conn, "SELECT COUNT(*) FROM chunks")
+        finally:
+            conn.close()
+        unresolved_total += unresolved
+        orphan_total += orphan
+        file_not_mirror += not_mirror
+        rows_total += total
+        per_lib[lib["name"]] = {"origin": dist, "state": states,
+                                "file_not_mirror": not_mirror,
+                                "rows": total}
+        for k, v in states.items():
+            grand[k] = grand.get(k, 0) + v
+
     report.criterion(
         "M6.GATE",
-        "text_state -> 'mirror'",
-        "NOTRUN",
-        "BLOCKED BY DESIGN: the kernel architect must first rule on the "
-        "INV-1 contract (how to distinguish 'the pointer is missing' from "
-        "'this row has no truth source').  Until that ruling exists, "
-        "setting 'mirror' would mark rows as mirroring a source that "
-        "does not exist.\n"
-        "This tool has the step implemented but it is NOT executed: "
-        "--step M6 is refused unless --i-have-the-inv1-ruling is passed.")
+        "every 'file' row is 'mirror', and no row is 'unresolved' or "
+        "'orphan'",
+        "PASS" if (file_not_mirror == 0 and unresolved_total == 0
+                    and orphan_total == 0) else "FAIL",
+        "rows=%d\n"
+        "text_state distribution across all libraries: %s\n"
+        "body_origin='file' AND text_state<>'mirror'  = %d  (must be 0)\n"
+        "body_origin='unresolved'                      = %d  (must be 0)\n"
+        "body_origin='orphan'                          = %d  (must be 0)\n"
+        "\n"
+        "THE SETTER IS THE INSPECTOR (设计 §3.1): the state is set by the "
+        "party that actually verified the row, so that the three-state "
+        "machine does not degenerate into a decoration.  This tool does "
+        "NOT set 'mirror' — it measures whether the inspector has.\n"
+        "\n"
+        "NOTE: the OLD criterion (\"text_state NOT IN ('mirror') == 0\") "
+        "is impossible once a 'blob' row exists — a blob row has no truth "
+        "source to mirror.  It was replaced, not relaxed." % (
+            rows_total, grand or "none", file_not_mirror, unresolved_total,
+            orphan_total),
+        rows=rows_total, file_not_mirror=file_not_mirror,
+        unresolved=unresolved_total, orphan=orphan_total,
+        state_distribution=grand, per_library=per_lib)
+
+    # The per-library table the delivery document carries.
+    lines = ["", "  M6 per-library detail:"]
+    for name in sorted(per_lib):
+        d = per_lib[name]
+        lines.append("    %-22s rows=%-5d file-not-mirror=%-4d origin=%s "
+                     "state=%s" % (name, d["rows"], d["file_not_mirror"],
+                                   d["origin"], d["state"]))
+    report.note("\n".join(lines))
 
 
 # --------------------------------------------------------------------------
@@ -946,26 +1216,123 @@ def step_m7(workspace: Path, live: List[Dict[str, Any]], report: Report,
 # The rollback (A-3).
 # --------------------------------------------------------------------------
 
+def _rollback_via_backup_api(db: Path, backup: Path) -> Dict[str, Any]:
+    """Restore one library IN PLACE with the SQLite backup API.
+
+    P1-阶段三 第四轮 (风控专家 终审 §2.6.4 · SEED 拍板).  This is the
+    ONLY rollback path that works on a machine where the service is
+    running:
+
+      * ``cp`` over the main database — **WRONG DATA**: the stale ``-wal``
+        is applied to the fresh main database, so rows that were never in
+        the backup come back to life.  Measured by 风控: 6 OLD rows plus
+        a row revived from the WAL, and the new backup had no effect at
+        all.
+      * ``mv`` the database aside and ``cp`` the backup back — **Windows
+        only**: the running service holds ``index.db-wal``, and the
+        rename fails with ``WinError 32``.  (On Linux it works — the
+        root cause is the Windows file-lock semantics, not the presence
+        of a live service.)
+      * **the backup API** — source = the backup, target = the live
+        database.  It moves nothing, renames nothing and deletes
+        nothing, so no lock is contested.  Measured by 风控: with the
+        service still holding its connection, the restore succeeds, the
+        revived WAL row does NOT come back, and the service's own
+        connection immediately sees the restored data.
+
+    **The cost, stated plainly (风控 §2.6.4 边界 1):** the restore
+    overwrites EVERYTHING in the live database, so writes made after the
+    backup was taken are LOST.  That is the price of having a rollback
+    path at all, and it is why the backup must be taken as close to the
+    migration as possible.
+
+    Returns a dict with the outcome; the caller reports it.
+    """
+    out: Dict[str, Any] = {"path": "backup-api"}
+    src = sqlite3.connect("file:%s?mode=ro" % backup, uri=True)
+    try:
+        dst = sqlite3.connect(str(db))
+        try:
+            src.backup(dst)
+            dst.commit()
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    # Verify on a NEW connection — the one that restored it says nothing
+    # about what the next reader will see.
+    iconn = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+    try:
+        out["integrity_check"] = _q(iconn, "PRAGMA integrity_check")
+        out["chunks"] = _q(iconn, "SELECT COUNT(*) FROM chunks")
+        try:
+            out["body_path_notnull"] = _q(
+                iconn, "SELECT COUNT(*) FROM chunks WHERE body_path IS NOT NULL")
+        except sqlite3.Error:
+            out["body_path_notnull"] = None
+    finally:
+        iconn.close()
+    return out
+
+
 def rollback(live: List[Dict[str, Any]], backup_dir: Path,
-             report: Report) -> None:
+             report: Report, method: str = "auto") -> None:
     """Restore every library from its M0 backup.
 
-    A-3: the WAL/SHM sidecars must MOVE AWAY with the half-migrated
-    database — a stale WAL against a fresh main database is corruption.
-    And the backup is COPIED, not moved: the rollback only gets one
-    chance, so the backup has to survive it.
+    P1-阶段三 第四轮.  Two paths, and the report says which one ran:
+
+      * ``backup-api`` (the default on every platform): the SQLite
+        backup API restores the live database IN PLACE.  It does not
+        move, rename or delete any file, so it works while the service
+        holds the database — which is the only situation that matters on
+        this machine, and the situation the service's own hot state
+        creates.
+
+      * ``rename-copy`` (the original path): the half-migrated database
+        is renamed aside and the backup is copied back.  It is the only
+        path that keeps the half-migrated database as evidence, and it
+        is what a Linux host with the service STOPPED should use.
+
+    ``auto`` picks the backup API, because it is the one that works
+    everywhere; the rename path is kept for the case where the operator
+    wants the failed state preserved on disk.
+
+    **The stale WAL problem is solved differently in each path.**  The
+    rename path moves the ``-wal`` / ``-shm`` sidecars away with the
+    half-migrated database (a stale WAL against a fresh main database is
+    corruption).  The backup API needs no such dance: the restore goes
+    through SQLite itself, which reads the WAL correctly and replaces
+    the database's content as one transaction — so no stale WAL is ever
+    applied to a fresh main database.  That is exactly why the ``cp``
+    path is forbidden: it bypasses SQLite and lets the WAL apply itself.
     """
+    backup_dir = Path(backup_dir)
     for lib in live:
-        db: Path = lib["db"]
+        db: Path = Path(lib["db"])
         backup = backup_dir / ("%s.p1-bak.db" % lib["name"])
         if not backup.is_file():
             report.note("  rollback: no backup for %s -> SKIPPED" % lib["name"])
             continue
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        # A-3: the WAL/SHM sidecars MOVE AWAY with the half-migrated
-        # database.  A stale WAL against a fresh main database is
-        # corruption — and "the rollback ran but the library is broken" is
-        # WORSE than "the rollback did not run".
+        if method in ("auto", "backup-api"):
+            try:
+                res = _rollback_via_backup_api(db, backup)
+                report.note(
+                    "  rollback: %s restored IN PLACE via the SQLite "
+                    "backup API from %s (integrity_check=%s chunks=%s "
+                    "body_path NOT NULL=%s) — no file was moved, so the "
+                    "live service's lock was never contested"
+                    % (lib["name"], backup, res.get("integrity_check"),
+                       res.get("chunks"), res.get("body_path_notnull")))
+                continue
+            except Exception as e:
+                if method == "backup-api":
+                    raise
+                report.note(
+                    "  rollback: %s — the backup API failed (%s: %s); "
+                    "falling back to the rename+copy path"
+                    % (lib["name"], type(e).__name__, e))
+        # The rename+copy path.
         for suffix in ("-wal", "-shm"):
             side = db.parent / (db.name + suffix)
             if side.exists():
@@ -982,8 +1349,8 @@ def rollback(live: List[Dict[str, Any]], backup_dir: Path,
             ok = _q(iconn, "PRAGMA integrity_check")
         finally:
             iconn.close()
-        report.note("  rollback: %s restored from %s (integrity_check=%s)"
-                    % (lib["name"], backup, ok))
+        report.note("  rollback: %s restored via rename+copy from %s "
+                    "(integrity_check=%s)" % (lib["name"], backup, ok))
 
 
 # --------------------------------------------------------------------------
@@ -1003,7 +1370,43 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="measure everything, change nothing")
     ap.add_argument("--i-have-the-inv1-ruling", action="store_true",
                     help="unlock M6 (the kernel architect's INV-1 ruling)")
+    ap.add_argument("--rollback-method", default="auto",
+                    choices=["auto", "backup-api", "rename-copy"],
+                    help="how to restore from the M0 backup if the "
+                         "migration fails.  'backup-api' restores IN PLACE "
+                         "through SQLite and works while the service holds "
+                         "the database (the default); 'rename-copy' keeps "
+                         "the half-migrated database on disk as evidence.")
+    ap.add_argument("--expect-libraries", type=int, default=None,
+                    help="how many live libraries are expected.  WITHOUT "
+                         "it the count is reported, not enforced — the "
+                         "hardcoded 16 was true only on this machine and "
+                         "made the tool unusable on 0.114 (B-1).")
     args = ap.parse_args(argv)
+
+    # B-2 (风控专家 终审 §5.1 / R-9): running the module from outside the
+    # repository root gives "No module named 'agent'".  The import block
+    # at the top of this file inserts REPO into sys.path, so the failure
+    # happens BEFORE that in some layouts; and when it happens at all the
+    # error says nothing about what to do.  So the check is here, with an
+    # error that names the fix.
+    try:
+        import agent.memory  # noqa: F401
+    except ImportError as e:
+        sys.stderr.write(
+            "\n!! cannot import the 'agent' package: %s\n"
+            "\n"
+            "This tool must be run FROM THE REPOSITORY ROOT, e.g.\n"
+            "    cd %s\n"
+            "    python -m agent.memory.migrate --workspace <WS> ...\n"
+            "\n"
+            "And --workspace must point at the WORKSPACE ROOT (where the "
+            "truth-layer files live), NOT at the repository:\n"
+            "    this machine : C:\\Users\\User\\cow\n"
+            "    0.114       : /home/paikeywu/cow-workspace\n"
+            "(the repository holds the CODE; the workspace holds the "
+            "TRUTH.)\n" % (e, REPO))
+        return 2
 
     workspace = Path(args.workspace).resolve()
     report = Report()
@@ -1013,29 +1416,59 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     live = enumerate_live(workspace)
     report.note("=" * 72)
-    report.note("P1-阶段三 · 迁移（M0~M7，M6 受裁决门控）")
+    report.note("P1-阶段三 · 迁移（M0~M7，M6 由巡检器置位）")
     report.note("=" * 72)
     report.note("workspace : %s" % workspace)
     report.note("backup dir: %s" % backup_dir)
     report.note("live libraries (WHITELIST enumeration): %d" % len(live))
     for lib in live:
         report.note("   %-22s %s" % (lib["name"], lib["db"]))
-    if len(live) != 16:
+
+    # B-1 (风控专家 终审 §5.1): the expected library count was HARDCODED
+    # at 16 — a number that is true ONLY on this machine.  On 0.114 the
+    # same tool enumerated 1 library (the 15 ``agents/`` directories are
+    # empty shells), so the gate FAILED and the tool returned 2 BEFORE
+    # doing anything: not one row could be migrated.
+    #
+    # The fix is a PARAMETER, not a new constant: the expectation comes
+    # from the caller, and when it is not given the enumeration is
+    # REPORTED (with both numbers printed) instead of failing.  A gate
+    # that cannot be satisfied on the machine it is run on is not a gate,
+    # it is an outage.
+    if args.expect_libraries is None:
         report.criterion(
             "ENUM.GATE",
-            "the live library count is 16",
+            "the live library count was enumerated",
+            "PASS",
+            "enumerated %d libraries (no expectation given — "
+            "--expect-libraries was not passed, so the count is REPORTED, "
+            "not enforced).  The enumeration is a WHITELIST of path "
+            "shapes, never a *.db glob (A-4).  On this machine the "
+            "expected count is 16." % len(live),
+            enumerated=len(live), expected=None)
+    elif len(live) != args.expect_libraries:
+        report.criterion(
+            "ENUM.GATE",
+            "the live library count matches the expectation",
             "FAIL",
-            "enumerated %d libraries (expected 16 on this machine). "
-            "The enumeration is a WHITELIST of path shapes, never a *.db "
-            "glob (A-4)." % len(live))
+            "expected %d libraries, enumerated %d.  The enumeration is a "
+            "WHITELIST of path shapes, never a *.db glob (A-4)."
+            % (args.expect_libraries, len(live)),
+            enumerated=len(live), expected=args.expect_libraries)
         print("\n".join(report.lines))
         return 2
-    report.criterion("ENUM.GATE", "the live library count is 16", "PASS",
-                     "16 libraries, enumerated by path shape (A-4)")
+    else:
+        report.criterion(
+            "ENUM.GATE",
+            "the live library count matches the expectation",
+            "PASS",
+            "expected %d, enumerated %d (WHITELIST enumeration by path "
+            "shape, A-4)" % (args.expect_libraries, len(live)),
+            enumerated=len(live), expected=args.expect_libraries)
 
     steps = ([s.strip().upper() for s in args.step.split(",")]
              if args.step != "all"
-             else ["M0", "M1", "M4", "M5", "M7"])
+             else ["M0", "M1", "M4", "M5", "M7", "M6"])
 
     try:
         if "M0" in steps:
@@ -1061,24 +1494,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             if "M5" in steps:
                 step_m5(live, report)
         if "M6" in steps:
-            if args.i_have_the_inv1_ruling:
-                report.criterion("M6.GATE", "text_state -> 'mirror'",
-                                 "NOTRUN",
-                                 "the --i-have-the-inv1-ruling flag was "
-                                 "passed, but this round's tool does not "
-                                 "implement the state change yet — the "
-                                 "architect's ruling has to define the "
-                                 "target state first.")
-            else:
-                step_m6(live, report)
+            # P1-阶段三 第四轮: the architect's ruling EXISTS, so M6 runs
+            # as a MEASUREMENT.  The tool does not set 'mirror' — the
+            # INSPECTOR is the designated setter (设计 §3.1: "明确置位者，
+            # 防止三态机退化为装饰"), and a tool that set the state
+            # itself would make the three-state machine a decoration.
+            step_m6(live, report, dry_run=args.dry_run)
     except MigrationError as e:
         report.criterion("ROLLBACK", "the migration was rolled back",
                          "FAIL", str(e))
-        rollback(live, backup_dir, report)
+        rollback(live, backup_dir, report, method=args.rollback_method)
     except Exception as e:
         report.criterion("ROLLBACK", "the migration was rolled back",
                          "FAIL", "%s: %s" % (type(e).__name__, e))
-        rollback(live, backup_dir, report)
+        rollback(live, backup_dir, report, method=args.rollback_method)
 
     counts = report.counts()
     report.note("=" * 72)

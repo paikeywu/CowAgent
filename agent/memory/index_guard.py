@@ -310,8 +310,12 @@ def _build_trigger_sql() -> List[str]:
         f"ELSE NULL END, "
         # P1-阶段一 (M2): carry the externalization columns through — a
         # corrected row must not come back with text_state=NULL.
+        # P1-阶段三 第四轮: body_origin travels with them — a corrected row
+        # that dropped the origin would read as 'unresolved' and send the
+        # inspector looking for a decision nobody made.
         "NEW.body_path, NEW.body_anchor, NEW.body_hash, "
-        "COALESCE(NEW.text_state, 'projection')"
+        "COALESCE(NEW.text_state, 'projection'), "
+        "COALESCE(NEW.body_origin, 'unresolved')"
     )
 
     # Self-registration: a dark page whose chunks are indexed BEFORE this
@@ -349,7 +353,7 @@ def _build_trigger_sql() -> List[str]:
     cols = ("id, user_id, scope, source, path, start_line, end_line, text, "
             "embedding, hash, metadata, updated_at, file_sealed, "
             "element_released, sealed_owner, body_path, body_anchor, "
-            "body_hash, text_state")
+            "body_hash, text_state, body_origin")
 
     insert_trigger = f"""
 CREATE TRIGGER {GUARD_TRIGGERS[0]} BEFORE INSERT ON chunks

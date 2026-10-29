@@ -84,6 +84,11 @@ EXPECTED_CHUNK_COLUMNS: Tuple[str, ...] = (
     "body_anchor",
     "body_hash",
     "text_state",
+    # P1-阶段三 第四轮: the body-origin column.  It MUST be in this list:
+    # the fingerprint is derived from the column set, so a column that is
+    # not listed is a column whose drift the fingerprint CANNOT see — the
+    # same false green as the single-table fingerprint (H2), one level down.
+    "body_origin",
 )
 
 #: The columns a migration may ADD. A column that is not in this map is
@@ -102,6 +107,11 @@ ADDABLE_COLUMNS: Dict[str, str] = {
     "body_anchor": "TEXT",
     "body_hash": "TEXT",
     "text_state": "TEXT NOT NULL DEFAULT 'projection'",
+    # P1-阶段三 第四轮: NOT NULL with an explicit 'unresolved' default.
+    # A nullable column would make "not judged yet" and "judged, and the
+    # answer is nothing" indistinguishable in SQL — and the whole point of
+    # the column is to make "not judged yet" a VISIBLE TODO.
+    "body_origin": "TEXT NOT NULL DEFAULT 'unresolved'",
 }
 
 #: The columns the current code expects on ``files``.

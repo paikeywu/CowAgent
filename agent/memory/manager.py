@@ -853,7 +853,7 @@ class MemoryManager:
             # The path is the row's OWN key; it is checked with the ONE
             # path-safety rule (agent.memory.paths), never with a second
             # spelling of it.
-            body_path, body_anchor, body_hash, text_state = (
+            body_path, body_anchor, body_hash, text_state, body_origin = (
                 self._body_columns_for(
                     relpath=path,
                     start_line=chunk.start_line,
@@ -861,6 +861,8 @@ class MemoryManager:
                     part=chunk.part,
                     chunk_text=chunk.text,
                     workspace_root=None,
+                    segments=list(chunk.segments or []),
+                    gaps=list(chunk.gaps or []),
                 )
             )
 
@@ -880,6 +882,7 @@ class MemoryManager:
                 body_anchor=body_anchor,
                 body_hash=body_hash,
                 text_state=text_state,
+                body_origin=body_origin,
             ))
         
         # Save to storage
@@ -1312,7 +1315,7 @@ class MemoryManager:
                 # from, and the workspace root is the root the path is
                 # relative to.  The path-safety rule is the ONE rule
                 # (agent.memory.paths) — not a second spelling.
-                body_path, body_anchor, body_hash, text_state = (
+                body_path, body_anchor, body_hash, text_state, body_origin = (
                     self._body_columns_for(
                         relpath=rel_path,
                         start_line=chunk.start_line,
@@ -1321,6 +1324,8 @@ class MemoryManager:
                         chunk_text=chunk.text,
                         workspace_root=workspace_dir_path,
                         source_file=entry.get("file_path"),
+                        segments=list(chunk.segments or []),
+                        gaps=list(chunk.gaps or []),
                     )
                 )
                 memory_chunks.append(MemoryChunk(
@@ -1346,6 +1351,7 @@ class MemoryManager:
                     body_anchor=body_anchor,
                     body_hash=body_hash,
                     text_state=text_state,
+                    body_origin=body_origin,
                 ))
             self.storage.save_chunks_batch(memory_chunks)
             stat = entry["file_path"].stat()
@@ -1582,11 +1588,13 @@ class MemoryManager:
         chunk_text: str,
         workspace_root: Optional[Path],
         source_file: Optional[Path] = None,
-    ) -> Tuple[Optional[str], Optional[str], Optional[str], str]:
-        """The four body-externalization columns for one chunk row.
+        segments: Optional[List[Tuple[int, int]]] = None,
+        gaps: Optional[List[int]] = None,
+    ) -> Tuple[Optional[str], Optional[str], Optional[str], str, str]:
+        """The body-externalization columns for one chunk row.
 
         P1-阶段三 (H1 · C-A2).  Returns
-        ``(body_path, body_anchor, body_hash, text_state)``.
+        ``(body_path, body_anchor, body_hash, text_state, body_origin)``.
 
         The knowledge of HOW to build them lives in
         ``agent.memory.body_pointer`` — the ONE module — so the two writers
@@ -1598,35 +1606,29 @@ class MemoryManager:
         row": ``add_memory`` stores a blob of text under a synthetic path
         without writing a file.  Such a row carries no ``body_path`` (there
         is nothing to point at) but still carries an anchor and a drift
-        token, so it is not four empty columns.
+        token, so it is not four empty columns — and its origin is
+        ``'blob'``, which says **honestly** that there is no truth source
+        (as opposed to ``'unresolved'``, which says nobody has decided).
 
         ``source_file`` is the absolute path of the file the chunk was cut
         from.  It is used to read the fragment, so the hash is computed from
         the SAME bytes the invariant checker will read back (INV-3).
+
+        P1-阶段三 第四轮: ``segments`` / ``gaps`` carry the chunk's segment
+        sequence into the anchor — a chunk assembled from several
+        non-contiguous line ranges cannot be located by a bare line span.
         """
-        from agent.memory.body_pointer import four_columns_for_chunk
+        from agent.memory.body_pointer import five_columns_for_chunk
 
-        if workspace_root is None:
-            # No truth file behind this row: anchor + hash of the chunk's
-            # own text, and no body_path (there is no file to point at).
-            from agent.memory.body_pointer import (
-                STATE_PROJECTION,
-                body_anchor,
-                body_hash,
-            )
-
-            return (None,
-                    body_anchor(start_line, end_line, part),
-                    body_hash(chunk_text),
-                    STATE_PROJECTION)
-
-        return four_columns_for_chunk(
+        return five_columns_for_chunk(
             workspace_root=workspace_root,
             relpath=relpath,
             start_line=start_line,
             end_line=end_line,
             part=part,
             chunk_text=chunk_text,
+            segments=segments,
+            gaps=gaps,
         )
 
     def _generate_chunk_id(self, path: str, start_line: int, end_line: int,

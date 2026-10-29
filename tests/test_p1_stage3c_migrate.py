@@ -129,14 +129,14 @@ def test_a1_backfill_is_conditional_and_skips_a_concurrently_changed_row(
     conn.commit()
 
     # Now the backfill runs with the STALE hash it read.
-    bp, anchor, bh, state = four_columns_for_chunk(
+    bp, anchor, bh, state, origin = four_columns_for_chunk(
         workspace_root=ws, relpath=row["path"],
         start_line=int(row["start_line"]), end_line=int(row["end_line"]),
         part=0, chunk_text=row["text"] or "")
     cur = conn.execute(
         "UPDATE chunks SET body_path=?, body_anchor=?, body_hash=?, "
-        "text_state=? WHERE id=? AND hash=?",
-        (bp, anchor, bh, state, row["id"], old_hash))
+        "text_state=?, body_origin=? WHERE id=? AND hash=?",
+        (bp, anchor, bh, state, origin, row["id"], old_hash))
     assert cur.rowcount == 0, (
         "the conditional backfill OVERWROTE a concurrently changed row — "
         "the WHERE clause must carry the old hash")
@@ -157,14 +157,14 @@ def test_a1_backfill_fills_the_four_columns(tmp_path):
     for row in conn.execute(
             "SELECT id, path, start_line, end_line, text, hash FROM chunks "
             "WHERE body_path IS NULL").fetchall():
-        bp, anchor, bh, state = four_columns_for_chunk(
+        bp, anchor, bh, state, origin = four_columns_for_chunk(
             workspace_root=ws, relpath=row["path"],
             start_line=int(row["start_line"]), end_line=int(row["end_line"]),
             part=0, chunk_text=row["text"] or "")
         cur = conn.execute(
             "UPDATE chunks SET body_path=?, body_anchor=?, body_hash=?, "
-            "text_state=? WHERE id=? AND hash=?",
-            (bp, anchor, bh, state, row["id"], row["hash"]))
+            "text_state=?, body_origin=? WHERE id=? AND hash=?",
+            (bp, anchor, bh, state, origin, row["id"], row["hash"]))
         assert cur.rowcount == 1
     conn.commit()
     left = conn.execute(
@@ -178,16 +178,20 @@ def test_a1_backfill_fills_the_four_columns(tmp_path):
 # --------------------------------------------------------------------------
 
 def test_m5_measures_the_checkers_own_contract(tmp_path):
-    """M5 must not be stricter than the invariant it protects.
+    """M5 measures BYTE equality — and the byte count is reported.
 
-    Measured on the live corpus: the rows the shipped writer produced
-    are byte-equal 0/17 and canonically-equal 17/17.  So a byte-equal
-    M5 would report RED on a perfectly healthy corpus — and a criterion
-    that always reports RED is a criterion nobody trusts afterwards.
+    P1-阶段三 第四轮: the previous round's yardstick was the CANONICAL
+    form, because at that time the raw bytes could not be equal (the
+    markdown chunker joins segments with a blank line and a bare line
+    span cannot express that).  The anchor grammar now CAN express it
+    (the ``+S`` segment sequence), so the byte form is reachable — and
+    measured over the 16 live libraries it is reached: 2349 / 2349
+    byte-equal.
 
-    This test pins the contract: the chunker's own multi-segment join
-    must NOT make the row fail, and the byte count must still be
-    reported.
+    So the criterion now demands BYTE equality, and this test pins that
+    contract: a row whose anchor carries the segment sequence must be
+    byte-equal, and the canonical count must be reported BESIDE the byte
+    count (never instead of it).
     """
     ws, db, rows = _tiny_library(tmp_path)
     conn = sqlite3.connect(str(db))
@@ -195,14 +199,14 @@ def test_m5_measures_the_checkers_own_contract(tmp_path):
     for row in conn.execute(
             "SELECT id, path, start_line, end_line, text, hash FROM chunks "
             "WHERE body_path IS NULL").fetchall():
-        bp, anchor, bh, state = four_columns_for_chunk(
+        bp, anchor, bh, state, origin = four_columns_for_chunk(
             workspace_root=ws, relpath=row["path"],
             start_line=int(row["start_line"]), end_line=int(row["end_line"]),
             part=0, chunk_text=row["text"] or "")
         conn.execute(
             "UPDATE chunks SET body_path=?, body_anchor=?, body_hash=?, "
-            "text_state=? WHERE id=? AND hash=?",
-            (bp, anchor, bh, state, row["id"], row["hash"]))
+            "text_state=?, body_origin=? WHERE id=? AND hash=?",
+            (bp, anchor, bh, state, origin, row["id"], row["hash"]))
     conn.commit()
 
     report = migrate.Report()
@@ -212,6 +216,12 @@ def test_m5_measures_the_checkers_own_contract(tmp_path):
     assert crit["equal"] == crit["rows"]
     # The byte count is reported alongside (not hidden).
     assert "byte_equal" in crit
+    # P1-阶段三 第四轮: the byte form is now REACHABLE, so the criterion
+    # demands it — and the canonical count is printed beside it.
+    assert crit["byte_equal"] == crit["rows"], (
+        "the byte-equal count must cover every row — the anchor's segment "
+        "sequence makes the raw bytes reconstructible")
+    assert crit["canon_equal"] == crit["rows"]
 
 
 # --------------------------------------------------------------------------
@@ -258,19 +268,65 @@ def test_reverse_case_the_pre_migration_library_fails_the_m4_count(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# M6 is GATED.
+# M6 — the ruling EXISTS now, so M6 MEASURES (and never sets).
 # --------------------------------------------------------------------------
 
-def test_m6_is_gated_without_the_ruling(tmp_path):
-    """M6 must be NOTRUN, never executed, without the ruling."""
-    ws = tmp_path / "ws"
-    (ws / "memory" / "long-term").mkdir(parents=True)
-    live = migrate.enumerate_live(ws)
+def test_m6_measures_the_new_criterion_and_never_sets_the_state(tmp_path):
+    """M6 runs, measures, and does NOT set 'mirror' itself.
+
+    P1-阶段三 第四轮: the architect's ruling replaced the old criterion
+    ("every row is 'mirror'"), which was IMPOSSIBLE to satisfy once a
+    blob row exists — a blob row has no truth source to mirror.
+
+    The new criterion::
+
+        body_origin='file' AND text_state<>'mirror'  == 0
+        AND body_origin='unresolved'                  == 0
+        AND body_origin='orphan'                      == 0
+
+    And the SETTER is the inspector, not this tool (设计 §3.1: 明确置位者,
+    防止三态机退化为装饰).  A migration that set the state itself would
+    make the three-state machine a decoration — so the tool must MEASURE
+    and report, and must leave ``text_state`` alone.
+    """
+    ws, db, rows = _tiny_library(tmp_path)
+    # Fill the body columns the way the backfill does.
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    for row in conn.execute(
+            "SELECT id, path, start_line, end_line, text, hash FROM chunks"
+    ).fetchall():
+        bp, anchor, bh, state, origin = four_columns_for_chunk(
+            workspace_root=ws, relpath=row["path"],
+            start_line=int(row["start_line"]), end_line=int(row["end_line"]),
+            part=0, chunk_text=row["text"] or "")
+        conn.execute(
+            "UPDATE chunks SET body_path=?, body_anchor=?, body_hash=?, "
+            "text_state=?, body_origin=? WHERE id=?",
+            (bp, anchor, bh, state, origin, row["id"]))
+    conn.commit()
+    conn.close()
+
     report = migrate.Report()
-    migrate.step_m6(live, report)
+    migrate.step_m6([{"name": "t", "db": db, "workspace": ws}], report)
     crit = report.criteria[0]
-    assert crit["state"] == "NOTRUN"
-    assert "INV-1" in crit["detail"]
+    # It RAN (not NOTRUN) and it REPORTED the numbers.
+    assert crit["state"] in ("PASS", "FAIL"), crit
+    assert crit["rows"] == len(rows)
+    assert "file_not_mirror" in crit
+    assert "unresolved" in crit
+    assert "orphan" in crit
+    # The state was NOT set by the migration: every row is still
+    # 'projection', because the INSPECTOR is the designated setter.
+    conn = sqlite3.connect(str(db))
+    states = dict(conn.execute(
+        "SELECT text_state, COUNT(*) FROM chunks GROUP BY text_state"
+    ).fetchall())
+    conn.close()
+    assert set(states) == {"projection"}, (
+        "the migration set text_state itself — the designated setter is "
+        "the INSPECTOR (设计 §3.1); a tool that sets it makes the "
+        "three-state machine a decoration: %r" % (states,))
 
 
 # --------------------------------------------------------------------------

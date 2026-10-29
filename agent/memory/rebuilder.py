@@ -232,13 +232,22 @@ def rebuild_file(
         # re-assembled chunk the two differ, and the result was the
         # same fact reported twice: INV-2 RED (the truth) AND INV-3 RED
         # (which looks like corruption).  One definition, one hash.
-        body_path, body_anchor, body_hash, text_state = four_columns_for_chunk(
-            workspace_root=workspace,
-            relpath=rel,
-            start_line=pc.start_line,
-            end_line=pc.end_line,
-            part=pc.part,
-            chunk_text=pc.text,
+        body_path, body_anchor, body_hash, text_state, body_origin = (
+            four_columns_for_chunk(
+                workspace_root=workspace,
+                relpath=rel,
+                start_line=pc.start_line,
+                end_line=pc.end_line,
+                part=pc.part,
+                chunk_text=pc.text,
+                # P1-阶段三 第四轮: the segment sequence.  A rebuild that
+                # drops it would write a bare span for a chunk that was
+                # assembled from several ranges — and the reader would
+                # rebuild the wrong text.  The rebuilt anchor must carry
+                # the same information the chunker produced.
+                segments=list(pc.segments or []),
+                gaps=list(pc.gaps or []),
+            )
         )
         chunks.append(MemoryChunk(
             id=cid,
@@ -263,6 +272,7 @@ def rebuild_file(
                                                       pc.end_line, pc.part),
             body_hash=body_hash or _body_hash(pc.text),
             text_state=text_state or STATE_PROJECTION,
+            body_origin=body_origin,
         ))
 
     try:
@@ -311,13 +321,23 @@ def _rel_key_for(fp: Path, workspace_root: Path) -> str:
     pointer that points nowhere.
     """
     from agent.memory.paths import normalize_relpath
-    from agent.memory.body_pointer import _knowledge_dir
+    from agent.memory.body_pointer import _knowledge_dirs
 
-    fp_resolved = fp.resolve()
+    fp_resolved = Path(fp).resolve()
     ws_resolved = Path(workspace_root).resolve()
 
-    knowledge_dir = _knowledge_dir(workspace_root)
-    if knowledge_dir is not None:
+    # P1-阶段三 第四轮: EVERY knowledge directory is a candidate, not just
+    # the one ``_knowledge_dir`` happens to name.  The same shadowing
+    # defect that broke ``resolve_truth_file`` broke this inverse rule:
+    # an agent that has a ``knowledge/`` directory of its own could not
+    # be given an index key for a file in the SHARED tree, and the
+    # rebuild failed with "truth file ... is outside the workspace" —
+    # measured: 70 rebuild errors in ``agents/agent-mvnewfyb``.
+    #
+    # The two rules must stay INVERSES of each other (that is what the
+    # comment above says), so they must consult the SAME set of
+    # directories.  Both now call ``_knowledge_dirs``.
+    for knowledge_dir in _knowledge_dirs(workspace_root):
         try:
             rel_to_knowledge = fp_resolved.relative_to(
                 Path(knowledge_dir).resolve())
@@ -328,7 +348,7 @@ def _rel_key_for(fp: Path, workspace_root: Path) -> str:
                     "unsafe body_path %r (backslash / absolute / '..')" % key)
             return safe
         except ValueError:
-            pass
+            continue
 
     try:
         rel = fp_resolved.relative_to(ws_resolved).as_posix()
