@@ -39,6 +39,7 @@ from common.log import logger
 
 from agent.memory.chunker import TextChunker
 from agent.memory.naming import canonical_text
+from agent.memory import changes
 from agent.memory.storage import MemoryChunk, MemoryStorage
 
 #: The chunker version stamped into ``files.chunker_version``. Bump it when the
@@ -211,6 +212,10 @@ def rebuild_file(
             f"old projection kept")
         _audit_marker(workspace, rel, str(e))
         raise RebuildError(f"rebuild of {rel} failed, old projection kept: {e}") from e
+
+    # T2: the rebuild consumed a truth-layer change — record it in the single
+    # change log so the index projection and the shelf read the SAME record.
+    changes.record_change(workspace, rel, "rebuilder")
 
     return {
         "path": rel,

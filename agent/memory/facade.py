@@ -49,6 +49,7 @@ from agent.memory.facts_refs import (
     feeling_run_id,
 )
 from agent.memory.frontmatter import split_frontmatter
+from agent.memory import changes
 from agent.memory.visibility import (
     READ_RELEASED,
     READ_SEALED,
@@ -615,6 +616,11 @@ class WriteFacade:
         except FacadeError as e:
             raise self._reject(e, "write", relpath)
         self._audit("write", relpath, "ok", "")
+        # T2: every facade write records one change event in the single
+        # change log — the two projections read the SAME record, never
+        # re-derive it (创意 B2). No write-time rebuild (P0 拍板).
+        changes.record_change(self.workspace_root, relpath, "facade-write",
+                              actor=self.actor)
         return real
 
     # -- facts: append-only JSONL (WR-13..16, P0-1 §3) -----------------------
@@ -1345,6 +1351,9 @@ class WriteFacade:
                        "body_sha256": "sha256:" + _sha256_hex(new_body),
                        "hash8": str(new_fm.get("hash8") or "")[:8]},
             )
+            # T2: the import IS a file change — record it in the single log.
+            changes.record_change(self.workspace_root, relpath,
+                                  "import-human-edit", actor="human")
         except FacadeError as e:
             raise self._reject(e, "import_human_edit", relpath)
         return real

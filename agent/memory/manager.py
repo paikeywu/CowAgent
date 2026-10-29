@@ -148,6 +148,15 @@ class MemoryManager:
         # Cache for query embeddings (avoids redundant API calls within a session)
         self._embedding_cache = EmbeddingCache()
 
+        # P1 阶段二-B T3: the read-path freshness probe. Cached (P1-N2: a flood
+        # of hits must not self-DoS on repeated stat). Retrieval is
+        # fail-visible; content endpoints are fail-closed (风控 T3 裁决).
+        try:
+            from agent.memory.freshness import FreshnessProbe
+            self._freshness = FreshnessProbe(self.config.get_workspace())
+        except Exception:
+            self._freshness = None
+
         # Optional reranker; None means un-reranked retrieval
         self.reranker = reranker
 
@@ -645,8 +654,73 @@ class MemoryManager:
             except Exception as e:
                 logger.warning(f"[MemoryManager] Hit write-back failed: {e}")
 
+        # P1 阶段二-B T3: read-path freshness probe on the RETRIEVAL channel.
+        # Fail-VISIBLE: stale candidates are still returned (retrieval has
+        # many candidates + metadata) but each is flagged and the stale
+        # counter rises, so get_status() self-reports the drift (风控: 自曝
+        # 不能是撞运气自曝). Content endpoints use read_content_fresh() which
+        # is fail-CLOSED.
+        if top and self._freshness is not None:
+            try:
+                mtime_by_path = self._files_mtime_map(
+                    {r.path for r in top})
+                for r in top:
+                    r.stale = self._freshness.is_stale(
+                        r.path, mtime_by_path.get(r.path))
+            except Exception as e:
+                # The probe must never break retrieval — a probe failure is
+                # logged, the results still returned (fail-visible channel).
+                logger.warning(f"[MemoryManager] freshness probe failed: {e}")
+
         return top
-    
+
+    def _files_mtime_map(self, paths) -> Dict[str, Optional[float]]:
+        """files.mtime for the given paths, one query. Missing -> None."""
+        out: Dict[str, Optional[float]] = {}
+        try:
+            for p in paths:
+                row = self.storage.conn.execute(
+                    "SELECT mtime FROM files WHERE path=?", (p,)).fetchone()
+                out[p] = float(row[0]) if row and row[0] is not None else None
+        except Exception:
+            pass
+        return out
+
+    def read_content_fresh(self, relpath: str) -> Dict[str, Any]:
+        """Content endpoint (fail-CLOSED): serve the truth file only if fresh.
+
+        风控 T3 裁决: a content/drill-down/readability endpoint must NOT serve
+        stale content — returning old content as if it were fact is worse than
+        refusing. So when the truth file is newer than the index recorded
+        (or unreadable), this refuses with ok=False + reason, instead of
+        serving. Returns the fresh body text when ok=True.
+        """
+        norm = relpath.replace("\\", "/").lstrip("/")
+        indexed = self._files_mtime_map({norm}).get(norm)
+        if self._freshness is None:
+            return {"ok": False, "path": norm,
+                    "reason": "freshness probe unavailable (fail-closed)"}
+        if self._freshness.is_stale(norm, indexed):
+            return {"ok": False, "path": norm, "stale": True,
+                    "reason": "content is stale (index behind truth file); "
+                              "refusing to serve old content as fact"}
+        real = self.config.get_workspace() / norm
+        try:
+            body = real.read_text(encoding="utf-8")
+        except OSError as e:
+            return {"ok": False, "path": norm,
+                    "reason": f"truth file unreadable: {e}"}
+        return {"ok": True, "path": norm, "stale": False, "content": body}
+
+    def get_freshness_status(self) -> Dict[str, Any]:
+        """The probe counters, for get_status()."""
+        if self._freshness is None:
+            return {"checked": 0, "stale": 0, "cache_hits": 0,
+                    "probe": "unavailable"}
+        s = self._freshness.status()
+        s["probe"] = "active"
+        return s
+
     async def add_memory(
         self,
         content: str,
@@ -1324,6 +1398,10 @@ class MemoryManager:
                 if degraded else ''
             ),
             'schema_fingerprint': schema_fp,
+            # P1 阶段二-B T3: the read-path freshness probe counters — stale
+            # hits must be self-reported, not discovered by luck (风控: 自曝
+            # 不能是撞运气自曝).
+            'freshness': self.get_freshness_status(),
             'embedding_coverage': (
                 round(embedded / chunks, 4) if chunks else 0.0
             ),

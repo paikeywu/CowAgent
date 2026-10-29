@@ -24,12 +24,20 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from agent.memory.naming import canonical_text
 
+# T2: the shelf-lag invariant reads the single change log the facade /
+# import_human_edit / rebuilder all write to — the two projections read the
+# SAME record, never their own (SEED 裁决: no write-time rebuild, the P0
+# batch-rebuild contract stands).
+from agent.memory import changes as _changes
+
 REASON_INV1 = "gap-rule:inv1-pointer-missing"
 REASON_INV2 = "gap-rule:inv2-body-not-rebuildable"
 REASON_INV3 = "gap-rule:inv3-fragment-hash-mismatch"
 REASON_INV6 = "gap-rule:inv6-time-disorder"
 REASON_INV9 = "gap-rule:inv9-release-no-consent"
 REASON_INV11 = "gap-rule:inv11-unsafe-path"
+# T2: shelf lags the truth layer (真源变了，书架还没 batch 重建)。
+REASON_SHELF_LAG = "gap-rule:shelf-lag"
 
 CODE_INV1 = "inv1-pointer-missing"
 CODE_INV2 = "inv2-body-not-rebuildable"
@@ -37,6 +45,7 @@ CODE_INV3 = "inv3-fragment-hash-mismatch"
 CODE_INV6 = "inv6-time-disorder"
 CODE_INV9 = "inv9-release-no-consent"
 CODE_INV11 = "inv11-unsafe-path"
+CODE_SHELF_LAG = "shelf-lag"
 
 _EXTERNALIZED_STATES = ("projection", "mirror")
 
@@ -350,6 +359,59 @@ def check_inv11(conn: sqlite3.Connection, root: Path) -> Dict[str, Any]:
             "fingerprint": fp, "violations": out}
 
 
+def check_shelf_lag(root: Path) -> Dict[str, Any]:
+    """T2 shelf 滞后判据：真源变更晚于 shelf 页 generated_at → 报红。
+
+    P0 拍板：书架是投影、批量全量重建、无写时增量。这条判据兜住时序——
+    它不触发重建，只在「最新一次真源变更晚于最新 shelf 页的 generated_at」
+    时报红，提示该跑 batch 重建了。变更时间取自单一变更记录点（同一份
+    记录，索引投影也读它）；shelf 页时间取自 shelf/*.md front-matter 的
+    ``generated_at``。
+    """
+    from agent.memory.facade import split_frontmatter  # local import: no cycle
+    latest = _changes.latest_change_mtime(root)
+    if latest is None:
+        return {"inv": "SHELF-LAG", "verdict": "NOTRUN",
+                "fingerprint": "no-change-events", "violations": []}
+    shelf_dir = root / "memory" / "shelf"
+    if not shelf_dir.is_dir():
+        # Truth changed but no shelf exists at all -> the shelf is maximally
+        # behind. Report it (this is the T2 red case before any batch rebuild).
+        return {"inv": "SHELF-LAG", "verdict": "RED",
+                "fingerprint": f"latest-change={latest}",
+                "violations": [_v(REASON_SHELF_LAG, CODE_SHELF_LAG,
+                                  "memory/shelf",
+                                  f"truth-layer change at {latest} but no "
+                                  f"shelf directory exists — run a batch "
+                                  f"rebuild", "MID")]}
+    generated: List[str] = []
+    for page in sorted(shelf_dir.glob("*.md")):
+        try:
+            fm, _ = split_frontmatter(page.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            continue
+        ga = fm.get("generated_at")
+        if ga:
+            generated.append(str(ga))
+    if not generated:
+        return {"inv": "SHELF-LAG", "verdict": "RED",
+                "fingerprint": f"latest-change={latest}",
+                "violations": [_v(REASON_SHELF_LAG, CODE_SHELF_LAG,
+                                  "memory/shelf",
+                                  f"truth-layer change at {latest} but no "
+                                  f"shelf page carries generated_at", "MID")]}
+    newest_gen = max(generated)
+    lag = latest > newest_gen
+    out = [] if not lag else [
+        _v(REASON_SHELF_LAG, CODE_SHELF_LAG, "memory/shelf",
+           f"shelf is stale: latest truth-layer change {latest} is newer "
+           f"than the newest shelf page generated_at {newest_gen} — run a "
+           f"batch rebuild (P0 批量重建)", "MID")]
+    return {"inv": "SHELF-LAG", "verdict": "RED" if out else "GREEN",
+            "fingerprint": f"latest-change={latest}, newest-shelf={newest_gen}",
+            "violations": out}
+
+
 # Deferred INVs — registered, with their trigger condition. NOT implemented
 # in P1 (the element system is not shipped); listed so the report can say
 # precisely WHICH of 03 号's INVs are landed here and which are pending.
@@ -377,6 +439,8 @@ def run_text_invariants(conn: sqlite3.Connection, root: Path, *,
         "INV-6": check_inv6(conn),
         "INV-9": check_inv9(conn, root),
         "INV-11": check_inv11(conn, root),
+        # T2: shelf 滞后判据（读单一变更记录点，不依赖 chunks 表）。
+        "SHELF-LAG": check_shelf_lag(root),
     }
     violations: List[Dict[str, Any]] = []
     for c in checks.values():

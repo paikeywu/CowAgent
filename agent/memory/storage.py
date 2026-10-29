@@ -312,6 +312,10 @@ class SearchResult:
     snippet: str
     source: str
     user_id: Optional[str] = None
+    # P1 阶段二-B T3: the read-path freshness probe flags a result whose truth
+    # file is newer than the index (fail-visible retrieval keeps it but marks
+    # it). None = not probed; True/False = the probe's verdict.
+    stale: Optional[bool] = None
 
 
 class MemorySchemaError(RuntimeError):
