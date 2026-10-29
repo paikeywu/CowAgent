@@ -251,11 +251,33 @@ def judge_m4_every_library_was_backfilled(report, workspace: Path):
             detail.append("  %-22s 前置不成立: %s" % (prof["name"], prof["error"]))
             continue
         rows = int(prof.get("rows", 0))
-        nulls = int(prof.get("body_path_null", 0))
+        # --- ALL FOUR columns, one by one ---------------------------
+        #
+        # This used to assert only ``body_path`` (plus text_state's
+        # legality), while the criterion's NAME said 四列.  The gap was
+        # real and it was MEASURED (S3-H): a copy of a live library with
+        # every ``body_anchor`` set to NULL was reported PASS, because
+        # ``body_path`` was still filled.  The name was a lie and the
+        # lie was in the direction that hides a defect.
+        #
+        # The S-6 self-check did not catch it either: S-6 looks for the
+        # column name anywhere in the function body, and ``body_anchor``
+        # appeared in the DOCSTRING — so a prose mention satisfied the
+        # check.  The assertion is now explicit, and S-6 was tightened
+        # to look at CODE rather than prose.
+        per_col = {
+            "body_path": int(prof.get("body_path_null", 0)),
+            "body_anchor": int(prof.get("body_anchor_null", 0)),
+            "body_hash": int(prof.get("body_hash_null", 0)),
+        }
+        nulls = max(per_col.values())
         if rows and nulls == rows:
             wholly_unmigrated.append(prof["name"])
         elif nulls:
-            partial.append("%s(%d/%d 行)" % (prof["name"], nulls, rows))
+            broken = ", ".join("%s=%d" % (c, n)
+                               for c, n in sorted(per_col.items()) if n)
+            partial.append("%s(%d/%d 行: %s)"
+                           % (prof["name"], nulls, rows, broken))
         else:
             clean.append(prof["name"])
         # The FOURTH column: text_state must be a declared state value.
@@ -874,6 +896,101 @@ def judge_s1_criteria_do_not_modify_what_they_measure(report, workspace: Path):
         True, "\n".join(detail))
 
 
+def _strip_docstring(node, lines) -> str:
+    """A function's CODE, with its docstring removed.
+
+    The docstring is the first statement of a function when it is a
+    bare string constant.  Removing it is what makes "does the code
+    mention this column?" mean "does the code ASSERT this column?".
+    """
+    import ast
+
+    body = list(node.body)
+    if body and isinstance(body[0], ast.Expr) and \
+            isinstance(body[0].value, ast.Constant) and \
+            isinstance(body[0].value.value, str):
+        body = body[1:]
+    if not body:
+        return ""
+    try:
+        clone = ast.FunctionDef(name=node.name, args=node.args,
+                                 body=body, decorator_list=[],
+                                 returns=None, type_comment=None)
+        ast.fix_missing_locations(clone)
+        return ast.unparse(clone)
+    except Exception:
+        # Fall back to the raw source minus the docstring's lines.
+        return "\n".join(lines[node.lineno - 1:node.end_lineno])
+
+
+def _column_is_asserted_by_a_helper(code_src: str, column: str) -> bool:
+    """Is a column asserted by a HELPER the criterion calls?
+
+    Some criteria do not re-implement the check: they call a helper
+    that owns the rule.  ``S-1`` (the content digest covers the four
+    columns) calls ``acceptance.content_digest``, and the digest's
+    definition — with the column list — lives in ``__init__.py``.  The
+    criterion's OWN body therefore never names ``text_state``, and a
+    naive scan reports a false red.
+
+    So the check follows the calls: for every name the criterion calls,
+    the helper's own source is searched (transitively, one level deep
+    through the acceptance package) for the column.
+
+    The rule is deliberately narrow: the helper must be IN THE
+    ACCEPTANCE PACKAGE.  A criterion that delegates its assertion to
+    the PRODUCT (e.g. to ``text_inv``) is a different question — and
+    for those the claim is scoped out by the name, not by this helper.
+    """
+    import ast
+
+    here = Path(__file__).resolve().parent
+    try:
+        tree = ast.parse(code_src)
+    except SyntaxError:
+        return False
+    called = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            called.add(ast.unparse(node.func))
+    if not called:
+        return False
+    # The acceptance package's own modules — the only helpers a
+    # criterion may delegate a CLAIM to.
+    for path in sorted(here.glob("*.py")):
+        try:
+            src = path.read_text(encoding="utf-8")
+            htree = ast.parse(src)
+        except (SyntaxError, OSError):
+            continue
+        lines = src.splitlines()
+        for node in ast.walk(htree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if node.name not in called:
+                continue
+            try:
+                hsrc = _strip_docstring(node, lines)
+            except Exception:
+                continue
+            if column in hsrc:
+                return True
+            # The helper may READ the column from a MODULE-LEVEL
+            # constant instead of naming it in its body — and that is
+            # exactly how ``content_digest`` works: the column list
+            # lives in ``_CONTENT_COLUMNS``.  So the helper's own
+            # module's constants are searched too.
+            for const in htree.body:
+                if isinstance(const, ast.Assign):
+                    try:
+                        csrc = ast.unparse(const)
+                    except Exception:
+                        continue
+                    if column in csrc:
+                        return True
+    return False
+
+
 def judge_s6_criterion_names_say_what_they_measure(report, workspace: Path = None,
                                                   targets=None):
     """S-6 (unit): a criterion's NAME must say what it asserts.
@@ -905,7 +1022,10 @@ def judge_s6_criterion_names_say_what_they_measure(report, workspace: Path = Non
     detail = []
     here = Path(__file__).resolve()
     if targets is None:
-        targets = [here, here.parent / "phase2.py"]
+        # ALL THREE criterion files.  The S3-H module is included: a
+        # criterion that lives in a new file must not be able to slip a
+        # lying name past this check by living somewhere else.
+        targets = [here, here.parent / "phase2.py", here.parent / "phase2_s3h.py"]
     else:
         targets = [Path(t) for t in targets]
 
@@ -915,13 +1035,36 @@ def judge_s6_criterion_names_say_what_they_measure(report, workspace: Path = Non
     # is a claim about the files TABLE's columns, not about the four
     # extern columns.  A claim keyword therefore only applies when the
     # name does NOT narrow the subject.
+    # claim keyword -> the columns that must be asserted for it
+    #
+    # The claims are SCOPED, and the scoping is the subtle part.
+    #
+    # 「四列」 is an EXPLICIT claim about the four extern columns: a
+    # criterion that says 四列 must assert all four.  That is
+    # unconditional and stays strict.
+    #
+    # 「每个活库」 is only a claim about the four columns when the
+    # criterion is ABOUT the four columns.  「每个活库的 INV-1 为
+    # GREEN」 is a claim about the INV-1 invariant, and INV-1's own
+    # definition lives in ``text_inv`` — the criterion correctly does
+    # not re-implement it.  Firing on it would be a false red that
+    # teaches the reader to ignore this check.
+    #
+    # So the 「每个活库」 claim fires only when the name ALSO names one
+    # of the four columns (which is how a criterion says "the four
+    # columns, in every library").
+    #
+    # The MEASURED case that made this precise: 「每个活库的
+    # files.chunker_version 与当前切法一致」 is about the CHUNKER
+    # VERSION, not about the four columns, and firing on it was a false
+    # red.  The 「四列」 form is the one that caught the real defect.
     claims = [
         # "四列" — the four extern columns, always.
         ("四列", ("body_path", "body_anchor", "body_hash", "text_state")),
-        # "每个活库" — the four extern columns, but ONLY when the name is
-        # about the chunks table (the files-table claim is scoped out).
-        ("每个活库", ("body_path",)),
     ]
+    # The 「每个活库」 claim, and the condition under which it applies.
+    every_lib_claim = ("每个活库",)
+    four_col_names = ("body_path", "body_anchor", "body_hash", "text_state")
     # Names that narrow the subject away from the four extern columns.
     narrowed = ("files 表", "files 列")
 
@@ -942,6 +1085,21 @@ def judge_s6_criterion_names_say_what_they_measure(report, workspace: Path = Non
             if not isinstance(node, ast.FunctionDef):
                 continue
             body_src = "\n".join(lines[node.lineno - 1:node.end_lineno])
+            # --- the CODE, not the prose -----------------------------
+            #
+            # This used to search the whole function body — DOCSTRING
+            # included — for the column names.  That is a false green:
+            # the MEASURED case (S3-H) was ``M4``, named 「四列已回填」,
+            # whose DOCSTRING mentions all four columns while its
+            # ASSERTION read only ``body_path_null``.  A prose mention
+            # satisfied the check, so a lying name passed the very
+            # criterion that exists to catch lying names.
+            #
+            # So the scan now looks at the CODE only: the docstring is
+            # stripped, and the column must appear in an executable
+            # expression.  A criterion that merely TALKS about a column
+            # does not assert it.
+            code_src = _strip_docstring(node, lines)
             for call in ast.walk(node):
                 if not isinstance(call, ast.Call):
                     continue
@@ -960,6 +1118,11 @@ def judge_s6_criterion_names_say_what_they_measure(report, workspace: Path = Non
                 for key, cols in claims:
                     if key in name:
                         needed.extend(cols)
+                # The 「每个活库」 claim fires only when the name ALSO
+                # names one of the four columns.
+                if any(k in name for k in every_lib_claim) and \
+                        any(c in name for c in four_col_names):
+                    needed.extend(four_col_names)
                 if not needed:
                     continue
                 # A narrowed subject scopes the claim out.
@@ -969,7 +1132,20 @@ def judge_s6_criterion_names_say_what_they_measure(report, workspace: Path = Non
                                   % (target.name, number, name))
                     continue
                 checked += 1
-                missing = [c for c in dict.fromkeys(needed) if c not in body_src]
+                missing = [c for c in dict.fromkeys(needed)
+                           if c not in code_src]
+                if missing:
+                    # The column may be asserted by a HELPER the
+                    # criterion calls (e.g. the content digest lives in
+                    # acceptance/__init__.py).  If the criterion calls
+                    # something whose OWN source names the column, the
+                    # claim IS backed — by the helper.  This is checked
+                    # statically, over the helper's source.
+                    still = []
+                    for c in missing:
+                        if not _column_is_asserted_by_a_helper(code_src, c):
+                            still.append(c)
+                    missing = still
                 if missing:
                     offenders.append((target.name, number, name, missing))
                 else:
