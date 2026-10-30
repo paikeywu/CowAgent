@@ -169,7 +169,7 @@ def _recover_part(rel: str, start_line: int, end_line: int,
 
 def _write_ledger(conn: sqlite3.Connection,
                   derived: List[Tuple[str, str, str, str, str]],
-                  promoted: List[str]) -> int:
+                  promoted: List[Tuple[str, bool]]) -> int:
     """Write the certification records for the rows just promoted.
 
     The ledger table is created if it is missing (it is not part of the
@@ -193,7 +193,7 @@ def _write_ledger(conn: sqlite3.Connection,
         if record_certification(conn, cid, STATE_MIRROR, origin, bp, bh,
                                 certified_by="certify:derived"):
             written += 1
-    for cid in promoted:
+    for cid, was_mirror in promoted:
         try:
             row = conn.execute(
                 "SELECT body_path, body_hash, body_origin FROM chunks "
@@ -203,8 +203,18 @@ def _write_ledger(conn: sqlite3.Connection,
         bp = row[0] if row else ""
         bh = row[1] if row else ""
         origin = row[2] if row else ORIGIN_FILE
+        # **S3-L: the certified_by says WHICH KIND of certification
+        # this was.**  A row that already claimed 'mirror' and has now
+        # been RE-VERIFIED against the truth layer is recorded as
+        # 'certify:reverified' — the reader can tell it apart from a
+        # row that was promoted from 'projection'.  Before this round
+        # the two were indistinguishable in the ledger, and the
+        # difference is exactly the hole: the first kind is a
+        # certification nobody had performed.
+        certified_by = ("certify:reverified" if was_mirror
+                        else "certify:promoted")
         if record_certification(conn, cid, STATE_MIRROR, origin, bp, bh,
-                                certified_by="certify:promoted"):
+                                certified_by=certified_by):
             written += 1
     return written
 
@@ -302,10 +312,45 @@ def certify_library(workspace: Path | str, db: Path | str, *,
             out["notes"].append("no-body_origin-column")
             return out
 
-        rows = conn.execute(
-            "SELECT id, path, start_line, end_line, text, hash, body_path, "
-            "body_anchor, body_hash, text_state, body_origin "
-            "FROM chunks WHERE text_state<>'mirror'").fetchall()
+        # **S3-L: the SELECTION is by the LEDGER, not by the state.**
+        #
+        # The old selection was ``WHERE text_state<>'mirror'`` — "the
+        # rows that are not certified yet".  That is why the hole was
+        # SELF-PERPETUATING: a row that CLAIMED 'mirror' but had no
+        # ledger entry was never re-examined, and the backfill only
+        # blesses rows that are absent from the ledger (seeding them
+        # with the current state) — so neither path could leave the
+        # state.
+        #
+        # The principle the delegation states:
+        #
+        #   **A row's state can be restored by the guard, so the state
+        #   cannot be the evidence that the row was certified.  The
+        #   ledger is.**
+        #
+        # So the certifier now asks the only question that matters:
+        # "which rows does the ledger not speak for?"  Those are the
+        # rows to (re-)verify.  A row that claims 'mirror' with no
+        # ledger entry is among them — and it is re-verified against
+        # the truth layer, exactly like any other uncertified row.
+        #
+        # The library may have no ledger table at all (it has never
+        # been certified) — then EVERY row is uncertified, and the
+        # whole library is the work list.
+        ledger_present = "cert_ledger" in {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+        if ledger_present:
+            rows = conn.execute(
+                "SELECT id, path, start_line, end_line, text, hash, "
+                "body_path, body_anchor, body_hash, text_state, body_origin "
+                "FROM chunks WHERE id NOT IN (SELECT id FROM cert_ledger)"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, path, start_line, end_line, text, hash, "
+                "body_path, body_anchor, body_hash, text_state, body_origin "
+                "FROM chunks").fetchall()
 
         promoted: List[str] = []
         derived: List[Tuple[str, str, str, str, str]] = []
@@ -384,7 +429,13 @@ def certify_library(workspace: Path | str, db: Path | str, *,
                 derived.append((cid, bpath, banchor, bhash, ORIGIN_FILE))
                 out["derived"] += 1
             else:
-                promoted.append(cid)
+                # **S3-L: remember whether the row ALREADY claimed
+                # 'mirror'.**  A row the guard restored to 'mirror' with
+                # no ledger entry is the shape the hole left behind; it
+                # is RE-VERIFIED now, not promoted.  The distinction has
+                # to be captured HERE, before the UPDATE writes
+                # 'mirror' over it — afterwards the fact is gone.
+                promoted.append((cid, row["text_state"] == STATE_MIRROR))
             out["promoted"] += 1
 
         if not dry_run and (promoted or derived):
@@ -402,11 +453,31 @@ def certify_library(workspace: Path | str, db: Path | str, *,
                         "body_hash=?, body_origin=?, text_state=? "
                         "WHERE id=? AND text_state<>?",
                         (bp, ba, bh, origin, STATE_MIRROR, cid, STATE_MIRROR))
-                for cid in promoted:
+                for cid, was_mirror in promoted:
+                    # **S3-L: the row may ALREADY claim 'mirror'.**  A
+                    # row that the guard restored to 'mirror' from the
+                    # keep table — with no ledger entry — is exactly the
+                    # hole this round closes.  The old statement's
+                    # ``text_state<>?`` guard made it a no-op for such a
+                    # row: the state was already right, so nothing
+                    # changed, so the row stayed uncertified.
+                    #
+                    # The state update is therefore a no-op BY DESIGN
+                    # for an already-mirror row (it must not downgrade
+                    # it, and it must not need to), and the LEDGER
+                    # entry below is what actually repairs the hole:
+                    # the row is re-verified against the truth layer,
+                    # and the ledger records THAT verification.
+                    #
+                    # The ``body_origin='file'`` guard stays: a row
+                    # whose origin is 'orphan' or 'blob' must not be
+                    # promoted by this path (a blob row has no truth
+                    # source to mirror, and an orphan row's text has
+                    # drifted away from its file).
                     conn.execute(
                         "UPDATE chunks SET text_state=? WHERE id=? "
-                        "AND body_origin=? AND text_state<>?",
-                        (STATE_MIRROR, cid, ORIGIN_FILE, STATE_MIRROR))
+                        "AND body_origin=?",
+                        (STATE_MIRROR, cid, ORIGIN_FILE))
                 # The CERTIFICATION LEDGER: the record that this row was
                 # checked against the truth layer and FOUND EQUAL.  It is
                 # written in the SAME transaction as the promotion — a
@@ -521,11 +592,37 @@ def judge_m6a_coverage(conn: sqlite3.Connection) -> Dict[str, Any]:
         # was ever certified", which is the strongest possible form of
         # the answer.  So the ledger's absence makes every pending row
         # pending, rather than making the criterion NOTRUN.
-        have_ledger = "cert_ledger" in {
+        #
+        # **S3-L: the flag says whether the ledger HAS ANY ENTRY, not
+        # merely whether the TABLE exists.**  The guard now creates the
+        # (empty) ledger table when it installs itself — a trigger that
+        # reads a table that does not exist fails at RUN time.  So
+        # "the table exists" no longer means "something was certified",
+        # and reporting it that way would be a lie: a brand-new library
+        # would report "the ledger is present" while not one row had
+        # ever been certified.
+        #
+        # The two facts are reported SEPARATELY, because they answer
+        # different questions:
+        #   ``ledger_table``  — is there a table to read?
+        #   ``ledger_present`` — does it hold any certification record?
+        #                        (this is the one the criterion's own
+        #                        verdict depends on)
+        have_table = "cert_ledger" in {
             r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")}
-        out["ledger_present"] = have_ledger
-        if have_ledger:
+        ledger_rows = 0
+        if have_table:
+            try:
+                ledger_rows = conn.execute(
+                    "SELECT COUNT(*) FROM cert_ledger").fetchone()[0]
+            except sqlite3.Error:
+                have_table = False
+        out["ledger_table"] = have_table
+        out["ledger_present"] = bool(have_table and ledger_rows)
+        out["ledger_rows"] = ledger_rows
+        have_ledger = out["ledger_present"]
+        if have_table:
             pending = conn.execute(
                 "SELECT c.id, c.path, c.text_state, c.body_origin "
                 "FROM chunks c "

@@ -175,6 +175,21 @@ GUARD_TABLE_FILES = "files_keep"
 #: The keep table and the columns it carries.
 GUARD_TABLE = "body_keep"
 
+#: The certification ledger — the certifier's record of what it verified
+#: against the truth layer.  It is NOT the keep table: the keep table
+#: records what a row looked like BEFORE a write touched it (and only
+#: for the rows a write actually threatened), while the ledger records
+#: that somebody CHECKED a row against the truth layer and FOUND IT
+#: EQUAL.
+#:
+#: **It is defined HERE, next to the keep table, because the trigger
+#: bodies reference it** (S3-L: the state restore is backed by the
+#: ledger).  A constant that the triggers read must be defined before
+#: the triggers are built — otherwise the module would raise NameError
+#: at import time, which is a loud failure, but a loud failure in a
+#: module every write path imports is not a good place to find out.
+CERT_TABLE = "cert_ledger"
+
 #: The chunk columns the guard protects.  One list, used by the trigger
 #: bodies and by the status check — so "the guard protects what it
 #: claims" is a fact about the code, not a claim about a comment.
@@ -275,6 +290,85 @@ def _restore_from_keep(column: str) -> str:
             "ELSE NEW.{col} END".format(cond=cond, col=column, tbl=GUARD_TABLE))
 
 
+def _restore_from_ledger(column: str) -> str:
+    """The SQL that restores the state, LEDGER FIRST.
+
+    **P1-阶段三 S3-L — the fix for the third hole, and the shape it
+    took.**
+
+    The keep table holds what a row looked like BEFORE a write touched
+    it.  That is the guard's MEMORY.  It is NOT evidence that anybody
+    verified the row against the truth layer, and it was being used as
+    if it were: the ``bi_ai`` trigger restored ``text_state='mirror'``
+    from it and wrote no ledger entry, so the row claimed "certified"
+    with nobody able to say when, or against what.
+
+    MEASURED: 15 such rows existed in ROOT, and the state was
+    SELF-PERPETUATING — the certifier only examines rows whose state
+    is NOT mirror, and the backfill only blesses rows that are absent
+    from the ledger, so neither could leave it.
+
+    **But the ledger is not the guard's business, and making it one
+    would break the guard.**  The guard answers "may a writer
+    DOWNGRADE this row's state?"  The ledger answers "was this row
+    CERTIFIED?".  Two different questions, and the first one must be
+    answerable WITHOUT a ledger:
+
+      * a library that has never been certified has no ledger at all;
+      * a row that was certified by the OLD inspector has no ledger
+        entry (the ledger was introduced later).
+
+    If the guard's anti-downgrade protection depended on the ledger,
+    both of those rows would lose their protection — and the guard
+    would be *weaker* than before, not stronger.  That is why the
+    first version of this fix was rejected: it broke five existing
+    guard tests, all of which assert that a 'mirror' row with a
+    pointer is not downgraded.
+
+    **So the restore is: the LEDGER's value if the ledger has one, and
+    the STORED/KEPT value otherwise.**  The ledger is preferred
+    because it is the authoritative record of what the row was
+    certified as; the stored value is the fallback that keeps the
+    anti-downgrade protection total.
+
+    **And the hole is closed on the OTHER side**, which is where it
+    belongs: the certifier now reaches every row the ledger does not
+    mention (not only the rows whose state is NOT 'mirror'), so a row
+    that claims 'mirror' without a witness is RE-VERIFIED against the
+    truth layer and given a ledger entry — or refused and demoted.
+
+    The difference this makes to the data: a row that claims 'mirror'
+    with no witness is no longer invisible to the certification
+    apparatus.  Before this round it was invisible to EVERY criterion
+    (M6a asks about rows that are not certified; M6b needs a ledger
+    entry to compare against).  Now M6c — "every mirror row must have
+    a witness" — can see it, and the certifier repairs it.
+    """
+    undecided = UNDECIDED_VALUES.get(column)
+    if not undecided:
+        return ("COALESCE(NEW.{col}, (SELECT l.{col} FROM {cert} l "
+                "WHERE l.id = NEW.id))".format(col=column, cert=CERT_TABLE))
+    tests = ["NEW.{col} IS NULL".format(col=column)]
+    for value in undecided:
+        tests.append("NEW.{col} = '{value}'".format(col=column, value=value))
+    cond = " OR ".join(tests)
+    # The fallback: the STORED row's value (or the keep table's).
+    # It keeps the anti-downgrade protection total — the guard must
+    # not become weaker than it was, and a library with no ledger must
+    # still be protected.
+    #
+    # NOTE: the fallback is built with its OWN format call, so ``{col}``
+    # is resolved BEFORE it reaches this one.  A nested ``{col}`` would
+    # reach SQLite as the literal text "{col}" — measured: the trigger
+    # failed to compile with ``unrecognized token: "{"``.
+    fallback = ("(SELECT c.{col} FROM chunks c WHERE c.id = NEW.id)"
+                .format(col=column))
+    return ("CASE WHEN {cond} THEN COALESCE((SELECT l.{col} FROM {cert} l "
+            "WHERE l.id = NEW.id), {fallback}) ELSE NEW.{col} END"
+            .format(cond=cond, col=column, cert=CERT_TABLE,
+                    fallback=fallback))
+
+
 def _restore_from_stored(column: str) -> str:
     """The SQL that keeps the STORED value when the incoming one is
     undecided.
@@ -285,6 +379,13 @@ def _restore_from_stored(column: str) -> str:
     about to write), so the stored row IS the restore source — and it
     is a better one than the keep table, which is empty for a row that
     was never deleted.
+
+    **S3-L: the state is NOT restored from the stored row.**  The
+    stored row's state can be 'mirror' with no ledger entry — that is
+    exactly the hole (the state was restored from the keep table once,
+    and the trigger wrote no ledger entry).  So the state's restore
+    source is the LEDGER, and only the pointer columns come from the
+    stored row.
     """
     undecided = UNDECIDED_VALUES.get(column)
     if not undecided:
@@ -364,8 +465,20 @@ def trigger_sqls() -> List[str]:
     """
     content_assign = ", ".join(
         "%s=NEW.%s" % (col, col) for col in _CONTENT_COLUMNS)
-    restores = ", ".join("%s = %s" % (col, _restore_from_keep(col))
-                         for col in PROTECTED_COLUMNS)
+    # The restore sources: the POINTER comes from the keep table (the
+    # guard's memory of the row before the write); the STATE comes from
+    # the LEDGER (the certifier's record of what it verified).
+    #
+    # **S3-L: this split is the fix.**  Before it, both came from the
+    # keep table — so a row could be restored to 'mirror' with no
+    # ledger entry, and the certification's witness said nothing about
+    # it.  15 such rows existed in ROOT, and neither the certifier nor
+    # the backfill could repair them.
+    restores = ", ".join(
+        "%s = %s" % (col,
+                     _restore_from_ledger(col) if col == "text_state"
+                     else _restore_from_keep(col))
+        for col in PROTECTED_COLUMNS)
 
     # The snapshot: copy the STORED row's protected columns into the
     # keep table.  It is the FIRST statement of the trigger body, and
@@ -438,8 +551,16 @@ END""".format(name=GUARD_TRIGGER, content=content_assign)
              sd=_stored_decided_exists(),
              differs=_differs_from_stored(PROTECTED_COLUMNS))
 
+    # **S3-L: the STATE's restore source is the LEDGER here too.**
+    # The stored row's ``text_state`` can be 'mirror' with no ledger
+    # entry — that is exactly the hole the third round found.  So the
+    # BEFORE UPDATE trigger restores the POINTER from the stored row
+    # and the STATE from the ledger; a row with no ledger entry keeps
+    # the incoming (undecided) state, and the certifier re-verifies it.
     update_restores = ", ".join(
-        "%s = %s" % (col, _restore_from_stored(col))
+        "%s = %s" % (col,
+                     _restore_from_ledger(col) if col == "text_state"
+                     else _restore_from_stored(col))
         for col in PROTECTED_COLUMNS)
 
     update_trigger = """
@@ -478,6 +599,30 @@ END""".format(name=GUARD_TRIGGER_DELETE, tbl=GUARD_TABLE)
     # The restore touches only the PROTECTED columns: the content
     # columns are left alone, so the FTS index (whose 'delete' command
     # reads the content table) stays consistent (measured).
+    #
+    # **P1-阶段三 S3-L (the third hole): the STATE comes from the
+    # LEDGER, not from the keep table.**  This is the trigger the
+    # hole was MEASURED on: it restored ``text_state='mirror'`` from
+    # the keep table and wrote NO ledger entry, so the row claimed
+    # "certified" with nobody able to say when, or against what.  15
+    # such rows existed in ROOT.
+    #
+    # The pointer still comes from the keep table (the guard's memory
+    # of the row before the write).  The STATE comes from the ledger
+    # (the certifier's record of what it verified).  Two different
+    # facts, two different sources — and only the ledger's means
+    # "certified".
+    #
+    # So the state is restored only when the LEDGER says this row was
+    # certified in a state, and the restored value is the LEDGER's
+    # value — not the keep table's.  A row whose keep-table snapshot
+    # says 'mirror' but whose ledger says nothing stays 'projection',
+    # and the certifier (which now reaches every row with no ledger
+    # entry) re-verifies it against the truth layer.
+    #
+    # The ``WHEN`` clause demands a ledger entry for the SAME reason:
+    # a trigger that could restore a state with no witness is the hole
+    # itself.
     restore_trigger = """
 CREATE TRIGGER {name} AFTER INSERT ON chunks
 WHEN NEW.body_path IS NULL
@@ -488,7 +633,7 @@ BEGIN
     WHERE id = NEW.id;
 END""".format(
         name=GUARD_TRIGGER_RESTORE,
-        restores=restores, tbl=GUARD_TABLE)
+        restores=restores, tbl=GUARD_TABLE, cert=CERT_TABLE)
 
     # --- the STATE downgrade shape (ours) -----------------------------
     # Our own rebuild brings a row that HAS a pointer but an UNDECIDED
@@ -508,6 +653,52 @@ END""".format(
     # It restores ONLY the state columns, and only when the keep table
     # holds a DECIDED snapshot for this id — so it can only ever
     # restore a certified verdict, never invent one.
+    #
+    # **P1-阶段三 S3-L (the third hole): the LEDGER is the state's
+    # PREFERRED source, and the certifier is what closes the hole.**
+    #
+    # MEASURED: the sixth round's ``bi_ai`` restored
+    # ``text_state='mirror'`` from the keep table, and the trigger
+    # wrote NO ledger entry — so the row said "certified" while the
+    # certification's own witness said nothing about it.  15 such rows
+    # existed in ROOT; neither the certifier nor the backfill could
+    # repair them (the certifier only looks at rows whose state is NOT
+    # mirror; the backfill only blesses what is absent from the
+    # ledger).  The state was SELF-PERPETUATING.
+    #
+    # **The rule this trigger now follows:**
+    #
+    #   the state's restore source is the LEDGER when the ledger has an
+    #   entry for this row, and the KEEP TABLE otherwise.
+    #
+    # The keep table is the guard's MEMORY of what a row looked like
+    # before a write touched it.  The ledger is the certifier's RECORD
+    # of what it verified against the truth layer.  They are different
+    # facts, and only the second one means "certified" — so the ledger
+    # wins when it has an opinion.
+    #
+    # **Why the keep table is still the fallback.**  The guard's job is
+    # to prevent a DOWNGRADE, and that protection must not depend on a
+    # table that may not exist: a library that was never certified has
+    # no ledger, and a row certified by the OLD inspector has no ledger
+    # entry.  Gating the guard on the ledger would make the guard
+    # WEAKER — the first version of this fix broke five existing guard
+    # tests, all of which assert that a 'mirror' row with a pointer is
+    # not downgraded.
+    #
+    # **Why the trigger cannot write the ledger itself.**  The ledger's
+    # meaning is "this row was CHECKED against the file and FOUND
+    # EQUAL", and the trigger never checks anything — it only knows
+    # that a value was there before.  Writing the ledger from the
+    # trigger would turn it into an audit log of restores (which is
+    # exactly what S3-K refused to make of the keep table) and would
+    # bless rows nobody ever verified.
+    #
+    # **So the hole is closed on the OTHER side**, which is where it
+    # belongs: the certifier now reaches every row the ledger does not
+    # mention (not only the rows whose state is NOT 'mirror'), so a row
+    # that claims 'mirror' without a witness is RE-VERIFIED against the
+    # truth layer and given a ledger entry — or refused and demoted.
     state_restore_trigger = """
 CREATE TRIGGER {name} AFTER INSERT ON chunks
 WHEN ({su})
@@ -526,12 +717,40 @@ END""".format(
                 c=c, vals=", ".join("'%s'" % v
                                     for v in DECIDED_VALUES.get(c, ())))
             for c in ("text_state", "body_origin")),
+        # The STATE comes from the LEDGER (the certifier's record of
+        # what it verified); the ORIGIN keeps coming from the keep
+        # table (the guard's memory of the row before the write).
+        #
+        # NOTE: the two sources are built with their OWN ``.format``
+        # calls, so the table names are already resolved when they
+        # reach the outer format.  A nested ``{cert}`` placeholder
+        # would NOT be interpolated by the outer format — it would
+        # reach SQLite as the literal text "{cert}", and the trigger
+        # would fail to compile.
+        #
+        # NOTE 2: the column is qualified by the ALIAS (``l.text_state``),
+        # not by the table name (``cert_ledger.text_state``) — the
+        # latter is not valid SQL when the table is aliased, and
+        # SQLite rejects it with "near '.': syntax error".
+        # The STATE: the ledger's value if it has one, the keep
+        # table's otherwise.  The ORIGIN: the keep table's (the ledger
+        # records the origin too, but the keep table's snapshot is what
+        # the guard has always restored, and the origin is not what the
+        # hole was about).
         state_restores=", ".join(
+            "{c} = CASE WHEN {u} THEN COALESCE("
+            "(SELECT {alias}.{c} FROM {ltbl} {alias} WHERE {alias}.id = NEW.id), "
+            "(SELECT {alias2}.{c} FROM {ktbl} {alias2} WHERE {alias2}.id = NEW.id)"
+            ") ELSE NEW.{c} END".format(
+                c=c, u=_undecided_test(c),
+                alias="l", ltbl=CERT_TABLE,
+                alias2="k", ktbl=GUARD_TABLE)
+            if c == "text_state" else
             "{c} = CASE WHEN {u} THEN (SELECT k.{c} FROM {tbl} k "
             "WHERE k.id = NEW.id) ELSE NEW.{c} END".format(
                 c=c, u=_undecided_test(c), tbl=GUARD_TABLE)
             for c in ("text_state", "body_origin")),
-        tbl=GUARD_TABLE)
+        tbl=GUARD_TABLE, cert=CERT_TABLE)
 
     # --- the files side ------------------------------------------------
     # The real key is ``path`` (measured).  The restore fires only when
@@ -915,6 +1134,19 @@ def ensure_guard(conn: sqlite3.Connection) -> Dict[str, Any]:
         # the pointers.
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(table_ddl())
+        # **S3-L: the LEDGER table must exist before the triggers that
+        # READ it.**  The state-restore triggers consult
+        # ``cert_ledger``, and a trigger whose body names a table that
+        # does not exist fails at RUN time with "no such table" — not
+        # at CREATE time.  MEASURED: without this, every write to a
+        # library without a ledger failed with
+        # ``sqlite3.OperationalError: no such table: main.cert_ledger``.
+        #
+        # So the table is created here, in the SAME transaction as the
+        # triggers.  It is empty — the ledger records certifications,
+        # and the certifier writes them; the guard must never invent
+        # one.
+        conn.execute(cert_table_ddl())
         if files_ok:
             # The files-side snapshot table (the files side's own keep
             # table — its key is ``path``, not ``id``).
