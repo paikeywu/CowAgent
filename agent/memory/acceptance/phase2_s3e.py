@@ -484,14 +484,47 @@ def judge_r_s3_5_mirror_has_a_setter(report, workspace: Path):
 
     # The setter must be EXPLICIT: it must actually write 'mirror', and
     # it must only do so for rows it has just verified byte-equal.
-    writes_mirror = "text_state='mirror'" in setter_src
-    verifies_first = "rebuild_from_anchor" in setter_src and \
-        "!= (text or" in setter_src
+    #
+    # P1-阶段三 S3-K: the setter DELEGATES.  ``_set_mirror_state`` now
+    # calls ``agent.memory.certify.certify_library``, and the byte
+    # comparison lives THERE — so reading only the setter's own source
+    # finds neither the write nor the check, and the criterion goes red
+    # for a reason that has nothing to do with the product.
+    #
+    # MEASURED: on the S3-K tree, ``_set_mirror_state``'s source
+    # contains NEITHER ``text_state='mirror'`` NOR
+    # ``rebuild_from_anchor``; ``certify_library``'s source contains
+    # BOTH.  The rule did not change — it MOVED.  So the criterion
+    # follows the call: it reads the setter's source AND the source of
+    # the function the setter delegates to.
+    #
+    # This is the "criterion must follow the implementation" rule, and
+    # it is the same shape as the S3-J "the chain must consult the
+    # files bookkeeping" mutant: a criterion that looks at the wrong
+    # place reports a defect that is not there.
+    delegate_src = ""
+    delegate_name = ""
+    try:
+        import inspect
+        from agent.memory import certify as _certify
+        delegate_name = "agent.memory.certify.certify_library"
+        delegate_src = inspect.getsource(_certify.certify_library)
+    except Exception as e:
+        detail.append("委托实现检查失败: %s: %s" % (type(e).__name__, e))
+
+    effective_src = setter_src + "\n" + delegate_src
+    writes_mirror = "text_state='mirror'" in effective_src or \
+        "STATE_MIRROR" in effective_src
+    verifies_first = "rebuild_from_anchor" in effective_src and \
+        ('!= (text or' in effective_src or '!= (row["text"] or' in effective_src)
     detail.append("置位者: agent.memory.inspector.Inspector._set_mirror_state "
                   "存在=%s 显式写 text_state='mirror'=%s 置位前逐字节复核=%s"
                   % (has_setter, writes_mirror, verifies_first))
     detail.append("（置位者是巡检器，不是迁移器：迁移器只测量巡检器做没做，"
                   "自己置位会让三态机退化为装饰）")
+    detail.append("S3-K: 置位者已委托给 %s，字节复核的实现在那里 —— "
+                  "判据跟随委托一起读，否则会把『实现搬家』说成『产品坏了』。"
+                  % (delegate_name or "（拿不到）"))
 
     if wrong_mirror:
         detail.append("错置为 mirror 但指针不可解析的行: %d (%s)"
