@@ -160,21 +160,84 @@ def judge_mu12_three_states_are_real(report, workspace: Path = None):
 
     Half 1 alone passes on a harness nobody uses; half 2 alone passes on
     a harness that cannot express the state.
+
+    ------------------------------------------------------------------------
+    R8 (第八轮) — BEHAVIOUR, NOT SOURCE TEXT.
+
+    The old half 1 read the harness's SOURCE and looked for the
+    literals ``"def judge_notrun"``, ``"notrun=False"`` and
+    ``"STATE_NOTRUN"``.  That made the criterion hostage to the
+    harness's spelling: rewriting ``judge_notrun`` as a lambda, or
+    moving the states into a dict, would have turned this criterion
+    RED for a reason that has nothing to do with whether the third
+    state works.  **A false red nobody fixes is worse than no
+    criterion at all** — it teaches the team that the gate is noise.
+
+    So half 1 now EXERCISES the harness: it builds a report, records
+    one PASS, one FAIL and one NOTRUN, and asserts that
+
+      * the three rows carry three DIFFERENT states;
+      * ``summary()`` counts NOTRUN separately;
+      * ``summary()`` returns False when a NOTRUN is present
+        (NOTRUN is not green);
+      * ``judge(..., notrun=True)`` lands in the third state.
+
+    That is a statement about the BEHAVIOUR, and no amount of
+    renaming can break it.
     """
     detail = []
     ok = True
 
-    # --- half 1: the harness has the state ---
-    harness = _read("__init__.py")
-    checks = {
-        "judge_notrun 方法存在": "def judge_notrun" in harness,
-        "judge 接受 notrun 参数": "notrun=False" in harness,
-        "rows 存的是状态字符串": "STATE_PASS if ok else STATE_FAIL" in harness,
-        "summary 单独统计 NOTRUN": "STATE_NOTRUN" in harness and "notrun = sum(" in harness,
-        "NOTRUN 不算通过": "return passed == total" in harness,
-    }
+    # --- half 1: the harness HAS the state (BY EXERCISING IT) ---
+    #
+    # R8: behaviour, not source text.  The harness is driven, and its
+    # OUTPUT is asserted.  A harness that cannot express the third
+    # state fails here; a harness that expresses it under any spelling
+    # passes.
+    try:
+        from agent.memory.acceptance import Report as _Report
+        probe = _Report()
+        probe.judge("PROBE-PASS", "probe", True, "probe")
+        probe.judge("PROBE-FAIL", "probe", False, "probe")
+        probe.judge_notrun("PROBE-NOTRUN", "probe", "probe")
+        probe.judge("PROBE-NOTRUN2", "probe", False, "probe", notrun=True)
+        states = [r[2] for r in probe.rows]
+        checks = {
+            "记录了四行": len(probe.rows) == 4,
+            "三态互不相同": len(set(states)) == 3,
+            "PASS 行是 PASS": states[0] == "PASS",
+            "FAIL 行是 FAIL": states[1] == "FAIL",
+            "judge_notrun 落在第三态": states[2] == "NOTRUN",
+            "notrun=True 落在第三态": states[3] == "NOTRUN",
+        }
+        summary_ok = False
+        notrun_counted = None
+        try:
+            import io
+            import contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                summary_ok = probe.summary()
+            for line in buf.getvalue().splitlines():
+                if "判据通过" in line:
+                    notrun_counted = line
+        except Exception as e:
+            checks["summary() 可调用"] = False
+            detail.append("  harness: summary() 失败: %s: %s"
+                          % (type(e).__name__, e))
+        else:
+            checks["summary() 可调用"] = True
+        checks["NOTRUN 不算通过（summary 返回 False）"] = (summary_ok is False)
+        checks["summary 单独统计 NOTRUN"] = bool(
+            notrun_counted and "NOTRUN" in notrun_counted)
+        if notrun_counted:
+            detail.append("  harness: summary 行: %s" % notrun_counted)
+    except Exception as e:
+        detail.append("  harness: 行为探测失败: %s: %s" % (type(e).__name__, e))
+        checks = {"harness 可用": False}
+
     for k, v in checks.items():
-        detail.append("  harness: %-28s %s" % (k, v))
+        detail.append("  harness: %-36s %s" % (k, v))
         if not v:
             ok = False
 

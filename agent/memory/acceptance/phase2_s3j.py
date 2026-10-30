@@ -150,6 +150,19 @@ from agent.memory.acceptance.live_libs import (
     table_columns,
 )
 
+# R8: J-3 and M6e ask the SAME question ("is this NULL statistic
+# 'never measured' or 'erased'?") about the SAME rows, so they must use
+# the SAME discriminator.  The discriminator lives with M6e (it was
+# written there, with the measurement that backs it); J-3 imports it
+# instead of growing a second, weaker copy.
+#
+# The alternative — keeping a library-level rule in J-3 — is exactly
+# what produced the 17/17 disagreement measured in R7: two mouths for
+# one question.
+from agent.memory.acceptance.phase2_s3k import (  # noqa: E402
+    _chunks_side_state,
+)
+
 #: The four columns the migration owns on ``chunks``.
 CHUNK_COLUMNS = ("body_path", "body_anchor", "body_hash", "text_state")
 
@@ -204,6 +217,40 @@ class MigrationProfile:
         self.files_cv: Dict[str, int] = {}
         self.files_cc_null = 0
         self.files_cv_null = 0
+        #: R8: the PATHS whose ``chunker_version`` is NULL.  The
+        #: library-level counter alone cannot say WHICH file was never
+        #: measured; the path is what the chunks-side discriminator
+        #: needs.  (This is what turned 18 legitimate NULLs into 18
+        #: false "version wrong" verdicts.)
+        self.files_cv_null_paths: List[str] = []
+        #: R8: per path, the chunks-side discriminator's answer:
+        #: ``(decided rows, v4 anchors)``.  Computed while the
+        #: connection is still open, because the profile closes it
+        #: before the criterion body runs.
+        self.files_cv_null_state: Dict[str, Tuple[int, int]] = {}
+        #: R8: the LEDGER as the witness.  ``cert_ledger`` is written by
+        #: the CERTIFIER, when it certifies — so "in the ledger" means
+        #: exactly "was certified".  This is what lets J-2 tell an
+        #: ERASURE from a REFUSAL:
+        #:
+        #:   * in the ledger, but not ``mirror`` now ⇒ it WAS certified
+        #:     and was demoted ⇒ **erased** (a live defect).
+        #:   * NOT in the ledger, and not ``mirror`` ⇒ it was never
+        #:     certified — the certifier REFUSED it (the content
+        #:     drifted) ⇒ **not an erasure**.
+        #:
+        #: MEASURED (R8, agent-mvnes449): 2 rows were ``projection`` /
+        #: ``orphan`` with NO ledger entry; the ledger held 249 entries,
+        #: all ``mirror``, with ZERO intersection with the non-mirror
+        #: rows.  The old J-2 counted them as "erased" — a verdict the
+        #: evidence did not support.
+        self.ledger_rows = 0
+        self.ledger_nonmirror_ids: List[str] = []
+        #: R8: does this library HAVE a ledger at all?  The ledger
+        #: SPEAKS, or it does not: where there is no ledger, the
+        #: criterion cannot claim "this row was never certified", so it
+        #: falls back to the original reading.
+        self.has_ledger = False
 
         # --- the witnesses ------------------------------------------
         self.downgrade_proven = 0        # body_keep=mirror & chunks<>'mirror'
@@ -255,9 +302,28 @@ class MigrationProfile:
                     conn, "SELECT COUNT(*) FROM files WHERE chunker_version IS NULL")
                 self.files_cv = self._dist(
                     conn, "SELECT chunker_version, COUNT(*) FROM files GROUP BY 1")
+                # R8: WHICH paths are NULL — the discriminator needs the
+                # path, not just the count.
+                try:
+                    self.files_cv_null_paths = [
+                        r[0] for r in conn.execute(
+                            "SELECT path FROM files WHERE chunker_version IS NULL "
+                            "ORDER BY path").fetchall()]
+                except sqlite3.Error:
+                    self.files_cv_null_paths = []
+                # R8: the discriminator's answer, computed NOW (the
+                # connection is open here and closed by the time the
+                # criterion body runs).
+                for _p in self.files_cv_null_paths:
+                    try:
+                        self.files_cv_null_state[_p] = _chunks_side_state(
+                            conn, _p)
+                    except Exception:
+                        self.files_cv_null_state[_p] = (0, 0)
 
             # -- the witnesses --------------------------------------
             self._read_keep(conn)
+            self._read_ledger(conn)
             self._read_anchors(conn)
             self._read_bulk(conn)
         except sqlite3.Error as e:
@@ -282,6 +348,37 @@ class MigrationProfile:
                 conn,
                 "SELECT COUNT(*) FROM body_keep k JOIN chunks c ON c.id=k.id "
                 "WHERE k.text_state<>'mirror' AND c.text_state='mirror'")
+        except sqlite3.Error:
+            pass
+
+    def _read_ledger(self, conn) -> None:
+        """R8: the certification ledger — the witness for J-2.
+
+        The ledger holds one row per CERTIFIED chunk.  A chunk that is
+        in the ledger but is not ``mirror`` now was certified and then
+        demoted — an ERASURE.  A chunk that is not in the ledger was
+        never certified — the certifier REFUSED it (the content
+        drifted), and a refusal is not an erasure.
+
+        ``body_keep`` cannot answer this question: the guard writes it,
+        and the guard only runs when a write was intercepted, so a
+        newly written row is simply absent from it.
+        """
+        try:
+            tabs = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+        except sqlite3.Error:
+            return
+        if "cert_ledger" not in tabs:
+            return
+        self.has_ledger = True
+        try:
+            self.ledger_rows = self._count(
+                conn, "SELECT COUNT(*) FROM cert_ledger")
+            self.ledger_nonmirror_ids = [
+                r[0] for r in conn.execute(
+                    "SELECT l.id FROM cert_ledger l JOIN chunks c ON c.id=l.id "
+                    "WHERE c.text_state<>'mirror' ORDER BY l.id").fetchall()]
         except sqlite3.Error:
             pass
 
@@ -500,16 +597,77 @@ def judge_migration_state_is_discriminable(report, workspace: Path):
             if state != "mirror":
                 file_not_mirror += n
         detail.append("      ⇒ 迁移已完成（F1~F4 全成立）")
-        if file_not_mirror:
-            detail.append("      ⇒ 结论: FAIL（迁移后被擦）—— 非 mirror 的行数=%d"
-                          % file_not_mirror)
-            if prof.downgrade_proven:
-                detail.append("      ⇒ 证据: body_keep 里有 %d 行曾是 mirror，现在不是 —— "
+
+        # R8: "not mirror" is NOT one thing.  It is TWO, and the LEDGER
+        # is what tells them apart:
+        #
+        #   * the LEDGER HAS the row and the row is not mirror now ⇒ it
+        #     WAS certified and was demoted ⇒ **erased** (a live defect).
+        #   * the LEDGER has NO row for it ⇒ it was NEVER certified —
+        #     the certifier REFUSED it (the content drifted under it)
+        #     ⇒ a refusal is NOT an erasure, and calling it one is a
+        #     verdict the evidence does not support.
+        #
+        # MEASURED (R8, agent-mvnes449): 2 rows were `projection` /
+        # `orphan` with NO ledger entry; the ledger held 249 entries,
+        # all `mirror`, with ZERO intersection with the non-mirror
+        # rows.  The old rule ("any non-mirror row ⇒ erased") called
+        # them erased — the same shape of mistake as J-3's "NULL is a
+        # wrong version": a category error between "not what we want"
+        # and "what went wrong".
+        #
+        # **The ledger SPEAKS, or it does not.**  Where the ledger says
+        # nothing about a row (the library has no ledger at all), the
+        # criterion falls back to the ORIGINAL reading — "migrated, and
+        # a row that should be mirror is not" ⇒ erased.  That is the
+        # MU-20 case: a library with no ledger at all, where the
+        # demotion is the only fact there is.  The exemption applies
+        # only where the ledger actually says "this row was never
+        # certified".
+        erased = list(prof.ledger_nonmirror_ids)
+        refused = 0
+        if prof.has_ledger:
+            # The ledger is present: it covers every row, and its
+            # silence about a non-mirror row is a REFUSAL (the
+            # certifier saw it and declined).
+            refused = file_not_mirror - len(erased)
+        witness = ("cert_ledger" if prof.has_ledger
+                   else "无账本（按『迁移已完成 + 现在不是 mirror』判读）")
+
+        detail.append("      cert_ledger 存在=%s 条目=%-6d 其中现在非 mirror 的=%-4d "
+                      "（这是【被擦】的行）"
+                      % (prof.has_ledger, prof.ledger_rows,
+                         len(prof.ledger_nonmirror_ids)))
+        detail.append("      body_keep 里曾是 mirror 现在不是的行=%-4d"
+                      % prof.downgrade_proven)
+        detail.append("      非 mirror 的行=%-6d 其中【从未认证】（认证器拒绝）=%-4d"
+                      % (file_not_mirror, refused))
+
+        if erased:
+            detail.append("      ⇒ 结论: FAIL（迁移后被擦）—— 曾被认证、现在不是 mirror 的行数=%d"
+                          % len(erased))
+            detail.append("      ⇒ 证据: %s" % witness)
+            for i in erased[:5]:
+                detail.append("         被擦的行 id=%s" % i)
+            if prof.downgrade_proven and witness == "cert_ledger":
+                detail.append("      ⇒ 旁证: body_keep 里也有 %d 行曾是 mirror —— "
                               "降级是【被证明的】，不是推断的"
                               % prof.downgrade_proven)
-            else:
-                detail.append("      ⇒ 证据: body_keep 里没有 mirror 快照（保底快照已被覆盖），"
-                              "但 F1~F4 成立 ⇒ 迁移过、且现在不是 mirror ⇒ 仍是【被擦】")
+            red_libs.append(prof.name)
+            ok = False
+        elif refused:
+            detail.append("      ⇒ 结论: PASS（已迁移；%d 行【从未被认证】—— "
+                          "认证器诚实拒绝了它们，正文已漂移，不是被擦）" % refused)
+            detail.append("      （这一类的归属是 M6c：被登记且可见；"
+                          "它不是降级，也不是迁移缺陷。）")
+        elif file_not_mirror:
+            # No ledger to speak about the row, and the row is not
+            # mirror: the migration's work landed (F1~F4) and this row
+            # is not in the certified state ⇒ it was demoted.
+            detail.append("      ⇒ 结论: FAIL（迁移后被擦）—— 非 mirror 的行数=%d"
+                          % file_not_mirror)
+            detail.append("      ⇒ 证据: %s（该库没有账本，降级由『迁移已完成』"
+                          "与『现在不是 mirror』两项事实共同确立）" % witness)
             red_libs.append(prof.name)
             ok = False
         else:
@@ -553,25 +711,57 @@ def judge_migration_state_is_discriminable(report, workspace: Path):
 def judge_files_statistics_are_not_erased(report, workspace: Path):
     """J-3 (REAL): the ``files`` statistics columns, per library, three states.
 
-    The question this answers: are the ``files`` rows' statistics
-    columns (``chunk_count`` / ``chunker_version``) NULL because the
-    library was never migrated, or because an old writer erased them?
+The question this answers: are the ``files`` rows' statistics
+columns (``chunk_count`` / ``chunker_version``) NULL because the
+library was never migrated, or because an old writer erased them?
 
-    The discriminator is the SAME F-chain as J-2, restricted to the
-    ``files`` table:
+The discriminator is the SAME F-chain as J-2, restricted to the
+``files`` table:
 
-      * ``chunker_version`` is NULL on every row AND the chunks table
-        has no pointer at all ⇒ **never migrated** ⇒ NOTRUN.
-      * ``chunker_version`` is NULL on every row BUT the chunks table
-        IS migrated (F1..F3 hold, the anchors carry the v4 syntax) ⇒
-        the files bookkeeping was erased while the chunks bookkeeping
-        survived ⇒ **FAIL**, and the report says which one was erased.
-      * ``chunker_version`` holds a value that is NOT the current
-        version ⇒ **FAIL**: the library was rebuilt by an older chunker.
+  * ``chunker_version`` is NULL on every row AND the chunks table
+    has no pointer at all ⇒ **never migrated** ⇒ NOTRUN.
+  * ``chunker_version`` is NULL on every row BUT the chunks table
+    IS migrated (F1..F3 hold, the anchors carry the v4 syntax) ⇒
+    the files bookkeeping was erased while the chunks bookkeeping
+    survived ⇒ **FAIL**, and the report says which one was erased.
+  * ``chunker_version`` holds a value that is NOT the current
+    version ⇒ **FAIL**: the library was rebuilt by an older chunker.
 
-    So the three verdicts are distinguishable by OBSERVED facts, and
-    every library prints its own numbers.
-    """
+So the three verdicts are distinguishable by OBSERVED facts, and
+every library prints its own numbers.
+
+------------------------------------------------------------------------
+R8 (第八轮) — ONE MOUTH.  Two fixes, both forced by measurement:
+
+**(a) NULL is not a version.**  The old code computed
+``others = {k: v for k, v in prof.files_cv.items() if k != version}``
+— and since ``None != version``, a row that was **never filled in**
+was reported as "**a non-current version**".  That is a different
+claim: one says "the value is wrong", the other says "there is no
+value".  The criterion's own prose says "holds a value that is NOT
+the current version", and NULL holds no value at all.
+
+**(b) The granularity must match the question.**  The library-level
+rule ("all cv NULL ⇒ never migrated") cannot answer the
+path-level question "was THIS file's statistic erased?".  A library
+can hold BOTH migrated files (cv = 4) and files that were written
+after the migration and never measured (cv = NULL).  Under the old
+rule those NULL rows were invisible: the library was not "all NULL",
+so they fell into the "some cv is present" branch, where they were
+called "version wrong".
+
+So J-3 now asks M6e's question **per path**, with M6e's
+discriminator: a NULL statistic on a path whose chunks side shows
+no decided row and no v4 anchor was **never measured** (not a
+defect); a NULL statistic on a path whose chunks side IS migrated
+was **erased** (a defect).
+
+**The two criteria can no longer disagree.**  They ask the same
+question of the same rows with the same discriminator, so for every
+row their conclusions MUST agree.  That is the property the
+criterion set was missing, and it is asserted by
+``tests/test_p1_stage3l_j3_m6e_agreement.py``.
+"""
     detail: List[str] = []
     libs = enumerate_live(workspace)
     if not libs:
@@ -601,22 +791,53 @@ def judge_files_statistics_are_not_erased(report, workspace: Path):
         if prof.files_rows == 0:
             detail.append("      ⇒ 结论: NOTRUN（没有 files 行可判）")
             continue
-        if prof.files_cv_null == prof.files_rows:
-            # every cv is NULL — the erased shape
-            if prof.body_path_null == prof.rows and prof.rows > 0:
-                detail.append("      ⇒ 结论: NOTRUN（从未迁移：chunks 侧也没有指针，"
-                              "files 统计列自然没有）")
+
+        # ---- R8: the PATH-level mouth (the same one M6e uses) -----
+        #
+        # A library can hold BOTH migrated files (cv = 4) and files
+        # written after the migration that were never measured (cv =
+        # NULL).  The old library-level rule could not see the second
+        # kind: the library was not "all NULL", so its NULL rows fell
+        # into the "some cv is present" branch and were called "version
+        # wrong".  MEASURED (R8, 16 live libraries): 18 rows across
+        # agent-mvnewfyb (14) and agent-mvnf7fjl (4) — all of them
+        # "never measured", none of them a wrong version.
+        #
+        # The discriminator is per PATH: the chunks side tells us
+        # whether the statistic was ever known.
+        null_paths = prof.files_cv_null_paths
+        erased_paths: List[str] = []
+        never_measured_paths: List[str] = []
+        for path in null_paths:
+            decided, v4 = prof.files_cv_null_state.get(path, (0, 0))
+            if decided == 0 and v4 == 0:
+                never_measured_paths.append(path)
             else:
-                detail.append("      ⇒ 结论: FAIL（被擦成 NULL：chunks 侧已迁移"
-                              "（指针在、锚点带 v4 语法），只有 files 统计列被清空）")
-                ok = False
-            continue
-        # some cv is present
-        others = {k: v for k, v in prof.files_cv.items() if k != version}
-        if others:
+                erased_paths.append(path)
+
+        # The version check — only over the NON-NULL values.  NULL is
+        # "no value", not "a value that is not the current one".
+        others = {k: v for k, v in prof.files_cv.items()
+                  if k is not None and k != version}
+
+        if erased_paths:
+            detail.append("      ⇒ 结论: FAIL（被擦成 NULL：%d 个 path 的统计列被清空，"
+                          "但 chunks 侧已迁移 —— 已判定行/v4 锚点都在）"
+                          % len(erased_paths))
+            for p in erased_paths[:5]:
+                detail.append("         被擦的 path: %s" % p)
+            ok = False
+        elif others:
             detail.append("      ⇒ 结论: FAIL（版本错：存在非当前版本的 chunker_version %s）"
                           % others)
             ok = False
+        elif never_measured_paths:
+            detail.append("      ⇒ 结论: PASS（%d 个 path 的统计列是 NULL，但 chunks 侧"
+                          "从未判定过它们 ⇒ 从未测量，不是被擦；其余 %d 个 path 齐备）"
+                          % (len(never_measured_paths),
+                             prof.files_rows - len(never_measured_paths)))
+            for p in never_measured_paths[:5]:
+                detail.append("         合法 NULL（从未测量）: %s" % p)
         elif prof.files_cc_null:
             detail.append("      ⇒ 结论: FAIL（chunk_count 有 NULL：files 统计列被部分擦除）")
             ok = False
@@ -625,6 +846,8 @@ def judge_files_statistics_are_not_erased(report, workspace: Path):
     detail.append("")
     detail.append("三态可分：从未迁移(NOTRUN) / 被擦成 NULL(FAIL) / 版本错(FAIL) —— "
                   "依据是 chunks 侧是否已迁移（F1~F3 + 锚点 v4 语法）。")
+    detail.append("R8: NULL 是「没填过」不是「填错了」；口径与 M6e 同源，"
+                  "同一批行的结论必然一致。")
     return report.judge(
         "J-3(REAL)",
         "J-3 files 统计列：区分「从未迁移」/「被擦成 NULL」/「版本错」（逐库三态）",

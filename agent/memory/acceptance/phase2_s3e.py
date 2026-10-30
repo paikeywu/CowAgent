@@ -463,68 +463,131 @@ def judge_r_s3_5_mirror_has_a_setter(report, workspace: Path):
     # 通过时置位——明确置位者，防止三态机退化为装饰）".  The migration
     # tool only MEASURES whether the inspector has done it.
     #
-    # The previous version of this criterion looked for
-    # ``migrate.step_m6`` and reported NOTRUN because that step was
-    # gated on a ruling that had not yet been made.  That was correct
-    # THEN and is STALE NOW: the gate is open, the inspector is the
-    # setter, and 2674 rows ARE 'mirror'.  A criterion that keeps
-    # saying NOTRUN after the thing it waited for has happened is a
-    # criterion that has stopped measuring.
+    # ------------------------------------------------------------------------
+    # R8 (第八轮) — BY BEHAVIOUR, NOT BY SOURCE TEXT.
+    #
+    # The old check read the SETTER'S SOURCE and looked for the literals
+    # ``"text_state='mirror'"`` and ``"rebuild_from_anchor"``.  When the
+    # setter DELEGATED (S3-K), the rule MOVED to the delegate, and the
+    # criterion had to be patched to follow it — a patch that would
+    # break again the next time the rule moves.
+    #
+    # **That patch is worse than no criterion.**  A criterion that
+    # reports RED because the implementation moved is a false red, and
+    # a false red nobody fixes teaches the whole team that the gate is
+    # noise.  The R7 review said it exactly: 「最该动的不是『会假红』，
+    # 而是『假红没人修』」.
+    #
+    # So the criterion now asks the BEHAVIOURAL question on a COPY:
+    #
+    #   * a row whose text does NOT match the file ⇒ the setter must
+    #     NOT promote it (「复核通过才置位」);
+    #   * a row whose text DOES match ⇒ the setter must promote it
+    #     (「置位者是明确的」).
+    #
+    # Both halves are measured, so neither the name of the setter nor
+    # the place the rule lives can make this criterion go red.
+    has_setter = False
+    writes_mirror = False
+    verifies_first = False
+    delegate_name = "（行为判定）"
     try:
-        from agent.memory import inspector as _inspector
-        has_setter = hasattr(_inspector.Inspector, "_set_mirror_state")
-        setter_src = ""
-        if has_setter:
-            import inspect
-            setter_src = inspect.getsource(
-                _inspector.Inspector._set_mirror_state)
+        import shutil as _shutil
+        import sqlite3 as _sqlite3
+        import tempfile as _tempfile
+        from agent.memory import certify as _certify
+
+        has_setter = hasattr(_certify, "certify_library")
+        libs_now = enumerate_live(workspace)
+        if not libs_now:
+            detail.append("没有活库，无法做行为判定")
+            has_setter = False
+        else:
+            lib0 = libs_now[0]
+            probe_dir = Path(_tempfile.mkdtemp(prefix="rs35-probe-"))
+            probe_db = probe_dir / "index.db"
+            _shutil.copy2(str(lib0.db), str(probe_db))
+            pconn = _sqlite3.connect(str(probe_db))
+            pconn.row_factory = _sqlite3.Row
+            try:
+                # The LEDGER is the witness: an entry means "this row
+                # was certified".  So the question 「复核通过才置位」 is
+                # observable as: a row whose stored text does NOT match
+                # the file must NOT acquire a ledger entry.
+                #
+                # MEASURED (R8): the first attempt asserted on
+                # ``text_state`` and got the wrong answer — the GUARD
+                # restores 'mirror' from its snapshot, so the probe was
+                # measuring the guard, not the setter.  The ledger is
+                # written by the certifier and nobody else, so it is the
+                # right witness.
+                def _has_entry(conn, rid):
+                    try:
+                        return conn.execute(
+                            "SELECT COUNT(*) FROM cert_ledger WHERE id=?",
+                            (rid,)).fetchone()[0] > 0
+                    except Exception:
+                        return None
+
+                victims = pconn.execute(
+                    "SELECT id FROM chunks WHERE body_path IS NOT NULL "
+                    "AND body_origin='file' LIMIT 2").fetchall()
+                if len(victims) < 2:
+                    detail.append("副本里没有两行可判定的 file 行 —— "
+                                  "无法在行为层验证置位者")
+                    has_setter = False
+                else:
+                    bad_id = victims[0]["id"]
+                    good_id = victims[1]["id"]
+                    # --- row 1: the stored text is WRONG -------------
+                    pconn.execute(
+                        "UPDATE chunks SET text=text || ' <<<DRIFT>>>' "
+                        "WHERE id=?", (bad_id,))
+                    pconn.execute("DELETE FROM cert_ledger WHERE id=?",
+                                  (bad_id,))
+                    pconn.commit()
+                    rep1 = _certify.certify_library(
+                        lib0.workspace, probe_db, name="probe")
+                    got_entry = _has_entry(pconn, bad_id)
+                    verifies_first = (got_entry is False)
+                    detail.append("行为判定·行1（正文被改坏）: "
+                                  "认证器 refused=%s 该行拿到账本条目=%s ⇒ "
+                                  "没有复核通过就不置位=%s"
+                                  % (rep1.get("refused"), got_entry,
+                                     verifies_first))
+
+                    # --- row 2: the stored text is RIGHT --------------
+                    pconn.execute("DELETE FROM cert_ledger WHERE id=?",
+                                  (good_id,))
+                    pconn.commit()
+                    rep2 = _certify.certify_library(
+                        lib0.workspace, probe_db, name="probe")
+                    got_entry2 = _has_entry(pconn, good_id)
+                    writes_mirror = (got_entry2 is True)
+                    detail.append("行为判定·行2（正文相符）: "
+                                  "认证器 promoted=%s 该行拿到账本条目=%s ⇒ "
+                                  "复核通过就置位=%s"
+                                  % (rep2.get("promoted"), got_entry2,
+                                     writes_mirror))
+            finally:
+                pconn.close()
+                try:
+                    _shutil.rmtree(probe_dir, ignore_errors=True)
+                except Exception:
+                    pass
+        detail.append("置位者: 行为判定（不读源码）—— "
+                      "存在=%s 复核通过才置位=%s 复核通过就置位=%s"
+                      % (has_setter, verifies_first, writes_mirror))
+        detail.append("（置位者是巡检器，不是迁移器：迁移器只测量巡检器做没做，"
+                      "自己置位会让三态机退化为装饰）")
+        detail.append("R8: 判据读【语义锚点】（认证器的公开行为），"
+                      "不读【实现长相】（源码字面量）—— "
+                      "『规则搬到哪』不再能让这条判据变红。")
+        detail.append("（证人用【账本条目】而不是 text_state：守卫会把 text_state "
+                      "从快照恢复成 mirror，用它当证人量到的是守卫，不是置位者。）")
     except Exception as e:
         detail.append("置位者检查失败: %s: %s" % (type(e).__name__, e))
-        has_setter, setter_src = False, ""
-
-    # The setter must be EXPLICIT: it must actually write 'mirror', and
-    # it must only do so for rows it has just verified byte-equal.
-    #
-    # P1-阶段三 S3-K: the setter DELEGATES.  ``_set_mirror_state`` now
-    # calls ``agent.memory.certify.certify_library``, and the byte
-    # comparison lives THERE — so reading only the setter's own source
-    # finds neither the write nor the check, and the criterion goes red
-    # for a reason that has nothing to do with the product.
-    #
-    # MEASURED: on the S3-K tree, ``_set_mirror_state``'s source
-    # contains NEITHER ``text_state='mirror'`` NOR
-    # ``rebuild_from_anchor``; ``certify_library``'s source contains
-    # BOTH.  The rule did not change — it MOVED.  So the criterion
-    # follows the call: it reads the setter's source AND the source of
-    # the function the setter delegates to.
-    #
-    # This is the "criterion must follow the implementation" rule, and
-    # it is the same shape as the S3-J "the chain must consult the
-    # files bookkeeping" mutant: a criterion that looks at the wrong
-    # place reports a defect that is not there.
-    delegate_src = ""
-    delegate_name = ""
-    try:
-        import inspect
-        from agent.memory import certify as _certify
-        delegate_name = "agent.memory.certify.certify_library"
-        delegate_src = inspect.getsource(_certify.certify_library)
-    except Exception as e:
-        detail.append("委托实现检查失败: %s: %s" % (type(e).__name__, e))
-
-    effective_src = setter_src + "\n" + delegate_src
-    writes_mirror = "text_state='mirror'" in effective_src or \
-        "STATE_MIRROR" in effective_src
-    verifies_first = "rebuild_from_anchor" in effective_src and \
-        ('!= (text or' in effective_src or '!= (row["text"] or' in effective_src)
-    detail.append("置位者: agent.memory.inspector.Inspector._set_mirror_state "
-                  "存在=%s 显式写 text_state='mirror'=%s 置位前逐字节复核=%s"
-                  % (has_setter, writes_mirror, verifies_first))
-    detail.append("（置位者是巡检器，不是迁移器：迁移器只测量巡检器做没做，"
-                  "自己置位会让三态机退化为装饰）")
-    detail.append("S3-K: 置位者已委托给 %s，字节复核的实现在那里 —— "
-                  "判据跟随委托一起读，否则会把『实现搬家』说成『产品坏了』。"
-                  % (delegate_name or "（拿不到）"))
+        has_setter, writes_mirror, verifies_first = False, False, False
 
     if wrong_mirror:
         detail.append("错置为 mirror 但指针不可解析的行: %d (%s)"
@@ -917,12 +980,25 @@ def judge_s1_criteria_do_not_modify_what_they_measure(report, workspace: Path):
             # to revert exactly this mutation, so leaving it on would
             # make the criterion measure the guard instead of the
             # digest.  (The LIVE library is never touched.)
+            #
+            # R8: BY PURPOSE, NOT BY NAME.  The old code dropped five
+            # hard-coded trigger names.  If the guard is renamed — or a
+            # new trigger is added — the DROP misses it, the mutation is
+            # reverted by the guard, and the criterion reports "the
+            # mutation did not land" and goes NOTRUN: a false green
+            # that hides the very hole the criterion exists for.
+            #
+            # So the triggers are DISCOVERED: every trigger attached to
+            # the ``chunks`` table is dropped, by reading
+            # ``sqlite_master``.  The rule is "the guard on this
+            # table", not "these five names".
             dropped = []
-            for trig in ("chunks_body_keep_bu", "chunks_body_keep_bi",
-                         "chunks_body_keep_bd", "chunks_body_keep_bi_ai",
-                         "chunks_body_keep_st_ai"):
-                conn.execute("DROP TRIGGER IF EXISTS %s" % trig)
-                dropped.append(trig)
+            trig_rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' "
+                "AND tbl_name='chunks'").fetchall()
+            for (tname,) in trig_rows:
+                conn.execute("DROP TRIGGER IF EXISTS %s" % tname)
+                dropped.append(tname)
             conn.commit()
             before = content_digest(conn)
             row = conn.execute("SELECT id FROM chunks WHERE body_path IS NOT NULL "

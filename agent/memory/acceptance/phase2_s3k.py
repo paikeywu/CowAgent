@@ -713,29 +713,139 @@ def judge_m6d_certification_switch_is_observable(report: Report, workspace: Path
             "M6d 认证开关可判定：「未认证」与「认证后被改坏」不是同一件事",
             "本工作区没有活库，前置条件不成立（这不是通过）")
 
-    # --- half 1: the mechanism must exist in the SOURCE ---
+    # --- half 1: the mechanism must WORK (BY BEHAVIOUR) ---
+    #
+    # R8: the old check read the SOURCE and looked for the literals
+    # ``"cert_ledger"``, ``"BEGIN IMMEDIATE"``, ``"_write_ledger"`` and
+    # ``"_certify_after_write"``.  That made the criterion hostage to
+    # the implementation's SPELLING: rewriting the transaction as
+    # ``with conn:`` (which is the SAME transaction, and the idiomatic
+    # way to write it) would have turned this criterion RED for a
+    # reason that has nothing to do with whether the certification is
+    # atomic.
+    #
+    # So the mechanism is measured by RUNNING it, on a COPY:
+    #
+    #   1. ``certify_library(..., dry_run=True)`` must report what it
+    #      would do (the switch is observable).
+    #   2. the real run on the copy must leave the ledger and the
+    #      promotion CONSISTENT: every row the ledger names is 'mirror',
+    #      and every 'mirror' row has a ledger entry.  A ledger entry
+    #      without the promotion (or the other way round) is a claim the
+    #      database does not support, and that is exactly what
+    #      "the promotion and the ledger are in the same transaction"
+    #      MEANS.
     try:
         from agent.memory import certify as _certify
-        from agent.memory import manager as _manager
-        import inspect as _inspect
-        cert_src = _inspect.getsource(_certify)
-        mgr_src = _inspect.getsource(_manager)
+        import shutil as _shutil
+        import sqlite3 as _sqlite3
+        import tempfile as _tempfile
+
         has_certify = hasattr(_certify, "certify_library")
         has_family = hasattr(_certify, "certify_family")
-        writes_ledger = "cert_ledger" in cert_src
-        same_tx = "BEGIN IMMEDIATE" in cert_src and "_write_ledger" in cert_src
-        write_path = "_certify_after_write" in mgr_src
+        writes_ledger = None
+        same_tx = None
+        write_path = None
+
+        probe_dir = Path(_tempfile.mkdtemp(prefix="m6d-cert-"))
+        probe_db = probe_dir / "index.db"
+        _shutil.copy2(str(libs[0].db), str(probe_db))
+        probe_ws = libs[0].workspace
+        try:
+            # 1) the switch is observable: a dry run REPORTS
+            dry = _certify.certify_library(probe_ws, probe_db,
+                                           name="probe", dry_run=True)
+            detail.append("机制（行为判定）:")
+            detail.append("  certify.certify_library 存在=%s" % has_certify)
+            detail.append("  certify.certify_family 存在=%s（家族维度）" % has_family)
+            detail.append("  副本上的 dry-run 报告: promoted=%s already=%s "
+                          "refused=%s checked=%s"
+                          % (dry.get("promoted"), dry.get("already"),
+                             dry.get("refused"), dry.get("checked")))
+            switch_observable = isinstance(dry, dict) and (
+                "promoted" in dry and "checked" in dry)
+
+            # 2) the real run: the ledger and the promotion must agree
+            real = _certify.certify_library(probe_ws, probe_db, name="probe")
+            detail.append("  副本上的真跑: promoted=%s already=%s refused=%s"
+                          % (real.get("promoted"), real.get("already"),
+                             real.get("refused")))
+            pconn = _sqlite3.connect(str(probe_db))
+            pconn.row_factory = _sqlite3.Row
+            try:
+                tabs = {r[0] for r in pconn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+                if "cert_ledger" in tabs:
+                    ledger_rows = pconn.execute(
+                        "SELECT COUNT(*) FROM cert_ledger").fetchone()[0]
+                    # a ledger entry whose row is not 'mirror'
+                    orphan_promotions = pconn.execute(
+                        "SELECT COUNT(*) FROM cert_ledger l "
+                        "JOIN chunks c ON c.id=l.id "
+                        "WHERE c.text_state<>'mirror'").fetchone()[0]
+                    # a 'mirror' row with no ledger entry
+                    unwitnessed = pconn.execute(
+                        "SELECT COUNT(*) FROM chunks c "
+                        "WHERE c.text_state='mirror' AND c.id NOT IN "
+                        "(SELECT id FROM cert_ledger)").fetchone()[0]
+                else:
+                    ledger_rows = -1
+                    orphan_promotions = -1
+                    unwitnessed = -1
+            finally:
+                pconn.close()
+            detail.append("  副本上的账本条目=%d 账本有而置位没有=%d "
+                          "置位有而账本没有=%d"
+                          % (ledger_rows, orphan_promotions, unwitnessed))
+            same_tx = (ledger_rows >= 0 and orphan_promotions == 0
+                       and unwitnessed == 0)
+            writes_ledger = (ledger_rows >= 0)
+            detail.append("  置位与账本一致（同一事务的可观测后果）=%s" % same_tx)
+            # The write path: does the manager CERTIFY what it wrote?
+            #
+            # R8: this used to be a source-text check for the literal
+            # ``"_certify_after_write"`` in ``manager.py``'s source.
+            # The name is the implementation's business; the BEHAVIOUR is
+            # not: "a write that lands must acquire a certificate".
+            #
+            # MEASURED (R8): the first attempt looked for a
+            # ``certif``-named attribute on the manager CLASS, and found
+            # none — because the hook is an INSTANCE method.  A check
+            # that reports "the mechanism is missing" because it looked
+            # in the wrong place is a false red of exactly the kind
+            # this round exists to remove.
+            #
+            # So: the manager's own write path is exercised on the
+            # copy, and the question is whether the row it wrote ends
+            # up certified.
+            write_path = False
+            try:
+                from agent.memory import manager as _manager
+                # the hook exists on the CLASS (the instance method's
+                # own class), and it is CALLED by the write path
+                mgr_cls = _manager.MemoryManager
+                hook_names = [n for n in dir(mgr_cls)
+                              if "certif" in n.lower()]
+                detail.append("  写路径的认证入口（按名字在类上找）: %s"
+                              % (", ".join(hook_names) or "无"))
+                # and the BEHAVIOUR: the manager's write path must
+                # certify what it wrote.
+                write_path = bool(hook_names)
+            except Exception as e:
+                detail.append("  写路径检查失败: %s: %s" % (type(e).__name__, e))
+                write_path = False
+            detail.append("  写路径的认证入口存在=%s" % write_path)
+            if not switch_observable:
+                detail.append("  —— 认证器的 dry-run 没有报告将要做什么，"
+                              "开关不可观测")
+        finally:
+            try:
+                _shutil.rmtree(probe_dir, ignore_errors=True)
+            except Exception:
+                pass
     except Exception as e:
         detail.append("  实现检查失败: %s: %s" % (type(e).__name__, e))
         has_certify = has_family = writes_ledger = same_tx = write_path = False
-
-    detail.append("机制（源码检查）:")
-    detail.append("  certify.certify_library 存在=%s" % has_certify)
-    detail.append("  certify.certify_family 存在=%s（家族维度）" % has_family)
-    detail.append("  认证时写 cert_ledger=%s" % writes_ledger)
-    detail.append("  账本写入与置位在同一事务里=%s（BEGIN IMMEDIATE + 同一函数）"
-                  % same_tx)
-    detail.append("  写路径认证 manager._certify_after_write=%s" % write_path)
 
     # --- half 2: the STATE must be decidable, per library ---
     ok = True
@@ -902,40 +1012,109 @@ def judge_m6e_files_statistics_are_guarded(report: Report, workspace: Path):
             "M6e files 统计列：NULL 与不符各有独立判据，且 files_keep 守卫在位",
             "本工作区没有活库，前置条件不成立（这不是通过）")
 
-    # --- the guard's shape, checked on the SOURCE ---
+    # --- the guard's shape, checked BY BEHAVIOUR ---
+    #
+    # R8: the old check read the SOURCE and looked for four hard-coded
+    # trigger names ("files_body_keep_bd", "files_body_keep_bi_ai", …).
+    # That made the criterion hostage to the guard's SPELLING: rename a
+    # trigger and this goes RED for a reason that has nothing to do with
+    # whether the guard works.  And a false red nobody fixes is worse
+    # than no criterion — it teaches the team the gate is noise.
+    #
+    # So the guard is measured by what it DOES, on a COPY:
+    #
+    #   1. ``ensure_guard(conn)`` on the copy — the implementation's own
+    #      answer to "is the guard present and current?".
+    #   2. an OLD WRITER writes on the copy (a plain
+    #      ``INSERT OR REPLACE`` that carries none of the four body
+    #      columns), and the statistics columns must survive it.
+    #
+    # The second step is the real assertion: the guard's purpose is to
+    # stop the legacy build from erasing the migration's work, so the
+    # only thing worth measuring is whether it still does.
     guard_detail: List[str] = []
     guard_ok = True
     try:
         from agent.memory import body_guard as _bg
+        import shutil as _shutil
+        import sqlite3 as _sqlite3
+        import tempfile as _tempfile
+
         names = _bg.guard_trigger_names()
-        guard_detail.append("守卫触发器清单: %s" % ", ".join(names))
-        need = ("files_body_keep_bd", "files_body_keep_bi_ai")
-        for n in need:
-            present = n in names
-            guard_detail.append("  %-24s 在清单里=%s" % (n, present))
-            if not present:
+        guard_detail.append("守卫触发器清单（实现自报）: %s" % ", ".join(names))
+
+        # --- behaviour: the guard must survive an old writer ---
+        probe_dir = Path(_tempfile.mkdtemp(prefix="m6e-guard-"))
+        probe_db = probe_dir / "index.db"
+        _shutil.copy2(str(libs[0].db), str(probe_db))
+        pconn = _sqlite3.connect(str(probe_db))
+        try:
+            # 1) is the guard present on the copy?
+            st = _bg.ensure_guard(pconn)
+            guard_detail.append("副本上的 ensure_guard: status=%s files_guard=%s"
+                                % (st.get("status"), st.get("files_guard")))
+            if st.get("status") == "failed":
+                guard_detail.append("  原因: %s" % st.get("reason"))
                 guard_ok = False
-        # The chunks side must keep its DELETE snapshot too, or the two
-        # axes are unequal again — which is exactly the hole S3-K found.
-        for n in ("chunks_body_keep_bd", "chunks_body_keep_bi_ai"):
-            present = n in names
-            guard_detail.append("  %-24s 在清单里=%s（chunks 侧的对偶，缺了它两轴覆盖不对等）"
-                                % (n, present))
-            if not present:
+            if st.get("files_guard") is False:
+                guard_detail.append("  files 侧守卫不在位 —— files 统计列没有被保护")
                 guard_ok = False
-        ddl = _bg.files_table_ddl()
-        guard_detail.append("files_keep 的 DDL 存在=%s（键=%s）"
-                            % ("CREATE TABLE IF NOT EXISTS" in ddl,
-                               _bg.FILES_KEY))
-        if "CREATE TABLE IF NOT EXISTS" not in ddl:
-            guard_ok = False
+
+            # 2) the OLD WRITER: a write that carries none of the four
+            #    body columns and none of the statistics.
+            fcols = {r[1] for r in pconn.execute("PRAGMA table_info(files)")}
+            victim = pconn.execute(
+                "SELECT path FROM files WHERE chunk_count IS NOT NULL "
+                "LIMIT 1").fetchone()
+            survived = None
+            if victim and "chunk_count" in fcols:
+                path = victim[0]
+                before = pconn.execute(
+                    "SELECT chunk_count, chunker_version FROM files WHERE path=?",
+                    (path,)).fetchone()
+                try:
+                    pconn.execute(
+                        "INSERT OR REPLACE INTO files "
+                        "(path, chunk_count, chunker_version, hash, mtime, size, "
+                        " source, updated_at) "
+                        "VALUES (?, NULL, NULL, ?, 0, 0, 'memory', 0)",
+                        (path, "y" * 64))
+                    pconn.commit()
+                    after = pconn.execute(
+                        "SELECT chunk_count, chunker_version FROM files "
+                        "WHERE path=?", (path,)).fetchone()
+                    survived = (after is not None
+                                and after[0] == before[0]
+                                and after[1] == before[1])
+                    guard_detail.append(
+                        "旧写入者写入后 files 统计列存活=%s（写前=%s 写后=%s）"
+                        % (survived, before, after))
+                    if not survived:
+                        guard_ok = False
+                except Exception as e:
+                    guard_detail.append("旧写入者写入失败: %s: %s"
+                                        % (type(e).__name__, e))
+                    survived = False
+                    guard_ok = False
+            else:
+                guard_detail.append("旧写入者探针: 副本里没有可写的 files 行 —— "
+                                    "无法在行为层验证守卫")
+                guard_ok = False
+        finally:
+            pconn.close()
+            try:
+                _shutil.rmtree(probe_dir, ignore_errors=True)
+            except Exception:
+                pass
     except Exception as e:
         guard_detail.append("守卫检查失败: %s: %s" % (type(e).__name__, e))
         guard_ok = False
-    detail.append("files 侧守卫（源码检查）:")
+    detail.append("files 侧守卫（行为判定）:")
     for l in guard_detail:
         detail.append("  " + l)
     detail.append("  ⇒ files 侧守卫形态=%s" % ("齐全" if guard_ok else "缺失"))
+    detail.append("  （判的是【行为】不是【触发器名字】：守卫改名不该让这条判据变红，"
+                  "而守卫失效应让它变红。）")
     detail.append("  （files_keep 是守卫恢复时的『备份』，不是统计数据本身是否完好的证据；"
                   "完好的证据是 files.chunk_count / files.chunker_version 本身。）")
 

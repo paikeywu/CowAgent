@@ -951,29 +951,27 @@ def judge_upsert_does_not_downgrade_the_body_columns(report, workspace: Path):
             "不填四列的旧写入者不会擦掉已判定值（迁移填好的值不被降级）",
             "storage / schema_drift 不可用（%s: %s）" % (type(e).__name__, e))
 
-    # The rule under test: the SQL fragment's shape.  It must be
-    # CONDITIONAL on the incoming value, so that a NULL/empty incoming
-    # value cannot overwrite a decided one.
-    detail.append("BODY_COLUMN_UPSERT_SQL 片段:")
+    # The rule under test: the STALE WRITER must not erase a decided
+    # value.  That is a BEHAVIOUR, and the behaviour is measured below
+    # (on a scratch database: a stale writer runs, and the decided
+    # values must survive it).
+    #
+    # R8: the old check ALSO read the SQL fragment's TEXT and matched
+    # it against the regex ``col = CASE WHEN excluded.col IS NOT NULL``.
+    # That made the criterion hostage to the SQL's spelling: writing
+    # the same rule as ``COALESCE(excluded.col, chunks.col)`` — which
+    # is the SAME rule and the idiomatic way to write it — would have
+    # turned this criterion RED for a reason that has nothing to do
+    # with whether the anti-downgrade works.
+    #
+    # So the text-matching half is GONE, and only the behaviour
+    # remains.  The SQL is still printed (the reader may want to see
+    # what ran), but nothing is ASSERTED about its shape.
+    detail.append("BODY_COLUMN_UPSERT_SQL 片段（仅供阅读，不据此判定）:")
     for line in BODY_COLUMN_UPSERT_SQL.strip().splitlines():
         detail.append("    %s" % line.strip())
-    conditional = {}
-    for col in ("body_path", "body_anchor", "body_hash", "text_state",
-                "body_origin"):
-        m = re.search(
-            r"%s\s*=\s*CASE\s+WHEN\s+excluded\.%s\s+IS\s+NOT\s+NULL"
-            % (col, col), BODY_COLUMN_UPSERT_SQL)
-        conditional[col] = bool(m)
-        detail.append("  %-12s 有条件覆盖（excluded IS NOT NULL 时才写）: %s"
-                      % (col, bool(m)))
-    detail.append("（text_state 另有一条『excluded 不许是 projection』的规则；"
-                  "body_origin 另有一条『excluded 不许是 unresolved』的规则。）")
-    for col in ("body_origin",):
-        m2 = re.search(r"%s\s*=\s*CASE\s+WHEN\s+excluded\.%s\s+IS\s+NOT\s+NULL"
-                       r"\s+AND\s+excluded\.%s\s*<>\s*'unresolved'"
-                       % (col, col, col), BODY_COLUMN_UPSERT_SQL)
-        conditional[col] = conditional[col] and bool(m2)
-        detail.append("  %-12s 另需排除 'unresolved': %s" % (col, bool(m2)))
+    detail.append("R8: 判据不再对 SQL 的【写法】做断言 —— 条件覆盖可以有多种写法，"
+                  "断言的是【旧写入者写完之后已判定值仍在】这个行为。")
 
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "index.db"
@@ -1027,15 +1025,9 @@ def judge_upsert_does_not_downgrade_the_body_columns(report, workspace: Path):
         if v != decided[k]:
             ok = False
             detail.append("  —— %s 被降级：%r -> %r" % (k, decided[k], v))
-    for col, cond in conditional.items():
-        if not cond:
-            ok = False
-            detail.append("  —— SQL 片段里 %s 不是条件覆盖：旧写入者会直接盖掉"
-                          "已判定值" % col)
 
     if ok:
-        detail.append("结论：不填四列的旧写入者没有擦掉任何已判定值；"
-                      "SQL 片段对五列都是条件覆盖。")
+        detail.append("结论：不填四列的旧写入者没有擦掉任何已判定值。")
     return report.judge(
         "UPSERT(unit)",
         "不填四列的旧写入者不会擦掉已判定值（迁移填好的值不被降级）",
@@ -1076,16 +1068,140 @@ def judge_anchor_parser_is_single(report, workspace: Path = None):
     not the point.
     """
     import ast
+    import importlib
 
     detail: List[str] = []
     root = Path(__file__).resolve().parent.parent
-    #: The ONE designated implementation.  Everything else that parses
-    #: the grammar is a second copy.
-    THE_ONE_SOURCE = ("body_pointer.py", "parse_anchor")
+    #: The candidate parser NAMES.  A name is only a CANDIDATE — the
+    #: verdict is decided by BEHAVIOUR, below.
     parser_names = ("_parse_anchor", "parse_anchor", "_parse_body_anchor",
                     "parse_body_anchor")
+
+    #: R8 — the criterion writes its OWN parser, from the grammar, and
+    #: uses it as the reference.  Then every candidate function in the
+    #: repository is RUN against the same anchor samples, and a
+    #: candidate is a SECOND IMPLEMENTATION when it disagrees with the
+    #: reference on any sample.
+    #:
+    #: Why this replaces the old "exclude the designated source by
+    #: name" rule: that rule hard-coded ``("body_pointer.py",
+    #: "parse_anchor")``.  Rename the module, move the function, or
+    #: split it — and the criterion either flagged the real source as
+    #: a second copy (a permanent red) or missed the copy it was
+    #: supposed to catch.  **Naming the source is what made the check
+    #: fragile.**
+    #:
+    #: With a REFERENCE implementation, the question becomes "is there
+    #: another implementation?", and it is answered by BEHAVIOUR: a
+    #: second parser is a function that parses the grammar — and a
+    #: function that parses it wrongly is exactly the defect this
+    #: criterion exists for.
+    SAMPLES = (
+        "L1-18",
+        "L10-20+1-5",
+        "L1-3:p2",
+        "L1-3+1-5,6-9",
+        "L1-3+1-5~2",
+        "L1-3:p1+1-5,6-9~3",
+        "not-an-anchor",
+        "",
+    )
+
+    def _reference(anchor):
+        """The criterion's own parser, written from the grammar.
+
+        ``body_anchor := "L" start "-" end [":p" part] ["+S" seg(,seg)*]``
+        ``seg         := start "-" end ["~" tailblanks]``
+
+        Returns a comparable tuple, or None when the anchor cannot be
+        parsed.  Written independently of the implementation, so it is
+        a reference and not a copy.
+        """
+        if not anchor or not anchor.startswith("L"):
+            return None
+        body = anchor[1:]
+        segments = ()
+        if "+S" in body:
+            body, seg_text = body.split("+S", 1)
+            segs = []
+            for raw in seg_text.split(","):
+                raw = raw.strip()
+                if not raw:
+                    return None
+                tail = 0
+                if "~" in raw:
+                    raw, tail_text = raw.rsplit("~", 1)
+                    try:
+                        tail = int(tail_text)
+                    except ValueError:
+                        return None
+                    if tail < 0:
+                        return None
+                if "-" not in raw:
+                    return None
+                a_text, b_text = raw.split("-", 1)
+                try:
+                    a, b = int(a_text), int(b_text)
+                except ValueError:
+                    return None
+                if a < 1 or b < a:
+                    return None
+                segs.append((a, b, tail))
+            if not segs:
+                return None
+            segments = tuple(segs)
+        part = 0
+        if ":p" in body:
+            body, p = body.rsplit(":p", 1)
+            try:
+                part = int(p)
+            except ValueError:
+                return None
+        if "-" not in body:
+            return None
+        a_text, b_text = body.split("-", 1)
+        try:
+            a, b = int(a_text), int(b_text)
+        except ValueError:
+            return None
+        if a < 1 or b < a:
+            return None
+        if not segments:
+            # No ``+S``: ONE CONTIGUOUS SPAN, read verbatim.
+            segments = ((a, b, 0),)
+        else:
+            # The segment sequence must AGREE with the span the anchor
+            # claims — a disagreement means the anchor is broken.
+            if segments[0][0] != a or segments[-1][1] != b:
+                return None
+        return (a, b, part, segments)
+
+    def _candidate_answer(fn, anchor):
+        """A candidate's answer, normalized to the reference's shape."""
+        try:
+            got = fn(anchor)
+        except Exception:
+            return ("<raised>",)
+        if got is None:
+            return None
+        # The implementation returns a NamedTuple; normalize it by its
+        # FIELDS (not by its class name), so a rename of the type does
+        # not break the comparison.
+        if all(hasattr(got, a) for a in
+               ("start", "end", "part", "segments")):
+            segs = tuple(
+                (s.start, s.end, getattr(s, "tailblanks", 0))
+                for s in (got.segments or ()))
+            return (got.start, got.end, got.part, segs)
+        if isinstance(got, tuple) and len(got) >= 4:
+            return (got[0], got[1], got[2],
+                    tuple((s.start, s.end, getattr(s, "tailblanks", 0))
+                          for s in (got[3] or ())))
+        return ("<unrecognized>", repr(got)[:80])
+
     found: List[str] = []
     scanned: List[str] = []
+    checked: List[str] = []
     for path in sorted(root.glob("*.py")):
         try:
             src = path.read_text(encoding="utf-8")
@@ -1098,37 +1214,56 @@ def judge_anchor_parser_is_single(report, workspace: Path = None):
                 continue
             if node.name not in parser_names:
                 continue
-            if (path.name, node.name) == THE_ONE_SOURCE:
-                continue          # the designated source: not a second copy
-            body_src = ast.unparse(node)
-            # A parser MENTIONS the grammar's markers; a re-export just
-            # calls the one parser.
-            mentions_grammar = bool(re.search(r"['\"]L['\"]|\+S|body_anchor",
-                                              body_src))
-            calls_the_one = bool(re.search(
-                r"body_pointer\.parse_anchor|rebuild_from_anchor", body_src))
-            if mentions_grammar and not calls_the_one:
+            # Load the module and get the function.  A module that
+            # cannot be imported is not a parser we can call; it is
+            # reported separately (an unimportable candidate is still
+            # a second copy of the grammar on paper).
+            modname = "agent.memory.%s" % path.stem
+            try:
+                mod = importlib.import_module(modname)
+                fn = getattr(mod, node.name, None)
+            except Exception:
+                fn = None
+            if fn is None:
+                found.append("%s:%d %s（模块不可导入，语法上仍是一份实现）"
+                             % (path.name, node.lineno, node.name))
+                continue
+            disagrees = []
+            for sample in SAMPLES:
+                try:
+                    ref = _reference(sample)
+                except Exception:
+                    ref = "<reference-raised>"
+                got = _candidate_answer(fn, sample)
+                if got != ref:
+                    disagrees.append((sample, ref, got))
+            if not disagrees:
+                checked.append("%s:%d %s" % (path.name, node.lineno, node.name))
+            else:
+                detail.append("  ! %s:%d %s 与判据自己的解析器在 %d 个样本上不一致:"
+                              % (path.name, node.lineno, node.name,
+                                 len(disagrees)))
+                for (sample, ref, got) in disagrees[:4]:
+                    detail.append("      样本 %r: 判据=%r 候选=%r" % (sample, ref, got))
                 found.append("%s:%d %s" % (path.name, node.lineno, node.name))
+
     detail.append("扫描的模块: %d 个（%s ...）"
                   % (len(scanned), ", ".join(scanned[:6])))
-    detail.append("指定的唯一真源: agent/memory/%s 的 %s" % THE_ONE_SOURCE)
+    detail.append("判据自己的参考解析器: 独立写自语法（%d 个样本）" % len(SAMPLES))
+    detail.append("与参考实现一致的候选: %s" % (", ".join(checked) if checked else "无"))
     detail.append("按语法自行实现锚点解析的**其它**函数: %s"
                   % (", ".join(found) if found else "无"))
-    detail.append("text_inv._parse_anchor: %s"
-                  % ("仍存在" if (root / "text_inv.py").is_file()
-                     and "_parse_anchor" in (root / "text_inv.py").read_text(
-                         encoding="utf-8").split("def read_fragment_at_anchor")[0]
-                     else "已删除"))
-    detail.append("唯一真源: agent/memory/body_pointer.py 的 parse_anchor"
-                  "（text_inv 只做 re-export，不是第二份实现）")
+    detail.append("R8: 不再按【文件名+函数名】排除真源 —— 改名或搬家不该让这条判据变红。"
+                  "真源由【行为】决定：只有与判据自己的解析器在全部样本上一致的实现，"
+                  "才是同一份规则。")
     if found:
         detail.append("  —— 有第二份锚点语法实现: %s" % ", ".join(found))
         detail.append("  —— 两处拼写一条规则，就是『锚点指向空处』的成因。")
         return report.judge(
             "PARSER(unit)",
-            "锚点语法只有一份实现（text_inv._parse_anchor 已删除，全仓只有 body_pointer.parse_anchor）",
+            "锚点语法只有一份实现（全仓只有一份实现能解析这套语法）",
             False, "\n".join(detail))
     return report.judge(
         "PARSER(unit)",
-        "锚点语法只有一份实现（text_inv._parse_anchor 已删除，全仓只有 body_pointer.parse_anchor）",
+        "锚点语法只有一份实现（全仓只有一份实现能解析这套语法）",
         True, "\n".join(detail))

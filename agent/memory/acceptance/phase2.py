@@ -896,6 +896,30 @@ _S3J_CRITERIA = [
     ("J-5", "judge_old_writer_erasure_monitor"),
 ]
 
+# ---------------------------------------------------------------------------
+# S3-R · the criteria that were WIRED IN this round.
+#
+# Two of them, and both of them answer questions that no existing
+# criterion could answer:
+#
+#   * M6f — the certification ledger has no ORPHAN entries.  Every other
+#     ledger criterion JOINS the ledger to ``chunks``, so an entry that
+#     names a chunk which is no longer in the index is invisible to all
+#     of them.
+#   * XF — the fleet's CROSS-END FINGERPRINT is uniform (seven
+#     dimensions: columns / constraints / trigger definition text /
+#     guard tables / indexes / chunker version / value domains).
+#
+# They live in their own module (``phase2_s3r``) because they read the
+# SEMANTIC ANCHORS the implementation exposes (``ledger_orphans`` /
+# ``fleet_check``) rather than re-implementing the question — a
+# criterion that re-implements the question is a second mouth for it,
+# and two mouths is exactly what broke the J-3/M6e pair.
+_S3R_CRITERIA = [
+    ("M6f", "judge_m6f_ledger_has_no_orphans"),
+    ("XF", "judge_xf_cross_end_fingerprint_is_uniform"),
+]
+
 # The criteria that GUARD the criteria (MU-12 / MU-14 / the replay).
 _GUARD_CRITERIA = [
     ("MU-12", "judge_mu12_three_states_are_real"),
@@ -993,6 +1017,24 @@ def _load_s3k():
     return out
 
 
+def _load_s3r():
+    """The S3-R criterion functions, bound to the workspace."""
+    from agent.memory.acceptance import phase2_s3r
+
+    ws = Path(resolve_workspace(ARGS.workspace)[0])
+    out = []
+    for group, attr in _S3R_CRITERIA:
+        fn = getattr(phase2_s3r, attr)
+
+        def make(fn=fn, ws=ws):
+            def run(report):
+                return fn(report, ws)
+            return run
+
+        out.append((group, make()))
+    return out
+
+
 def main() -> int:
     workspace, how = resolve_workspace(ARGS.workspace)
 
@@ -1051,6 +1093,12 @@ def main() -> int:
 
     # The S3-K criteria (the certification semantics: M6a..M6e).
     for group, fn in _load_s3k():
+        if ARGS.only and not group.startswith(ARGS.only):
+            continue
+        guarded(fn, report)
+
+    # The S3-R criteria (M6f · XF) — wired in this round.
+    for group, fn in _load_s3r():
         if ARGS.only and not group.startswith(ARGS.only):
             continue
         guarded(fn, report)
