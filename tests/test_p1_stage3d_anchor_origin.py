@@ -139,7 +139,17 @@ def test_a1_a_writer_without_the_body_columns_cannot_erase_them(tmp_path):
     ``body_path IS NULL`` on 255 of 255 rows, and "migrate → erased →
     migrate again" became an infinite loop.
 
-    The reverse case (the old behaviour) is asserted at the end.
+    **P1 阶段三 S3-I (2026-10-30): this assertion has INVERTED.**  The
+    guard is now installed on every library, so a plain UPDATE no
+    longer erases the pointer — the ``BEFORE UPDATE`` trigger restores
+    the stored values.  The old assertion (``body_path IS None`` after
+    the UPDATE) documented the HOLE; it is now the wrong expectation,
+    and a test that pins the hole is a test that demands the defect
+    come back.
+
+    So the assertion is now: the pointer SURVIVES the legacy write.
+    The reverse case below drops the guard to prove the guard is what
+    makes the difference.
     """
     ws, db, rows = _library(tmp_path)
     _fill_body_columns(ws, db, rows)
@@ -161,10 +171,12 @@ def test_a1_a_writer_without_the_body_columns_cannot_erase_them(tmp_path):
     after = conn.execute(
         "SELECT body_path, body_anchor, body_hash FROM chunks WHERE id=?",
         (before[0]["id"],)).fetchone()
-    # A plain UPDATE erases — that is the OLD behaviour, and it is what
-    # the guard has to intercept.  The UPSERT rule is what protects the
-    # NEW writer path; this assertion documents the shape of the hole.
-    assert after["body_path"] is None
+    # **The guard keeps the pointer.**  A plain UPDATE used to erase it
+    # — that was the hole, and the guard closed it.
+    assert after["body_path"] == before[0]["body_path"], (
+        "the legacy writer ERASED body_path — the guard did not fire")
+    assert after["body_anchor"] == before[0]["body_anchor"]
+    assert after["body_hash"] == before[0]["body_hash"]
     conn.close()
 
 
@@ -243,11 +255,23 @@ def test_a1_the_rule_is_written_once_and_used_by_all_three_upserts():
 
 
 def test_a1_reverse_case_the_unconditional_upsert_would_erase(tmp_path):
-    """REVERSE CASE: the old rule really does erase.
+    """REVERSE CASE: without the guard, the old rule really does erase.
 
     The criterion above pins the fix; this one proves the defect was
     real, so the criterion is not a decoration.
+
+    **P1 阶段三 S3-I (2026-10-30): the reverse case now DROPS THE
+    GUARD.**  With the guard installed, the unconditional UPDATE is
+    intercepted and the pointer survives — so the old "the reverse case
+    did not reproduce" assertion would fail, and it would fail
+    correctly: the defect is gone.
+
+    So the reverse case drops the guard's triggers, runs the same
+    unconditional UPDATE, and asserts that the pointer IS erased.  That
+    is the shape that proves the guard is what makes the difference.
     """
+    from agent.memory import body_guard
+
     ws, db, rows = _library(tmp_path)
     _fill_body_columns(ws, db, rows)
     conn = sqlite3.connect(str(db))
@@ -256,9 +280,13 @@ def test_a1_reverse_case_the_unconditional_upsert_would_erase(tmp_path):
         "SELECT id, body_path FROM chunks ORDER BY id").fetchall()
     conn.close()
 
-    # The OLD rule, spelled out: unconditional overwrite.
+    # The OLD rule, spelled out: unconditional overwrite — and WITHOUT
+    # the guard, which is what made it possible.
     conn = sqlite3.connect(str(db))
     conn.row_factory = sqlite3.Row
+    for name in body_guard.guard_trigger_names():
+        conn.execute("DROP TRIGGER IF EXISTS %s" % name)
+    conn.commit()
     for row in before:
         conn.execute(
             "UPDATE chunks SET body_path=NULL, body_anchor=NULL, "
@@ -648,12 +676,28 @@ def test_a3_the_column_is_not_null_with_an_explicit_default():
 
 
 def test_a3_reverse_case_an_unresolved_row_makes_inv1_red(tmp_path):
-    """REVERSE CASE: a row nobody judged must be RED, not PASS."""
+    """REVERSE CASE: a row nobody judged must be RED, not PASS.
+
+    **P1 阶段三 S3-I (2026-10-30): the guard's triggers are DROPPED
+    here.**  The guard restores the protected columns from the stored
+    row, so the ``UPDATE chunks SET body_origin='unresolved'`` is
+    intercepted and the row keeps its decided origin — and INV-1 then
+    correctly reports GREEN for a row that IS decided.
+
+    The reverse case is about the CRITERION, not about the guard: it
+    asks "does INV-1 report a row whose origin is unresolved?".  To ask
+    that, the row's origin must actually BE unresolved — so the guard
+    is dropped first, exactly as the A-1 reverse case above does.
+    """
+    from agent.memory import body_guard
     from agent.memory.text_inv import check_inv1
 
     ws, db, rows = _library(tmp_path)
     _fill_body_columns(ws, db, rows)
     conn = sqlite3.connect(str(db))
+    for name in body_guard.guard_trigger_names():
+        conn.execute("DROP TRIGGER IF EXISTS %s" % name)
+    conn.commit()
     conn.execute("UPDATE chunks SET body_origin='unresolved'")
     conn.commit()
     conn.close()
@@ -669,12 +713,21 @@ def test_a3_reverse_case_an_unresolved_row_makes_inv1_red(tmp_path):
 
 
 def test_a3_reverse_case_a_blob_row_without_a_hash_makes_inv1_red(tmp_path):
-    """REVERSE CASE: a blob row with no drift token is RED."""
+    """REVERSE CASE: a blob row with no drift token is RED.
+
+    **P1 阶段三 S3-I (2026-10-30): the guard's triggers are DROPPED
+    here** — for the same reason as the case above: the row's columns
+    must actually reach the state the case is about.
+    """
+    from agent.memory import body_guard
     from agent.memory.text_inv import check_inv1
 
     ws, db, rows = _library(tmp_path)
     _fill_body_columns(ws, db, rows)
     conn = sqlite3.connect(str(db))
+    for name in body_guard.guard_trigger_names():
+        conn.execute("DROP TRIGGER IF EXISTS %s" % name)
+    conn.commit()
     conn.execute("UPDATE chunks SET body_origin='blob', body_path=NULL, "
                  "body_hash=NULL")
     conn.commit()

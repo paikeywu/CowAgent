@@ -50,7 +50,25 @@ def test_inv1_green_on_seeded(tmp_path):
 
 
 def test_inv1_red_on_null_pointer(tmp_path):
+    """A row whose pointer is gone must be RED.
+
+    **P1 阶段三 S3-I (2026-10-30): the guard's triggers are DROPPED
+    here.**  The guard restores the protected columns from the stored
+    row, so ``UPDATE chunks SET body_anchor=NULL`` is intercepted and
+    the pointer survives — and INV-1 then correctly reports GREEN for a
+    row that IS pointed.
+
+    The reverse case is about the CRITERION: it asks "does INV-1 report
+    a row whose pointer is missing?".  For the row's pointer to
+    actually be missing, the guard has to be dropped first — otherwise
+    the case measures the guard, not the criterion.
+    """
+    from agent.memory import body_guard
+
     ws, f, st = _seed(tmp_path)
+    for name in body_guard.guard_trigger_names():
+        st.conn.execute("DROP TRIGGER IF EXISTS %s" % name)
+    st.conn.commit()
     st.conn.execute("UPDATE chunks SET body_anchor=NULL WHERE text_state='projection'")
     st.conn.commit()
     rep = _run(st, ws)

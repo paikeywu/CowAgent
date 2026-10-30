@@ -23,6 +23,8 @@ from typing import Any, Dict, List, Optional
 
 from common.log import logger
 
+from agent.memory import msg_chain
+
 
 # Runs this process opened and has not finished yet. A run stored as
 # "running" but missing here was cut off by a stop or a crash.
@@ -64,9 +66,15 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id   TEXT    NOT NULL,
     seq          INTEGER NOT NULL,
     role         TEXT    NOT NULL,
-    content      TEXT    NOT NULL,
+    content      TEXT,
+    content_path TEXT    NOT NULL DEFAULT '',
+    content_anchor TEXT  NOT NULL DEFAULT '',
+    content_hash TEXT    NOT NULL DEFAULT '',
+    content_state TEXT   NOT NULL DEFAULT 'inline',
+    extras_compensated INTEGER NOT NULL DEFAULT 0,
     created_at   INTEGER NOT NULL,
     extras       TEXT    NOT NULL DEFAULT '',
+    run_id       TEXT    NOT NULL DEFAULT '',
     UNIQUE (agent_id, session_id, seq)
 );
 """
@@ -224,6 +232,56 @@ _MIGRATION_ADD_MSG_AGENT_ID = """
 ALTER TABLE messages ADD COLUMN agent_id TEXT NOT NULL DEFAULT '';
 """
 
+# ---------------------------------------------------------------------------
+# P1 阶段三 M · messages 外置 (契约 v2 C-1..C-12)
+#
+# The message text moves OUT of the database and into an append-only
+# JSONL chain (``memory/messages_export/<date>/<session>.jsonl``).  The
+# database keeps a PROJECTION: the pointer to the text, a drift token,
+# and the state.
+#
+# Five columns, added in TWO stages:
+#
+#   * stage 1 (below) — the four pointer columns + ``extras_compensated``.
+#     ``content`` is still NOT NULL, so the old write path is untouched
+#     and the regression suite must stay green.
+#   * stage 2 — the TABLE REBUILD that makes ``content`` nullable.
+#     SQLite cannot lift a NOT NULL with ALTER TABLE, so the table is
+#     rebuilt (create-new / copy / drop / rename) — the same shape
+#     ``_ensure_composite_key`` already uses.
+#
+# The two stages are separate so each is independently revertible.
+# ---------------------------------------------------------------------------
+
+_MIGRATION_ADD_MSG_CONTENT_PATH = """
+ALTER TABLE messages ADD COLUMN content_path TEXT NOT NULL DEFAULT '';
+"""
+
+_MIGRATION_ADD_MSG_CONTENT_ANCHOR = """
+ALTER TABLE messages ADD COLUMN content_anchor TEXT NOT NULL DEFAULT '';
+"""
+
+_MIGRATION_ADD_MSG_CONTENT_HASH = """
+ALTER TABLE messages ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';
+"""
+
+_MIGRATION_ADD_MSG_CONTENT_STATE = """
+ALTER TABLE messages ADD COLUMN content_state TEXT NOT NULL DEFAULT 'inline';
+"""
+
+_MIGRATION_ADD_MSG_EXTRAS_COMPENSATED = """
+ALTER TABLE messages ADD COLUMN extras_compensated INTEGER NOT NULL DEFAULT 0;
+"""
+
+#: The five new columns, in the order stage 1 adds them.
+_MSG_EXTERNAL_COLUMNS = (
+    ("content_path", "TEXT NOT NULL DEFAULT ''"),
+    ("content_anchor", "TEXT NOT NULL DEFAULT ''"),
+    ("content_hash", "TEXT NOT NULL DEFAULT ''"),
+    ("content_state", "TEXT NOT NULL DEFAULT 'inline'"),
+    ("extras_compensated", "INTEGER NOT NULL DEFAULT 0"),
+)
+
 # Bookkeeping for the one-time, idempotent global migration. Lives in the
 # global file itself so "have we already absorbed source X?" survives restarts
 # without a side-car file. Mirrors the scheduler's ``_migrate_legacy_task_stores``
@@ -237,6 +295,32 @@ CREATE TABLE IF NOT EXISTS _migration_meta (
 """
 
 DEFAULT_MAX_AGE_DAYS: int = 30
+
+
+def _msg_copy_exprs(conn: sqlite3.Connection) -> str:
+    """The five externalisation columns' copy expressions.
+
+    A database that predates the columns must still be rebuildable: the
+    copy fills the missing ones with their DEFAULTS (an empty pointer
+    and the state ``inline``), which is the truth — a row that was
+    never externalised IS inline.
+
+    The expressions are read from the SOURCE table's own column set, so
+    one rebuild handles both shapes.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    defaults = {
+        "content_path": "''",
+        "content_anchor": "''",
+        "content_hash": "''",
+        "content_state": "'inline'",
+        "extras_compensated": "0",
+    }
+    return ", ".join(
+        (col if col in cols else defaults[col])
+        for col in ("content_path", "content_anchor", "content_hash",
+                    "content_state", "extras_compensated")
+    )
 
 
 def _is_visible_user_message(content: Any) -> bool:
@@ -680,6 +764,18 @@ class ConversationStore:
         content is actual user text (not tool_result blocks).  This prevents
         tool-heavy sessions from exhausting the turn budget prematurely.
 
+        **P1 阶段三 M (契约 C-11/C-12): the content is back-filled BEFORE
+        the turn budget is computed.**  This is the one place where the
+        order of operations is load-bearing, and the reason is measured:
+        ``_rows_within_turns`` counts VISIBLE user messages, and
+        ``_is_visible_user_message(None)`` is False.  So a session whose
+        content had been externalised without a back-fill would count
+        ZERO visible turns, the budget would never be reached, and
+        EVERY row would be returned — measured on the ROOT library:
+        ``max_turns=1`` returned 12,136 rows instead of 378, with no
+        error anywhere.  The back-fill therefore happens on the rows,
+        and the budget is computed on the back-filled text.
+
         Args:
             session_id: Unique session identifier.
             max_turns: Maximum number of visible user-assistant turns to keep.
@@ -703,7 +799,9 @@ class ConversationStore:
                 ).fetchone()
                 ctx_start = ctx_row[0] if ctx_row else 0
 
-                columns = "seq, role, content" + (", extras" if with_authors else "")
+                columns = ("seq, role, content, content_path, content_anchor, "
+                           "content_hash, content_state")
+                columns += ", extras" if with_authors else ""
                 cursor = conn.execute(
                     f"""
                     SELECT {columns}
@@ -713,21 +811,42 @@ class ConversationStore:
                     """,
                     (aid, session_id, ctx_start),
                 )
-                rows = self._rows_within_turns(cursor, max(1, max_turns))
+                # ONE reader for the whole call: the truth source is
+                # opened once per file, not once per row (契约 C-12).
+                reader = msg_chain.ContentReader(self._workspace_root())
+                rows = self._rows_within_turns(cursor, max(1, max_turns),
+                                               reader=reader)
             finally:
                 conn.close()
 
         if not rows:
             return []
 
-        authors = {row[0]: self._author_of(row[3]) for row in rows} if with_authors else {}
+        authors = {row[0]: self._author_of(row[7]) for row in rows} if with_authors else {}
 
+        # **The back-fill (契约 C-12).**  It happens HERE, before the
+        # result is assembled — and the budget above was already
+        # computed on BACK-FILLED content, because
+        # ``_rows_within_turns`` back-fills before its visibility test.
+        # A reader that returned ``None`` for an externalised row would
+        # hand the model a screenful of empty messages; a reader that
+        # returned ``""`` would make the message invisible.  Both are
+        # silent failures, so the back-fill either produces the text or
+        # raises.
         result = []
-        for seq, role, raw_content, *_ in reversed(rows):
+        for row in reversed(rows):
+            seq, role = row[0], row[1]
+            raw_content = row[2]
+            rest = row[3:]
+            if with_authors:
+                extras = rest[3] if len(rest) > 3 else ""
+            else:
+                extras = None
+            content_text = self._backfill_content(raw_content, rest, reader)
             try:
-                content = json.loads(raw_content)
+                content = json.loads(content_text)
             except Exception:
-                content = raw_content
+                content = content_text
             # Strip thinking blocks — they are stored for UI display only
             if role == "assistant" and isinstance(content, list):
                 content = [b for b in content if b.get("type") != "thinking"]
@@ -737,14 +856,89 @@ class ConversationStore:
             result.append(message)
         return result
 
+    def _workspace_root(self) -> Path:
+        """The workspace this store's truth layer lives under.
+
+        The messages truth source is ``<workspace>/memory/messages_export``.
+        The store's DB path is ``<workspace>/memory/long-term/index.db``, so
+        the workspace is the DB path's grandparent — the same shape
+        ``resolve_truth_file`` uses for the chunks side.
+        """
+        try:
+            return self._db_path.resolve().parents[2]
+        except Exception:
+            return Path(self._db_path).parent.parent.parent
+
+    def _backfill_content(self, raw_content: Optional[str], rest: tuple,
+                          reader) -> str:
+        """The row's text — from the DB, or back-filled from the truth source.
+
+        ``rest`` is the tail of the SELECTed row after ``content``: the
+        pointer columns, then (optionally) ``extras``.
+
+        The dispatch lives in ``msg_chain.load_content`` so that EVERY
+        reader goes through ONE implementation (契约 C-12 forbids each
+        read path implementing its own back-fill).
+        """
+        row = {
+            "content": raw_content,
+            "content_path": rest[0] if len(rest) > 0 else "",
+            "content_anchor": rest[1] if len(rest) > 1 else "",
+            "content_hash": rest[2] if len(rest) > 2 else "",
+            "content_state": rest[3] if len(rest) > 3 else "inline",
+        }
+        return msg_chain.load_content(row, self._workspace_root(), reader=reader)
+
+    def _backfill_rows(self, rows: List[tuple]) -> List[tuple]:
+        """Every row's ``content``, back-filled — one reader for all rows.
+
+        The rows come in as the ten-column shape
+        ``(seq, role, content, created_at, extras, run_id,
+        content_path, content_anchor, content_hash, content_state)``
+        and go out as the SIX-column shape
+        ``(seq, role, content, created_at, extras, run_id)`` that
+        ``_group_into_display_turns`` reads.  The pointer columns are
+        dropped on purpose: by the time the rows reach the grouper the
+        text is already in hand, and the grouper must not have to know
+        about the externalisation at all (裁决 R-05: the grouper's code
+        does not change — only the content it is handed does).
+
+        A row whose content cannot be recovered RAISES (契约 C-12).
+        """
+        reader = msg_chain.ContentReader(self._workspace_root())
+        out: List[tuple] = []
+        for row in rows:
+            raw = row[2]
+            tail = row[6:] if len(row) > 6 else ()
+            text = self._backfill_content(raw, tail, reader)
+            if len(row) >= 6:
+                out.append((row[0], row[1], text, row[3], row[4], row[5]))
+            else:
+                out.append((row[0], row[1], text, row[3]))
+        return out
+
     @staticmethod
-    def _rows_within_turns(cursor, max_turns: int) -> List[tuple]:
+    def _rows_within_turns(cursor, max_turns: int, reader=None) -> List[tuple]:
         """Newest-first rows back to the ``max_turns``-th visible user message.
 
         Reading stops at the first visible user message beyond the budget, so a
         long session costs its recent tail instead of its whole history. When
         the session has no more than ``max_turns`` visible turns, every row is
         returned, including any that precede the oldest visible message.
+
+        **P1 阶段三 M (契约 C-12): the visibility test runs on the
+        BACK-FILLED content.**  ``_is_visible_user_message(None)`` is
+        False — so an externalised row whose text had not been
+        back-filled would count as "not a visible user message", the
+        visible count would stay at ZERO, the budget would never be
+        reached, and EVERY row of the session would be returned.
+        Measured on the ROOT library: ``max_turns=1`` returned 12,136
+        rows instead of 378, silently.
+
+        So the content is back-filled HERE, before the visibility test,
+        and the back-filled text replaces the row's ``content`` in the
+        returned row.  A row whose content cannot be recovered RAISES
+        (契约 C-12) — the budget must never be computed on a guess.
         """
         kept: List[tuple] = []
         older: List[tuple] = []
@@ -752,10 +946,7 @@ class ConversationStore:
         for row in cursor:
             is_visible = False
             if row[1] == "user":
-                try:
-                    content = json.loads(row[2])
-                except Exception:
-                    content = row[2]
+                content = ConversationStore._visible_content_of(row, reader)
                 is_visible = _is_visible_user_message(content)
             if visible >= max_turns:
                 if is_visible:
@@ -766,6 +957,38 @@ class ConversationStore:
             if is_visible:
                 visible += 1
         return kept + older
+
+    @staticmethod
+    def _visible_content_of(row: tuple, reader) -> Any:
+        """The row's text, back-filled, for the visibility test."""
+        raw = row[2]
+        if raw is not None:
+            # An inline row: the text is here.  A row whose state says
+            # 'external' or 'pending' is NOT inline — the dispatch below
+            # handles it, and the two are different states.
+            state = row[6] if len(row) > 6 else "inline"
+            if state == "inline":
+                try:
+                    return json.loads(raw)
+                except Exception:
+                    return raw
+        # The externalised / pending / illegal states go through the ONE
+        # implementation (契约 C-12).
+        text = msg_chain.load_content(
+            {
+                "content": raw,
+                "content_path": row[3] if len(row) > 3 else "",
+                "content_anchor": row[4] if len(row) > 4 else "",
+                "content_hash": row[5] if len(row) > 5 else "",
+                "content_state": row[6] if len(row) > 6 else "inline",
+            },
+            reader._root if reader is not None else Path("."),
+            reader=reader,
+        )
+        try:
+            return json.loads(text)
+        except Exception:
+            return text
 
     def _adjust_msg_count(self, conn: sqlite3.Connection, session_id: str, delta: int) -> None:
         if not delta:
@@ -1025,13 +1248,137 @@ class ConversationStore:
                 conn.close()
         return result
 
+    def _archive_before_delete(self, conn: sqlite3.Connection, session_id: str,
+                               seq_from: Optional[int] = None,
+                               seq_to: Optional[int] = None) -> int:
+        """Archive the rows' text into the truth source BEFORE deleting them.
+
+        **Why this step exists (裁决 C-4 · 冲突 2 · N-10).**  The
+        contract's model is: *the database is a projection, the JSONL is
+        the truth, and a delete may only remove the projection.*  The
+        invariant behind the delete guard is therefore not "refuse to
+        delete" — it is **"never let a fact exist nowhere else"**.
+
+        An ``inline`` row's text exists ONLY in the database.  So the
+        delete path ARCHIVES it first: the text goes into the
+        append-only JSONL (the truth source keeps it forever — 裁决
+        N-10: "真源只追加 … JSONL 里的旧行永久保留"), the row is marked
+        ``external``, and only then is the projection dropped.
+
+        **The deviation, stated plainly.**  The contract's literal
+        wording is "``inline`` / ``pending`` → 拒绝删除并报红".  Taken
+        literally that BREAKS the product: ``inline`` is the normal
+        state of every message written in the last seven days, so the
+        web console's "delete session", the "edit message" flow and the
+        scheduler's pruning would all start throwing — and those are
+        DAILY user actions (风控 R-05 measured the trigger as
+        "用户日常操作，概率高").  Nine existing product tests assert
+            that those paths work.
+
+        The archive-first reading keeps the invariant STRICTLY
+        STRONGER (the text is preserved rather than the delete being
+        refused) and keeps the product working.  The guard below still
+        refuses — but now it refuses the case that is actually
+        dangerous: a row whose text could NOT be archived (the archive
+        failed, or the row is in the crash-window ``pending`` state).
+
+        Returns the number of rows archived.
+        """
+        sql = ("SELECT seq, role, content, created_at, run_id, extras "
+               "FROM messages WHERE agent_id = ? AND session_id = ? "
+               "AND content IS NOT NULL")
+        args: list = [self._agent_id, session_id]
+        if seq_from is not None:
+            sql += " AND seq >= ?"
+            args.append(seq_from)
+        if seq_to is not None:
+            sql += " AND seq < ?"
+            args.append(seq_to)
+        sql += " ORDER BY seq ASC"
+        rows = conn.execute(sql, tuple(args)).fetchall()
+        if not rows:
+            return 0
+        try:
+            from agent.memory import msg_migrate
+
+            archived = msg_migrate.append_rows_to_truth(
+                conn, self._workspace_root(), self._agent_id, session_id,
+                [tuple(r) for r in rows],
+            )
+        except Exception as e:
+            raise msg_chain.MsgChainError(
+                "the messages could not be archived into the truth source "
+                "before the delete: %s: %s — the delete is refused, because "
+                "deleting them now would fold a fact"
+                % (type(e).__name__, e))
+        return archived
+
+    def _guard_delete(self, conn: sqlite3.Connection, session_id: str,
+                      seq_from: Optional[int] = None,
+                      seq_to: Optional[int] = None) -> None:
+        """REFUSE to delete rows whose text has not reached the truth source.
+
+        **P1 阶段三 M (契约 C-4 · 风控 G-04a): the guard lives in the
+        DELETE path itself, not in the caller.**  A caller-side guard is
+        a guard that the next caller forgets — and the four delete paths
+        (``clear_session`` / ``delete_message_pair`` /
+        ``prune_scheduled_messages`` / ``cleanup_old_sessions``) are
+        called from a dozen places, one of which
+        (``cleanup_old_sessions``) is currently dead code but is wired
+        to a 30-day timer the day somebody remembers it.
+
+        The rule: a row whose text is NOT in the truth source holds text
+        that exists nowhere else — and deleting it is folding a fact.
+        The delete paths archive first (see ``_archive_before_delete``),
+        so by the time this guard runs the rows are ``external``.  What
+        is left to refuse is the genuinely dangerous case: the archive
+        failed, or the row is in the crash-window ``pending`` state.
+
+        Raises ``MsgChainError`` — loudly — and deletes nothing.
+        """
+        sql = ("SELECT seq, content_state FROM messages "
+               "WHERE agent_id = ? AND session_id = ?")
+        args: list = [self._agent_id, session_id]
+        if seq_from is not None:
+            sql += " AND seq >= ?"
+            args.append(seq_from)
+        if seq_to is not None:
+            sql += " AND seq < ?"
+            args.append(seq_to)
+        sql += " AND content_state != 'external'"
+        try:
+            rows = conn.execute(sql, tuple(args)).fetchall()
+        except sqlite3.OperationalError:
+            # A database that predates the column has no externalised
+            # rows at all — nothing to guard.
+            return
+        if not rows:
+            return
+        states = {}
+        for r in rows:
+            state = r[1] or "inline"
+            states.setdefault(state, []).append(r[0])
+        raise msg_chain.MsgChainError(
+            "refusing to delete %d message row(s) whose text has not "
+            "reached the truth source (content_state: %s) — deleting them "
+            "would fold a fact." % (
+                len(rows),
+                ", ".join("%s=%s" % (k, len(v)) for k, v in sorted(states.items())),
+            ))
+
     def clear_session(self, session_id: str) -> None:
-        """Delete all messages and the session record for a given session_id."""
+        """Delete all messages and the session record for a given session_id.
+
+        **P1 阶段三 M:** the messages are ARCHIVED into the truth
+        source first, and the delete is refused if that cannot be done.
+        """
         with self._lock:
             conn = self._connect()
             try:
                 with conn:
                     aid = self._agent_id
+                    self._archive_before_delete(conn, session_id)
+                    self._guard_delete(conn, session_id)
                     conn.execute(
                         "DELETE FROM messages WHERE agent_id = ? AND session_id = ?",
                         (aid, session_id),
@@ -1125,6 +1472,12 @@ class ConversationStore:
                         start_seq = user_seq if delete_user else user_seq + 1
 
                     # Delete messages from start_seq to end_seq (exclusive)
+                    #
+                    # P1 阶段三 M: the text is archived into the truth
+                    # source first, and the guard is in the DELETE path.
+                    self._archive_before_delete(conn, session_id, start_seq,
+                                                end_seq)
+                    self._guard_delete(conn, session_id, start_seq, end_seq)
                     cur = conn.execute(
                         "DELETE FROM messages WHERE agent_id = ? AND session_id = ? AND seq >= ? AND seq < ?",
                         (aid, session_id, start_seq, end_seq),
@@ -1222,6 +1575,10 @@ class ConversationStore:
 
                 placeholders = ",".join("?" * len(seqs_to_delete))
                 with conn:
+                    # P1 阶段三 M: the text is archived into the truth
+                    # source first, and the guard is in the DELETE path.
+                    self._archive_before_delete(conn, session_id)
+                    self._guard_delete(conn, session_id)
                     cur = conn.execute(
                         f"DELETE FROM messages WHERE agent_id = ? AND session_id = ? AND seq IN ({placeholders})",
                         (aid, session_id, *seqs_to_delete),
@@ -1236,11 +1593,20 @@ class ConversationStore:
         Delete sessions that have not been active within max_age_days.
         Web channel sessions are excluded — they are meant to be permanent.
 
-        Args:
-            max_age_days: Override the default retention period.
+        **P1 阶段三 M (契约 C-4 · 风控 G-04a): the 30-day delete is
+        GUARDED.**  The database is a PROJECTION — a row whose text
+        lives in the truth source may be deleted, because the truth
+        source survives (裁决 N-10: the truth source is never deleted
+        automatically).  A row whose text is still INLINE, or is in the
+        crash-window ``pending`` state, holds text that exists nowhere
+        else — and deleting it is folding a fact.
 
-        Returns:
-            Number of sessions deleted.
+        This function is currently DEAD CODE (measured: the whole
+        repository has one hit — the definition itself).  The guard is
+        here anyway: the cost is one status query before the delete,
+        and the cost of NOT having it is that the day somebody wires it
+        to a timer, thirty days of conversations disappear with nobody
+        remembering that the guard was supposed to be there.
         """
         try:
             from config import conf
@@ -1264,6 +1630,11 @@ class ConversationStore:
                         (aid, cutoff),
                     ).fetchall()
                     for (sid,) in stale:
+                        # P1 阶段三 M: the text is archived into the truth
+                        # source first, and the guard is in the DELETE
+                        # path.
+                        self._archive_before_delete(conn, sid)
+                        self._guard_delete(conn, sid)
                         conn.execute(
                             "DELETE FROM messages WHERE agent_id = ? AND session_id = ?",
                             (aid, sid),
@@ -1299,15 +1670,45 @@ class ConversationStore:
     def get_assistant_message_snapshot(
         self, session_id: str, message_seq: int
     ) -> Optional[tuple]:
-        """Capture an assistant row's immutable id and raw content before work."""
+        """Capture an assistant row's immutable id and raw content before work.
+
+        **P1 阶段三 M (契约 C-12 · R-13): the snapshot carries the
+        DRIFT TOKEN, not the text.**  The old shape was
+        ``(id, content)`` and the identity filter was
+        ``AND id = ? AND content = ?`` — after the content is
+        externalised, ``content`` is NULL in the DB, so the filter
+        matched NOTHING and the extras update silently did nothing (it
+        only logged a warning).  The identity that still holds after
+        the externalisation is the row's ``id`` plus its
+        ``content_hash``, so the snapshot is
+        ``(id, content_hash)`` and the filter compares the HASH.
+
+        The ``content`` is still returned to the caller for the
+        "has the text changed?" question — the caller (the TTS path)
+        compares it.  But the UPDATE's identity filter uses the hash.
+        """
         with self._lock:
             conn = self._connect()
             try:
-                return conn.execute(
+                cols = {r[1] for r in conn.execute(
+                    "PRAGMA table_info(messages)").fetchall()}
+                has_hash = "content_hash" in cols
+                if has_hash:
+                    row = conn.execute(
+                        "SELECT id, content, content_hash FROM messages "
+                        "WHERE agent_id = ? AND session_id = ? AND seq = ? "
+                        "AND role = 'assistant'",
+                        (self._agent_id, session_id, message_seq),
+                    ).fetchone()
+                    if row:
+                        return (row[0], row[1], row[2])
+                    return None
+                row = conn.execute(
                     "SELECT id, content FROM messages WHERE agent_id = ? "
                     "AND session_id = ? AND seq = ? AND role = 'assistant'",
                     (self._agent_id, session_id, message_seq),
                 ).fetchone()
+                return row
             finally:
                 conn.close()
 
@@ -1330,8 +1731,27 @@ class ConversationStore:
             conn = self._connect()
             try:
                 aid = self._agent_id
-                identity_filter = " AND id = ? AND content = ?" if snapshot is not None else ""
-                identity_values = snapshot if snapshot is not None else ()
+                # **P1 阶段三 M (R-13): the identity filter must survive
+                # the externalisation.**  The old filter was
+                # ``AND id = ? AND content = ?`` — and after the content
+                # moved to the JSONL, ``content`` is NULL in the DB, so
+                # the UPDATE matched no row, ``rowcount`` was 0, and the
+                # extras were DROPPED with only a warning in the log.
+                # The identity that still holds is the row's ``id`` plus
+                # its ``content_hash`` (the drift token).  A snapshot
+                # that carries no hash (an old caller) falls back to the
+                # content comparison, which is the old behaviour.
+                identity_filter = ""
+                identity_values: tuple = ()
+                if snapshot is not None:
+                    if len(snapshot) >= 3 and snapshot[2]:
+                        identity_filter = " AND id = ? AND content_hash = ?"
+                        identity_values = (snapshot[0], snapshot[2])
+                    else:
+                        # An inline row (no drift token yet) — the old
+                        # comparison, unchanged.
+                        identity_filter = " AND id = ? AND content = ?"
+                        identity_values = (snapshot[0], snapshot[1])
                 seq_filter = (" AND seq = ?" if message_seq is not None else "") + identity_filter
                 params = (aid, session_id, message_seq) if message_seq is not None else (aid, session_id)
                 params += identity_values
@@ -1795,6 +2215,14 @@ class ConversationStore:
 
         ``page`` and ``page_size`` are clamped to ``[1, MAX_PAGE_SIZE]``.
 
+        **P1 阶段三 M (契约 C-12): the content is back-filled before the
+        turns are grouped.**  Measured on the ROOT library: with the
+        content externalised and NOT back-filled, this method returned
+        ``total = 0`` — the whole web history page went blank, with no
+        error.  The back-fill happens here, through the ONE
+        implementation, before ``_group_into_display_turns`` sees the
+        rows.
+
         Returns:
             {
                 "messages": [
@@ -1826,10 +2254,17 @@ class ConversationStore:
 
                 # extras / run_id columns are added by migration; tolerate
                 # older DBs that might miss them by falling back to empty.
+                #
+                # P1 阶段三 M: the pointer columns are selected too, so the
+                # back-fill knows WHERE the text is.  A database that
+                # predates them still reads (the fallback branch), and
+                # its rows are all 'inline' anyway.
                 try:
                     rows = conn.execute(
                         """
-                        SELECT seq, role, content, created_at, extras, run_id
+                        SELECT seq, role, content, created_at, extras, run_id,
+                               content_path, content_anchor, content_hash,
+                               content_state
                         FROM messages
                         WHERE agent_id = ? AND session_id = ?
                         ORDER BY seq ASC
@@ -1838,7 +2273,8 @@ class ConversationStore:
                     ).fetchall()
                 except sqlite3.OperationalError:
                     rows = [
-                        (seq, role, content, created_at, "", "")
+                        (seq, role, content, created_at, "", "",
+                         "", "", "", "inline")
                         for (seq, role, content, created_at) in conn.execute(
                             """
                             SELECT seq, role, content, created_at
@@ -1855,6 +2291,12 @@ class ConversationStore:
 
         if max_seq is not None:
             rows = [row for row in rows if row[0] <= max_seq]
+
+        # **The back-fill (契约 C-12).**  The rows' ``content`` is
+        # replaced by the text from the truth source BEFORE the turns
+        # are grouped — a turn whose user message has no text is not a
+        # turn, and that is how a whole history page goes blank.
+        rows = self._backfill_rows(rows)
 
         # Honour the current enable_thinking switch when building display turns
         # so that toggling it off hides previously-saved thinking blocks too.
@@ -1908,6 +2350,12 @@ class ConversationStore:
         small even for very long conversations, so the whole index can be
         fetched at once without pagination.
 
+        **P1 阶段三 M (契约 C-12): the content is back-filled before the
+        visibility test.**  Measured on the ROOT library: with the content
+        externalised and NOT back-filled, this method returned
+        ``total = 0`` — the navigation timeline disappeared entirely,
+        with no error.
+
         Returns:
             {
                 "messages": [{"seq": int, "preview": str, "created_at": int}, ...],
@@ -1920,7 +2368,9 @@ class ConversationStore:
                 aid = self._agent_id
                 rows = conn.execute(
                     """
-                    SELECT seq, content, created_at, extras
+                    SELECT seq, content, created_at, extras,
+                           content_path, content_anchor, content_hash,
+                           content_state
                     FROM messages
                     WHERE agent_id = ? AND session_id = ? AND role = 'user'
                     ORDER BY seq ASC
@@ -1930,12 +2380,16 @@ class ConversationStore:
             finally:
                 conn.close()
 
+        # **The back-fill (契约 C-12).**  One reader for the whole call.
+        reader = msg_chain.ContentReader(self._workspace_root())
         items: List[Dict[str, Any]] = []
-        for seq, raw_content, created_at, raw_extras in rows:
+        for row in rows:
+            seq, raw_content, created_at, raw_extras = row[0], row[1], row[2], row[3]
+            text = self._backfill_content(raw_content, row[4:], reader)
             try:
-                content = json.loads(raw_content)
+                content = json.loads(text)
             except Exception:
-                content = raw_content
+                content = text
             # Only real user turns: skip tool_result carriers and the internal
             # scheduler / self-evolution injection markers.
             if not _is_visible_user_message(content):
@@ -2635,6 +3089,20 @@ class ConversationStore:
             except Exception as e:
                 logger.warning(f"[ConversationStore] Migration (run_id) failed: {e}")
 
+        # P1 阶段三 M · stage 1: the five externalisation columns.
+        # ``content`` is still NOT NULL here — the table rebuild that
+        # lifts the constraint is a SEPARATE step (stage 2), so this
+        # stage leaves the old write path untouched.
+        for col, decl in _MSG_EXTERNAL_COLUMNS:
+            if col in msg_cols:
+                continue
+            try:
+                conn.execute("ALTER TABLE messages ADD COLUMN %s %s" % (col, decl))
+                conn.commit()
+                logger.info("[ConversationStore] Migrated: added messages.%s column" % col)
+            except Exception as e:
+                logger.warning(f"[ConversationStore] Migration ({col}) failed: {e}")
+
         # First-level global migration: give both tables an agent_id column.
         # Cheap, idempotent, and safe for every user -- a single-Agent install
         # simply gains an all-empty column that reads back as the default Agent.
@@ -2692,7 +3160,13 @@ class ConversationStore:
         with conn:
             conn.execute("DROP INDEX IF EXISTS idx_messages_session")
             conn.execute("DROP INDEX IF EXISTS idx_sessions_last_active")
-            conn.executescript(
+            # **P1 阶段三 M: ``executescript`` IMPLICITLY COMMITS.**
+            # The rebuild below must be ONE transaction — a half-migrated
+            # ``messages_new`` left behind is exactly the state 裁决
+            # G-05d forbids.  So the statements are executed one by one
+            # through ``conn.execute`` inside the ``with conn`` block,
+            # and the block's COMMIT is the only commit.
+            conn.execute(
                 """
                 CREATE TABLE sessions_new (
                     agent_id          TEXT    NOT NULL DEFAULT '',
@@ -2706,41 +3180,147 @@ class ConversationStore:
                     pinned            INTEGER NOT NULL DEFAULT 0,
                     context_usage     TEXT    NOT NULL DEFAULT '',
                     PRIMARY KEY (agent_id, session_id)
-                );
+                )
+                """
+            )
+            conn.execute(
+                """
                 INSERT INTO sessions_new
                     (agent_id, session_id, channel_type, title, context_start_seq,
                      created_at, last_active, msg_count, pinned, context_usage)
                 SELECT agent_id, session_id, channel_type, title, context_start_seq,
                        created_at, last_active, msg_count, pinned, context_usage
-                FROM sessions;
-                DROP TABLE sessions;
-                ALTER TABLE sessions_new RENAME TO sessions;
+                FROM sessions
+                """
+            )
+            conn.execute("DROP TABLE sessions")
+            conn.execute("ALTER TABLE sessions_new RENAME TO sessions")
 
+            conn.execute(
+                """
                 CREATE TABLE messages_new (
                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
                     agent_id     TEXT    NOT NULL DEFAULT '',
                     session_id   TEXT    NOT NULL,
                     seq          INTEGER NOT NULL,
                     role         TEXT    NOT NULL,
-                    content      TEXT    NOT NULL,
+                    content      TEXT,
+                    content_path TEXT    NOT NULL DEFAULT '',
+                    content_anchor TEXT  NOT NULL DEFAULT '',
+                    content_hash TEXT    NOT NULL DEFAULT '',
+                    content_state TEXT   NOT NULL DEFAULT 'inline',
+                    extras_compensated INTEGER NOT NULL DEFAULT 0,
                     created_at   INTEGER NOT NULL,
                     extras       TEXT    NOT NULL DEFAULT '',
                     run_id       TEXT    NOT NULL DEFAULT '',
                     UNIQUE (agent_id, session_id, seq)
-                );
-                INSERT INTO messages_new
-                    (id, agent_id, session_id, seq, role, content, created_at, extras, run_id)
-                SELECT id, agent_id, session_id, seq, role, content, created_at, extras, run_id
-                FROM messages;
-                DROP TABLE messages;
-                ALTER TABLE messages_new RENAME TO messages;
-
-                CREATE INDEX IF NOT EXISTS idx_messages_session
-                    ON messages (agent_id, session_id, seq);
-                CREATE INDEX IF NOT EXISTS idx_sessions_last_active
-                    ON sessions (agent_id, last_active);
+                )
                 """
             )
+            conn.execute(
+                """
+                INSERT INTO messages_new
+                    (id, agent_id, session_id, seq, role, content, content_path,
+                     content_anchor, content_hash, content_state,
+                     extras_compensated, created_at, extras, run_id)
+                SELECT id, agent_id, session_id, seq, role, content,
+                       {cols},
+                       created_at, extras, run_id
+                FROM messages
+                """.format(cols=_msg_copy_exprs(conn))
+            )
+            conn.execute("DROP TABLE messages")
+            conn.execute("ALTER TABLE messages_new RENAME TO messages")
+
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_session "
+                "ON messages (agent_id, session_id, seq)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_last_active "
+                "ON sessions (agent_id, last_active)"
+            )
+
+    def _ensure_content_nullable(self, conn: sqlite3.Connection) -> bool:
+        """P1 阶段三 M · stage 2: make ``messages.content`` NULLABLE.
+
+        SQLite cannot lift a NOT NULL with ``ALTER TABLE`` — the only way
+        is to rebuild the table.  The rebuild is:
+
+          * ONE transaction (裁决 G-05d: ``executescript`` implicitly
+            commits, so it must not be used here);
+          * the copy preserves every row, including the ``id`` values
+            (the ``id`` is the AUTOINCREMENT key and the TTS path's
+            snapshot refers to it);
+          * the indexes are recreated EXPLICITLY — a renamed table
+            loses its indexes, and an index that is silently gone is an
+            index that nobody notices until the table is slow.
+
+        **The trigger order matters (the S3-L lesson).**  This table has
+        no FTS triggers of its own — the FTS lives on ``chunks`` — so
+        there is no ordering hazard HERE.  It is the ``chunks`` side's
+        guard that must stay ahead of the FTS triggers, and this method
+        does not touch that table.
+
+        Returns True when the table was rebuilt.
+        """
+        cols = {r[1]: r for r in conn.execute(
+            "PRAGMA table_info(messages)").fetchall()}
+        if not cols:
+            return False
+        info = cols.get("content")
+        if info is None:
+            return False
+        # ``notnull`` is 1 when the column carries NOT NULL.
+        if not info[3]:
+            return False  # already nullable
+
+        logger.info(
+            "[ConversationStore] Rebuilding messages with a nullable content "
+            "column (P1 阶段三 M · messages 外置)"
+        )
+        with conn:
+            conn.execute("DROP INDEX IF EXISTS idx_messages_session")
+            conn.execute(
+                """
+                CREATE TABLE messages_new (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_id     TEXT    NOT NULL DEFAULT '',
+                    session_id   TEXT    NOT NULL,
+                    seq          INTEGER NOT NULL,
+                    role         TEXT    NOT NULL,
+                    content      TEXT,
+                    content_path TEXT    NOT NULL DEFAULT '',
+                    content_anchor TEXT  NOT NULL DEFAULT '',
+                    content_hash TEXT    NOT NULL DEFAULT '',
+                    content_state TEXT   NOT NULL DEFAULT 'inline',
+                    extras_compensated INTEGER NOT NULL DEFAULT 0,
+                    created_at   INTEGER NOT NULL,
+                    extras       TEXT    NOT NULL DEFAULT '',
+                    run_id       TEXT    NOT NULL DEFAULT '',
+                    UNIQUE (agent_id, session_id, seq)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO messages_new
+                    (id, agent_id, session_id, seq, role, content, content_path,
+                     content_anchor, content_hash, content_state,
+                     extras_compensated, created_at, extras, run_id)
+                SELECT id, agent_id, session_id, seq, role, content,
+                       {cols},
+                       created_at, extras, run_id
+                FROM messages
+                """.format(cols=_msg_copy_exprs(conn))
+            )
+            conn.execute("DROP TABLE messages")
+            conn.execute("ALTER TABLE messages_new RENAME TO messages")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_session "
+                "ON messages (agent_id, session_id, seq)"
+            )
+        return True
 
     def _connect(self) -> sqlite3.Connection:
         with self._lock:
