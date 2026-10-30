@@ -143,7 +143,7 @@ class Report:
 # The live-library enumeration — the WHITELIST rule (A-4).
 # --------------------------------------------------------------------------
 
-def enumerate_live(workspace: Path) -> List[Dict[str, Any]]:
+def enumerate_live(workspace: Path | str) -> List[Dict[str, Any]]:
     """The live indexes, by WHITELIST — never a ``*.db`` glob.
 
     A-4: a glob would also pick up the backups this tool writes and the
@@ -154,7 +154,18 @@ def enumerate_live(workspace: Path) -> List[Dict[str, Any]]:
 
     and nothing else.  The truth-layer root of an agent's library is the
     agent's own directory, which is what ``resolve_truth_file`` expects.
+
+    **The argument may be a ``str``.**  MEASURED (0.114 前置准备 §7.2):
+    ``enumerate_live('/home/paikeywu/cow-workspace')`` raised
+    ``TypeError: unsupported operand type(s) for /: 'str' and 'str'`` —
+    because the body does ``workspace / "memory"``.  Every caller on
+    0.114 passes the workspace as it came off the command line (a
+    string), so the tool was unusable there for a reason that has
+    nothing to do with the machine.  The type is coerced HERE, once,
+    so that every caller — the CLI, the certifier, the tests — gets the
+    same behaviour.
     """
+    workspace = Path(workspace)
     live: List[Dict[str, Any]] = []
     root_db = workspace / "memory" / "long-term" / "index.db"
     if root_db.is_file():
@@ -173,6 +184,54 @@ def enumerate_live(workspace: Path) -> List[Dict[str, Any]]:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def content_digest(conn: sqlite3.Connection,
+                   table: str = "chunks") -> Optional[str]:
+    """A digest of a table's CONTENT, independent of the byte layout.
+
+    **Why not the row count.**  MEASURED (0.114 前置准备 §4.4, E-4):
+    0.114's ROOT library had 25 rows at the time of the probe, 4 of
+    them with a non-NULL ``body_path`` — and the SERVICE writes to it
+    by itself (it syncs the knowledge layer on its own schedule).  So
+    the row count is not a constant of the machine: it moves between
+    the moment the baseline is taken and the moment it is compared.
+
+    **Why not the file's SHA-256.**  A checkpoint moves bytes without
+    moving rows, so the file's hash changes when nothing about the
+    content changed — a false alarm on a healthy library.
+
+    **What this is.**  The sha256 of the rows' own values, in a stable
+    order, so two libraries with the same content have the same digest
+    and any change to the content moves it.  The COVERED COLUMNS are
+    printed with the digest by the callers, because a digest whose
+    coverage is not stated cannot be audited.
+    """
+    import hashlib
+
+    try:
+        cols = [r[1] for r in conn.execute(
+            "PRAGMA table_info(%s)" % table)]
+    except sqlite3.Error:
+        return None
+    if not cols:
+        return None
+    wanted = [c for c in ("id", "path", "start_line", "end_line", "text",
+                           "hash", "body_path", "body_anchor", "body_hash",
+                           "text_state") if c in cols]
+    if not wanted:
+        return None
+    try:
+        rows = conn.execute(
+            "SELECT %s FROM %s ORDER BY id" % (", ".join(wanted), table)
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    h = hashlib.sha256()
+    for row in rows:
+        h.update(("\x1f".join("" if v is None else str(v)
+                               for v in row) + "\x1e").encode("utf-8"))
+    return h.hexdigest()
 
 
 def _q(conn: sqlite3.Connection, sql: str, args: Tuple = ()) -> Any:
@@ -205,10 +264,21 @@ def _backup_one(lib: Dict[str, Any], backup_dir: Path,
         "body_path_null": 0,
         "chunk_count_zero": 0,
         "chunk_count_null": 0,
+        # The CONTENT digest — the baseline that does not drift (E-4).
+        # The row count is reported too, but it is NOT the baseline:
+        # the service writes to the library by itself, so the row count
+        # moves between the baseline and the comparison.
+        "chunks_digest": None,
+        "files_digest": None,
     }
     conn = _open_ro(db)
     try:
         pre["chunks"] = _q(conn, "SELECT COUNT(*) FROM chunks")
+        pre["chunks_digest"] = content_digest(conn, "chunks")
+        try:
+            pre["files_digest"] = content_digest(conn, "files")
+        except sqlite3.Error:
+            pre["files_digest"] = None
         try:
             pre["messages"] = _q(conn, "SELECT COUNT(*) FROM messages")
         except sqlite3.OperationalError:
@@ -537,7 +607,8 @@ def step_m4(live: List[Dict[str, Any]], report: Report, dry_run: bool = False
     """
     grand = {"filled": 0, "skipped_concurrent": 0, "no_source": 0,
              "no_part": 0, "files_fixed": 0, "files_zero_real": 0,
-             "orphans": 0, "anchors_rewritten": 0, "with_segments": 0}
+             "orphans": 0, "anchors_rewritten": 0, "with_segments": 0,
+             "visited": 0, "changed": 0, "unchanged": 0}
     for lib in live:
         db = lib["db"]
         ws = lib["workspace"]
@@ -545,6 +616,7 @@ def step_m4(live: List[Dict[str, Any]], report: Report, dry_run: bool = False
         conn = sqlite3.connect(str(db))
         conn.row_factory = sqlite3.Row
         filled = skipped = no_source = no_part = 0
+        changed = unchanged = visited = 0
         orphans = 0
         anchors_rewritten = 0
         with_segments = 0
@@ -590,8 +662,9 @@ def step_m4(live: List[Dict[str, Any]], report: Report, dry_run: bool = False
             # anchors that cannot locate them.
             rows = conn.execute(
                 "SELECT id, path, start_line, end_line, text, hash, scope, "
-                "body_path, body_anchor, body_hash, body_origin "
+                "body_path, body_anchor, body_hash, body_origin, text_state "
                 "FROM chunks").fetchall()
+            visited = len(rows)
             for row in rows:
                 rel = row["path"]
                 if not rel:
@@ -659,6 +732,27 @@ def step_m4(live: List[Dict[str, Any]], report: Report, dry_run: bool = False
                     skipped += 1
                 else:
                     filled += 1
+                    # **The counter must count CHANGES, not VISITS.**
+                    # MEASURED (S3-L): the first version counted every
+                    # row the backfill WROTE, so a second run reported
+                    # ``filled=5`` — it wrote the same five rows again
+                    # with the same values.  That made the idempotence
+                    # check ("the second pass must fill 0") impossible
+                    # to read: the number said "5 rows were filled"
+                    # when nothing had been filled at all.
+                    #
+                    # The fix is to compare the values BEFORE and AFTER
+                    # the write, and count a row only when one of them
+                    # actually moved.  A row whose pointer was already
+                    # correct is NOT re-filled — it is left alone.
+                    if (row["body_path"] != bp or row["body_anchor"] != anchor
+                            or row["body_hash"] != bh
+                            or row["body_origin"] != origin
+                            or (row["text_state"] != "mirror"
+                                and row["text_state"] != state)):
+                        changed += 1
+                    else:
+                        unchanged += 1
             # --- the files bookkeeping (C-A3.1'') ---
             for frow in conn.execute(
                     "SELECT path, chunk_count FROM files").fetchall():
@@ -769,6 +863,9 @@ def step_m4(live: List[Dict[str, Any]], report: Report, dry_run: bool = False
             vconn.close()
 
         grand["filled"] += filled
+        grand["visited"] += visited
+        grand["changed"] += changed
+        grand["unchanged"] += unchanged
         grand["skipped_concurrent"] += skipped
         grand["no_source"] += no_source
         grand["no_part"] += no_part
@@ -783,16 +880,22 @@ def step_m4(live: List[Dict[str, Any]], report: Report, dry_run: bool = False
             "backfill filled the body columns and decided body_origin (%s)"
             % name,
             "PASS",
-            "filled=%d  skipped(concurrent, rowcount=0)=%d  "
+            "filled=%d (rows whose columns CHANGED)  "
+            "visited=%d  unchanged=%d (already correct - left alone)  "
+            "skipped(concurrent, rowcount=0)=%d  "
             "no truth source=%d  id/part not recoverable=%d\n"
             "body_origin distribution: %s\n"
             "anchors with a segment sequence (+S)=%d  bare anchors=%d\n"
             "orphans (factual drift, text kept)=%d\n"
-            "body-column guard: %s" % (
-                filled, skipped, no_source, no_part,
+            "body-column guard: %s\n"
+            "(filled counts CHANGES, not visits: a second run must report "
+            "filled=0 - that is the idempotence claim, and a counter that "
+            "counts visits cannot make it)" % (
+                changed, visited, unchanged, skipped, no_source, no_part,
                 origin_dist or "none", anchors_with_segments, anchors_bare,
                 orphans, guard_status),
-            filled=filled, skipped=skipped, orphans=orphans,
+            filled=changed, visited=visited, unchanged=unchanged,
+            skipped=skipped, orphans=orphans,
             origin_dist=origin_dist,
             anchors_with_segments=anchors_with_segments,
             body_guard=guard_status)
@@ -1396,7 +1499,8 @@ def _rollback_via_backup_api(db: Path, backup: Path) -> Dict[str, Any]:
 
 
 def rollback(live: List[Dict[str, Any]], backup_dir: Path,
-             report: Report, method: str = "auto") -> None:
+             report: Report, method: str = "auto",
+             explicit_backups: Optional[Dict[str, Path]] = None) -> None:
     """Restore every library from its M0 backup.
 
     P1-阶段三 第四轮.  Two paths, and the report says which one ran:
@@ -1425,11 +1529,25 @@ def rollback(live: List[Dict[str, Any]], backup_dir: Path,
     the database's content as one transaction — so no stale WAL is ever
     applied to a fresh main database.  That is exactly why the ``cp``
     path is forbidden: it bypasses SQLite and lets the WAL apply itself.
+
+    ``explicit_backups`` names the backup file for each library
+    directly.  It exists because the operator's undo button must work
+    with whatever path is in front of them — a directory, or one single
+    file — and inferring the file name from the directory layout is
+    one more place where a wrong guess becomes a silent no-op.
     """
     backup_dir = Path(backup_dir)
     for lib in live:
         db: Path = Path(lib["db"])
-        backup = backup_dir / ("%s.p1-bak.db" % lib["name"])
+        if explicit_backups is not None:
+            backup = explicit_backups.get(lib["name"])
+            if backup is None:
+                report.note("  rollback: no backup for %s -> SKIPPED"
+                            % lib["name"])
+                continue
+            backup = Path(backup)
+        else:
+            backup = backup_dir / ("%s.p1-bak.db" % lib["name"])
         if not backup.is_file():
             report.note("  rollback: no backup for %s -> SKIPPED" % lib["name"])
             continue
@@ -1444,6 +1562,20 @@ def rollback(live: List[Dict[str, Any]], backup_dir: Path,
                     "live service's lock was never contested"
                     % (lib["name"], backup, res.get("integrity_check"),
                        res.get("chunks"), res.get("body_path_notnull")))
+                report.criterion(
+                    "ROLLBACK.%s" % lib["name"],
+                    "%s was restored from its M0 backup" % lib["name"],
+                    "PASS" if res.get("integrity_check") == "ok" else "FAIL",
+                    "path=backup-api  backup=%s\n"
+                    "integrity_check=%s  chunks=%s  body_path NOT NULL=%s\n"
+                    "(the restore moved no file, so it worked with the "
+                    "service holding the database; the cost is that "
+                    "writes made after the backup was taken are LOST)"
+                    % (backup, res.get("integrity_check"), res.get("chunks"),
+                       res.get("body_path_notnull")),
+                    integrity=res.get("integrity_check"),
+                    chunks=res.get("chunks"),
+                    method="backup-api")
                 continue
             except Exception as e:
                 if method == "backup-api":
@@ -1471,6 +1603,312 @@ def rollback(live: List[Dict[str, Any]], backup_dir: Path,
             iconn.close()
         report.note("  rollback: %s restored via rename+copy from %s "
                     "(integrity_check=%s)" % (lib["name"], backup, ok))
+        report.criterion(
+            "ROLLBACK.%s" % lib["name"],
+            "%s was restored from its M0 backup" % lib["name"],
+            "PASS" if ok == "ok" else "FAIL",
+            "path=rename-copy  backup=%s  integrity_check=%s\n"
+            "(the half-migrated database was renamed aside, not deleted: "
+            "it is kept as evidence)" % (backup, ok),
+            integrity=ok, method="rename-copy")
+
+
+# --------------------------------------------------------------------------
+# A-6 — the five checks against "all green but running the OLD code".
+# --------------------------------------------------------------------------
+
+def step_a6_running_the_right_code(live: List[Dict[str, Any]],
+                                   report: Report) -> None:
+    """A-6: prove the process is running THIS code, and print the VALUES.
+
+    **Why this exists.**  A green gate means nothing if the gate ran
+    against the wrong code.  ``git rev-parse HEAD`` alone is not
+    enough: the repository can be at commit X while the interpreter
+    imports ``agent.memory`` from a ``site-packages`` copy at commit Y.
+    MEASURED on 0.114 (前置准备 §7): there is no site-packages copy
+    there, so the check is trivially satisfied — but "trivially
+    satisfied on the machine you tested" is not the same as "checked".
+
+    **The five items, and what each one catches:**
+
+      1. ``agent.memory.__file__`` — the file the interpreter ACTUALLY
+         imported.  Catches "the installed copy, not the source tree".
+      2. ``git rev-parse HEAD`` — the commit of the source tree.  Catches
+         "the right tree, the wrong commit".
+      3. ``schema_fingerprint`` **plus the tables it covers** — the
+         shape of the index.  Catches "the code is right but the
+         database is not the one this code expects".
+      4. ``body_path IS NULL`` count — the thing the migration was
+         supposed to fill.
+      5. the before/after row count and the CONTENT DIGEST — the
+         migration's own effect.
+
+    **Every item prints its ACTUAL VALUE**, never just PASS/FAIL: a
+    criterion that prints only the verdict cannot be audited by the
+    reader, and the reader is the one who has to decide whether the
+    machine is in the state the report claims.
+    """
+    import subprocess
+
+    items: List[Tuple[str, str, bool]] = []
+
+    # --- 1. which file did the interpreter import? --------------------
+    try:
+        import agent.memory as _m
+        import pathlib as _pl
+
+        mem_file = str(_pl.Path(_m.__file__).resolve())
+    except Exception as e:
+        mem_file = "cannot import agent.memory: %s" % e
+    in_source_tree = str(REPO) in mem_file
+    items.append((
+        "① agent.memory.__file__", mem_file, in_source_tree))
+
+    # --- 2. which commit is that tree at? ------------------------------
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(REPO), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=30).stdout.strip()
+    except Exception as e:
+        head = "cannot run git: %s" % e
+    items.append(("② git rev-parse HEAD", head or "(empty)", bool(head)))
+
+    # --- 3. the schema fingerprint, WITH its coverage ------------------
+    for lib in live:
+        try:
+            fp = schema_fingerprint(lib["db"])
+        except Exception as e:
+            fp = "error: %s" % e
+        items.append((
+            "③ schema_fingerprint [%s]" % lib["name"],
+            describe_schema_fingerprint(fp), fp is not None))
+        break  # one library is enough for the shape; the rest are in M1
+
+    # --- 4. the pointers that are supposed to be filled ----------------
+    # This is a MEASUREMENT, not a gate.  A non-zero count here does
+    # NOT mean "the wrong code ran" — it means the data has rows with
+    # no pointer, which is the honest state for a row whose truth file
+    # does not exist (Rule D), and the M4 criteria own that question.
+    # Conflating the two would make this criterion red for a reason
+    # that has nothing to do with what it asks.
+    null_total = 0
+    rows_total = 0
+    for lib in live:
+        try:
+            conn = _open_ro(lib["db"])
+            try:
+                null_total += _q(
+                    conn, "SELECT COUNT(*) FROM chunks "
+                          "WHERE body_path IS NULL")
+                rows_total += _q(conn, "SELECT COUNT(*) FROM chunks")
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            pass
+    measurements: List[Tuple[str, str]] = [
+        ("④ body_path IS NULL (all libraries)",
+         "%d of %d rows" % (null_total, rows_total)),
+    ]
+
+    # --- 5. the effect of this very run --------------------------------
+    for lib in live:
+        try:
+            conn = _open_ro(lib["db"])
+            try:
+                digest = content_digest(conn, "chunks")
+                rows = _q(conn, "SELECT COUNT(*) FROM chunks")
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            digest, rows = None, 0
+        pre = lib.get("pre", {})
+        before_rows = pre.get("chunks")
+        before_digest = pre.get("chunks_digest")
+        measurements.append((
+            "⑤ rows / content digest [%s]" % lib["name"],
+            "rows %s -> %s   digest %s -> %s" % (
+                before_rows if before_rows is not None else "(no baseline)",
+                rows,
+                (before_digest or "(no baseline)")[:16],
+                (digest or "(none)")[:16])))
+
+    # **The verdict is about the CODE IDENTITY only.**  Items ① ② ③
+    # answer "is this run against the code the report describes?" —
+    # that is what this criterion is for.  Items ④ ⑤ are the DATA
+    # state, printed so the reader can see the migration's effect;
+    # they are measured, not judged here (the M4 criteria own the
+    # pointer question).
+    ok = all(good for _label, _value, good in items)
+    detail = []
+    for label, value, _good in items:
+        detail.append("  %-34s %s" % (label, value))
+    for label, value in measurements:
+        detail.append("  %-34s %s" % (label, value))
+    detail.append("")
+    detail.append("(every item prints its ACTUAL VALUE — a verdict alone "
+                  "cannot be audited by the reader)")
+    detail.append("① ② ③ are the VERDICT (code identity: is this run "
+                  "against the code the report describes?).")
+    detail.append("④ ⑤ are MEASUREMENTS (the data state; the M4 "
+                  "criteria own the pointer question).")
+    report.criterion(
+        "A6.CODE",
+        "the run is against THIS source tree (the code identity), with "
+        "the data state printed beside it",
+        "PASS" if ok else "FAIL",
+        "\n".join(detail),
+        agent_memory_file=mem_file,
+        git_head=head,
+        body_path_null=null_total,
+        rows=rows_total)
+
+
+# --------------------------------------------------------------------------
+# The operator's undo button: ``--rollback <backup path>``.
+# --------------------------------------------------------------------------
+
+def _resolve_rollback_backups(backup_path: Path,
+                              live: List[Dict[str, Any]]) -> Dict[str, Path]:
+    """Map each live library to its backup file, from EITHER shape.
+
+    ``--rollback`` accepts two shapes, because an operator who is
+    standing in front of a broken machine has whatever is in front of
+    them:
+
+      * a DIRECTORY — the M0 backup directory (``<name>.p1-bak.db``
+        files).  This is what ``--backup-dir`` produced.
+      * a single FILE — one ``<name>.p1-bak.db``.  Then only that one
+        library is restored, and the others are reported as SKIPPED.
+
+    **A missing backup is reported, never guessed.**  A rollback that
+    silently restores three libraries out of four is worse than one
+    that restores none: the operator believes the machine is back to
+    the pre-migration state, and it is not.
+    """
+    backup_path = Path(backup_path)
+    out: Dict[str, Path] = {}
+    if backup_path.is_dir():
+        for lib in live:
+            cand = backup_path / ("%s.p1-bak.db" % lib["name"])
+            if cand.is_file():
+                out[lib["name"]] = cand
+        return out
+    if backup_path.is_file():
+        # The file name carries the library name: '<name>.p1-bak.db'.
+        stem = backup_path.name
+        for suffix in (".p1-bak.db", ".db"):
+            if stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                break
+        out[stem] = backup_path
+        return out
+    return out
+
+
+def run_rollback(backup_path: Path | str, workspace: Path | str,
+                 method: str = "auto") -> int:
+    """Restore the live libraries from an M0 backup and report.
+
+    This is the operator's undo button, and it is a SEPARATE entry
+    point from the migration: it never migrates, it only restores.
+
+    **The restore goes through the SQLite backup API** (A-3).  The
+    reason is NOT "``cp`` is always wrong" — it is that the backup API
+
+      * moves, renames and deletes NOTHING, so it works while the
+        service holds the database (measured by 风控: the service's own
+        connection immediately sees the restored data);
+      * does not depend on the side effect "the WAL's salt happens not
+        to match the fresh main database", which is the only reason
+        ``cp`` works at all when the service is stopped;
+      * replaces the database's content as ONE transaction through
+        SQLite, so a stale WAL is never applied to a fresh main
+        database (which is how ``cp`` revives rows that were never in
+        the backup).
+
+    The cost is stated in the report: the restore overwrites EVERYTHING
+    in the live database, so writes made after the backup was taken are
+    LOST.  That is the price of having a rollback path at all.
+    """
+    backup_path = Path(backup_path)
+    workspace = Path(workspace)
+    report = Report()
+    report.note("=" * 72)
+    report.note("P1-阶段三 · 回滚（restore from the M0 backup）")
+    report.note("=" * 72)
+    report.note("workspace  : %s" % workspace)
+    report.note("backup     : %s" % backup_path)
+    report.note("method     : %s" % method)
+
+    if not backup_path.exists():
+        report.criterion(
+            "ROLLBACK.INPUT", "the backup path exists", "FAIL",
+            "%s does not exist — there is nothing to restore from.  "
+            "Point --rollback at the M0 backup directory "
+            "(--backup-dir) or at a single '<name>.p1-bak.db'." % backup_path)
+        print("\n".join(report.lines))
+        return 2
+
+    live = enumerate_live(workspace)
+    backups = _resolve_rollback_backups(backup_path, live)
+    report.note("live libraries (WHITELIST enumeration): %d" % len(live))
+    for lib in live:
+        report.note("   %-22s %s" % (lib["name"], lib["db"]))
+    report.note("backups found: %d" % len(backups))
+
+    if not backups:
+        report.criterion(
+            "ROLLBACK.INPUT", "the backup path holds the backups", "FAIL",
+            "no '<name>.p1-bak.db' file was found under %s, and the live "
+            "libraries are %s.  A rollback that restores NOTHING and "
+            "reports success is worse than one that fails: the operator "
+            "would believe the machine is back to the pre-migration "
+            "state, and it is not." % (backup_path,
+                                      ", ".join(l["name"] for l in live) or "none"))
+        print("\n".join(report.lines))
+        return 2
+
+    # Restore only the libraries that HAVE a backup — and say which
+    # ones were left alone.
+    targets = [lib for lib in live if lib["name"] in backups]
+    skipped = [lib["name"] for lib in live if lib["name"] not in backups]
+    for name in skipped:
+        report.note("  rollback: %s -> SKIPPED (no backup for it)" % name)
+    if skipped:
+        report.criterion(
+            "ROLLBACK.COVERAGE",
+            "every live library had a backup to restore from",
+            "FAIL",
+            "restored=%d  skipped(no backup)=%s\n"
+            "(a library left behind is a library still holding the "
+            "half-migrated state — the operator must know which one)"
+            % (len(targets), ", ".join(skipped) or "none"),
+            restored=len(targets), skipped=skipped)
+    else:
+        report.criterion(
+            "ROLLBACK.COVERAGE",
+            "every live library had a backup to restore from",
+            "PASS",
+            "restored=%d  skipped=0" % len(targets),
+            restored=len(targets), skipped=skipped)
+
+    rollback(targets, backup_path.parent if backup_path.is_dir()
+             else backup_path.parent, report, method=method,
+             explicit_backups=backups)
+
+    counts = report.counts()
+    report.note("=" * 72)
+    report.note("判据通过: %d PASS / %d FAIL / %d NOTRUN"
+                % (counts["PASS"], counts["FAIL"], counts["NOTRUN"]))
+    report.note("=" * 72)
+    out = "\n".join(report.lines)
+    print(out)
+    try:
+        (backup_path.parent / "rollback-report.txt").write_text(
+            out, encoding="utf-8")
+    except OSError:
+        pass
+    return 1 if counts["FAIL"] else 0
 
 
 # --------------------------------------------------------------------------
@@ -1502,6 +1940,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "it the count is reported, not enforced — the "
                          "hardcoded 16 was true only on this machine and "
                          "made the tool unusable on 0.114 (B-1).")
+    ap.add_argument("--rollback", default=None, metavar="BACKUP_PATH",
+                    help="restore every live library from an M0 backup "
+                         "directory (or a single '<name>.p1-bak.db' file) and "
+                         "EXIT.  This is the operator's undo button: it "
+                         "does not migrate anything.  The restore goes "
+                         "through the SQLite backup API by default (A-3) — "
+                         "it moves no file, so it works while the service "
+                         "holds the database.")
     args = ap.parse_args(argv)
 
     # B-2 (风控专家 终审 §5.1 / R-9): running the module from outside the
@@ -1529,6 +1975,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     workspace = Path(args.workspace).resolve()
+
+    # The operator's undo button.  It is handled BEFORE anything else,
+    # because a rollback must never be blocked by a gate that has
+    # nothing to do with it — the whole point of the button is that it
+    # works when the machine is broken.
+    if args.rollback:
+        return run_rollback(args.rollback, workspace,
+                            method=args.rollback_method)
+
     report = Report()
     stamp = time.strftime("%Y%m%d-%H%M%S")
     backup_dir = Path(args.backup_dir) if args.backup_dir else \
@@ -1555,6 +2010,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     # REPORTED (with both numbers printed) instead of failing.  A gate
     # that cannot be satisfied on the machine it is run on is not a gate,
     # it is an outage.
+    #
+    # **The one number that IS a gate: ZERO.**  "Enumerated 0
+    # libraries" means the tool found nothing to migrate — the
+    # workspace path is wrong, or the truth layer is somewhere else.
+    # That is a genuine failure, and it must stop the run: a tool that
+    # reports success after migrating nothing is the worst possible
+    # outcome, because the operator reads the green and moves on.
+    if len(live) == 0:
+        report.criterion(
+            "ENUM.GATE",
+            "at least one live library was found",
+            "FAIL",
+            "enumerated 0 libraries under %s.  The enumeration is a "
+            "WHITELIST of path shapes — %s/memory/long-term/index.db and "
+            "%s/agents/<id>/memory/long-term/index.db — so zero means "
+            "the path is wrong, or the truth layer lives somewhere "
+            "else.  On 0.114 the workspace is /home/paikeywu/cow-workspace "
+            "(NOT the repository).  A run that migrates nothing must not "
+            "report success." % (workspace, workspace, workspace),
+            enumerated=0, expected=None)
+        print("\n".join(report.lines))
+        return 2
     if args.expect_libraries is None:
         report.criterion(
             "ENUM.GATE",
@@ -1564,7 +2041,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "--expect-libraries was not passed, so the count is REPORTED, "
             "not enforced).  The enumeration is a WHITELIST of path "
             "shapes, never a *.db glob (A-4).  On this machine the "
-            "expected count is 16." % len(live),
+            "expected count is 16; on 0.114 it is 1 (the 15 agents/ "
+            "directories are empty shells)." % len(live),
             enumerated=len(live), expected=None)
     elif len(live) != args.expect_libraries:
         report.criterion(
@@ -1620,6 +2098,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             # 防止三态机退化为装饰"), and a tool that set the state
             # itself would make the three-state machine a decoration.
             step_m6(live, report, dry_run=args.dry_run)
+        # A-6: the five checks against "all green but running the OLD
+        # code".  It runs on EVERY path (including --step M7 --dry-run),
+        # because the question it asks is not about the migration — it
+        # is about whether THIS run is the run the report describes.
+        step_a6_running_the_right_code(live, report)
     except MigrationError as e:
         report.criterion("ROLLBACK", "the migration was rolled back",
                          "FAIL", str(e))
