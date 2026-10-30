@@ -99,6 +99,22 @@ CRITERION_FILES = ("phase2.py", "phase2_s3e.py", "phase2_s3h.py",
 #:          looks unmigrated (MEASURED: this was a real bug)
 #:   MU-20  the verdict order is inverted ⇒ a measured defect is
 #:          hidden behind an unmet prerequisite
+#:
+#: MU-21..MU-26 are the S3-K round's six — the certification semantics:
+#:   MU-21  M6a consults the KEEP TABLE instead of the LEDGER ⇒ every
+#:          new row looks "never certified" (the keep table is written
+#:          by triggers, and triggers only run when a write is
+#:          threatened)
+#:   MU-22  a MISSING ledger is treated as NOTRUN ⇒ "nothing was ever
+#:          certified" hides behind "could not measure"
+#:   MU-23  the REFUSED (orphan) rows are counted as downgrades ⇒ an
+#:          honest refusal is reported as a defect
+#:   MU-24  a 'mirror' row with NO ledger entry is accepted ⇒ the row
+#:          claims "certified" with nobody able to say when
+#:   MU-25  the ground truth is the CHUNK ROW COUNT instead of a
+#:          re-chunk of the truth file ⇒ every changed file is red
+#:   MU-26  a NULL statistic is an erasure without checking whether the
+#:          chunks side was ever migrated ⇒ "never measured" is red
 REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
     "test_p1_stage3e_criteria_mutants.py": (
         "MU-1", "MU-2", "MU-3", "MU-4", "MU-5", "MU-6", "MU-7", "MU-8", "MU-9",
@@ -108,6 +124,9 @@ REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
     ),
     "test_p1_stage3j_criteria_mutants.py": (
         "MU-18", "MU-19", "MU-20",
+    ),
+    "test_p1_stage3k_criteria_mutants.py": (
+        "MU-21", "MU-22", "MU-23", "MU-24", "MU-25", "MU-26",
     ),
 }
 

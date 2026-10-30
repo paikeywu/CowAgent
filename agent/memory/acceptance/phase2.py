@@ -841,13 +841,42 @@ _S3E_CRITERIA = [
 # used the old (unsatisfiable) mouth, and keeping two M6 criteria in the
 # report would mean one of them is always red for a reason nobody can
 # fix.  The S3-H one replaces it.
+#
+# S3-K REPLACES the S3-H one in turn: S3-K made the certification a
+# first-class operation, and the witness for "was this row certified?"
+# is now the CERTIFICATION LEDGER.  The S3-H mouth also asserted
+# ``orphan == 0``, but S3-K's own measurement found a row whose truth
+# source had genuinely drifted — the certifier REFUSES it, honestly,
+# and it keeps ``projection``.  **A refusal is not an erasure**, so the
+# S3-H mouth was red for a reason that is not a defect.
+#
+# Keeping both would mean two M6 criteria with two different mouths —
+# exactly what the "one thing, one criterion" rule forbids.  The S3-K
+# module owns M6 from here on.
 _S3H_CRITERIA = [
     ("C-A3", "judge_ca3_chunker_version_is_consistent"),
-    ("M6", "judge_m6_body_origin_mouth"),
     ("INV-2", "judge_inv2_anchor_rebuild_is_byte_equal"),
     ("ANCHOR", "judge_anchor_segments_are_self_consistent"),
     ("UPSERT", "judge_upsert_does_not_downgrade_the_body_columns"),
     ("PARSER", "judge_anchor_parser_is_single"),
+]
+
+# ---------------------------------------------------------------------------
+# S3-K · the criteria that align with the CERTIFICATION semantics.
+#
+# They live in their own module (``phase2_s3k``) because the subject is
+# the certification, and the certification has its own witness (the
+# ledger), its own state machine (coverage / downgrade / refusal), and
+# its own switch ("not certified yet" vs "certified and broken").  The
+# M6 family is renamed M6a..M6e so that each one names its own
+# question — a single "M6" that means five different things is a
+# criterion nobody can argue with.
+_S3K_CRITERIA = [
+    ("M6a", "judge_m6a_certification_coverage"),
+    ("M6b", "judge_m6b_downgrade"),
+    ("M6c", "judge_m6c_refused_rows_are_registered"),
+    ("M6d", "judge_m6d_certification_switch_is_observable"),
+    ("M6e", "judge_m6e_files_statistics_are_guarded"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -946,6 +975,24 @@ def _load_s3j():
     return out
 
 
+def _load_s3k():
+    """The S3-K criterion functions, bound to the workspace."""
+    from agent.memory.acceptance import phase2_s3k
+
+    ws = Path(resolve_workspace(ARGS.workspace)[0])
+    out = []
+    for group, attr in _S3K_CRITERIA:
+        fn = getattr(phase2_s3k, attr)
+
+        def make(fn=fn, ws=ws):
+            def run(report):
+                return fn(report, ws)
+            return run
+
+        out.append((group, make()))
+    return out
+
+
 def main() -> int:
     workspace, how = resolve_workspace(ARGS.workspace)
 
@@ -998,6 +1045,12 @@ def main() -> int:
 
     # The S3-J criteria (「没迁移」 vs 「迁移后被擦」).
     for group, fn in _load_s3j():
+        if ARGS.only and not group.startswith(ARGS.only):
+            continue
+        guarded(fn, report)
+
+    # The S3-K criteria (the certification semantics: M6a..M6e).
+    for group, fn in _load_s3k():
         if ARGS.only and not group.startswith(ARGS.only):
             continue
         guarded(fn, report)
