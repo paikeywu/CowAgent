@@ -18,12 +18,15 @@ import re
 import sqlite3
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from common.log import logger
 
 from agent.memory import msg_chain
+
+_CST = timezone(timedelta(hours=8))
 
 
 # Runs this process opened and has not finished yet. A run stored as
@@ -1779,12 +1782,66 @@ class ConversationStore:
                     (json.dumps(cur, ensure_ascii=False), aid, session_id, seq, *identity_values),
                 )
                 conn.commit()
+                if updated.rowcount:
+                    # **P1 阶段三 M (施工图 W-2 · 契约 C-2): the extras update
+                    # must reach the truth source.**  The DB's ``extras``
+                    # column is a projection; an externalised row's extras
+                    # that change only in the DB leave the JSONL's copy
+                    # stale, and MSG-INV-5 loses its reconciliation base.
+                    # The compensation chain records the event and the flag
+                    # marks the row, so criterion and writer agree by
+                    # construction.  The write is best-effort: the extras
+                    # update itself already succeeded, and a compensation
+                    # failure must not turn that success into a failure —
+                    # but it is LOGGED, never swallowed silently.
+                    try:
+                        self._compensate_extras_update(conn, session_id, seq,
+                                                       extras)
+                    except Exception as e:
+                        logger.warning(
+                            f"[ConversationStore] extras compensation failed "
+                            f"for session={session_id} seq={seq}: {e}")
                 return seq if updated.rowcount else None
             except Exception as e:
                 logger.warning(f"[ConversationStore] attach_extras failed: {e}")
                 return None
             finally:
                 conn.close()
+
+    def _compensate_extras_update(self, conn: sqlite3.Connection,
+                                  session_id: str, seq: int,
+                                  extras: Dict[str, Any]) -> None:
+        """Record ONE extras update in the compensation chain (施工图 W-2).
+
+        Only an EXTERNALISED row needs a compensation: an inline row's
+        extras live in the DB alone, and the JSONL has no copy to drift
+        from.  For an externalised row the event is appended to
+        ``.audit/extras_compensations.jsonl`` (one row PER UPDATE EVENT —
+        the truth source records what happened, and a second update of
+        the same row is a second event) and the row's
+        ``extras_compensated`` flag is set.  MSG-INV-5 reconciles the
+        chain against the flag by DISTINCT target row, so repeated
+        updates of one row stay GREEN (判据自身的判据 D).
+        """
+        row = conn.execute(
+            "SELECT content_state FROM messages "
+            "WHERE agent_id = ? AND session_id = ? AND seq = ?",
+            (self._agent_id, session_id, seq),
+        ).fetchone()
+        if not row or row[0] != msg_chain.STATE_EXTERNAL:
+            return
+        msg_chain.append_compensation(
+            self._workspace_root(),
+            agent_id=self._agent_id, session_id=session_id, target_seq=seq,
+            extras=dict(extras),
+            at=datetime.now(_CST).isoformat(timespec="seconds"),
+        )
+        conn.execute(
+            "UPDATE messages SET extras_compensated = 1 "
+            "WHERE agent_id = ? AND session_id = ? AND seq = ?",
+            (self._agent_id, session_id, seq),
+        )
+        conn.commit()
 
     # ------------------------------------------------------------------
     # Runs: addressable, persisted units of work

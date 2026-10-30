@@ -2121,6 +2121,23 @@ class MemoryStorage:
                 self.conn.execute("DELETE FROM chunks WHERE path = ?", (path,))
                 if params_list:
                     self.conn.executemany(ins_sql, params_list)
+                # P1 阶段三 N (任务二): the certification ledger must not
+                # keep entries for the ids that did NOT come back.  The
+                # ids are position-derived, so a re-cut moves them
+                # wholesale; until now the ledger kept the old ids
+                # forever (MEASURED on the live ROOT library: 38 orphans,
+                # all on constantly re-cut files), and M6f cried wolf on
+                # a NORMAL state.  The entries for the ids that DID come
+                # back are KEPT — the restore triggers read the ledger to
+                # bring the certified state back (S3-L), so a blanket
+                # cascade would de-certify every re-cut file.  The prune
+                # happens INSIDE this transaction: the invariant "no
+                # ledger entry names a chunk that does not exist" is
+                # restored at the write boundary, atomically with the
+                # re-cut itself.
+                gone_ids = set(old_stats) - {c.id for c in chunks}
+                if gone_ids:
+                    self._prune_ledger_entries(gone_ids)
                 # The files bookkeeping row travels in the SAME transaction:
                 # a rebuilt projection whose files row still points at the old
                 # mtime is indistinguishable from a stale one.
@@ -2138,13 +2155,58 @@ class MemoryStorage:
                 self.conn.rollback()
                 raise
 
+    def _prune_ledger_entries(self, chunk_ids) -> int:
+        """Delete the ``cert_ledger`` rows of chunks that are GONE
+        (P1 阶段三 N, 任务二).
+
+        Called INSIDE an open write transaction by the two paths that
+        make chunk rows disappear (:meth:`replace_file_chunks` and
+        :meth:`delete_by_path`), so the ledger never holds a witness
+        for a row that does not exist.  Only the GONE ids are pruned —
+        the ledger is also the restore source for the certified state
+        (S3-L: the ``chunks_body_keep_*_ai`` triggers read it on
+        re-insert), so the entries of the ids that came back must
+        survive.  The janitor (``certify.py``'s prune and
+        ``ledger_orphans.py``) stays as the sweeper for every path
+        that does not go through here (a foreign writer's raw
+        ``DELETE``), and M6f stays as the detector above both.
+
+        A library without the ledger table has nothing to prune — that
+        is not an error.
+        """
+        ids = list(chunk_ids)
+        if not ids:
+            return 0
+        try:
+            has_table = self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='cert_ledger'").fetchone()
+        except sqlite3.Error:
+            return 0
+        if not has_table:
+            return 0
+        pruned = 0
+        for cid in ids:
+            cur = self.conn.execute(
+                "DELETE FROM cert_ledger WHERE id = ?", (cid,))
+            pruned += max(cur.rowcount, 0)
+        return pruned
+
     def delete_by_path(self, path: str):
         """Delete all chunks and file metadata for a path."""
         with self._lock:
             try:
+                # Snapshot the ids BEFORE the delete: the ledger rows
+                # that witnessed them must go in the SAME transaction
+                # (P1 阶段三 N, 任务二) — the file is gone, and a witness
+                # for a non-existent chunk is an orphan by definition.
+                gone_ids = [row["id"] for row in self.conn.execute(
+                    "SELECT id FROM chunks WHERE path = ?", (path,))]
                 self.vector_backend.delete(metadata_filter={"path": path})
                 self.conn.execute("DELETE FROM chunks WHERE path = ?", (path,))
                 self.conn.execute("DELETE FROM files WHERE path = ?", (path,))
+                if gone_ids:
+                    self._prune_ledger_entries(gone_ids)
                 self.conn.commit()
             except Exception:
                 self.conn.rollback()

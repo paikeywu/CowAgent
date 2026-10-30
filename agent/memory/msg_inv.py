@@ -362,12 +362,21 @@ def check_msg_inv5(workspace: Union[str, Path], conn: sqlite3.Connection,
                     agent_id: str = "") -> Dict[str, Any]:
     """MSG-INV-5: the DB projection and the JSONL agree, in both directions.
 
-    Four expectations (裁决 C-2 v2):
+    Four expectations (裁决 C-2 v2, 第 3 项于施工图 W-2 精确化):
 
     1. the main chain's MESSAGE lines == the DB's externalised rows;
     2. the main chain holds NO compensation lines (``kind`` must be
        absent from every line);
-    3. the compensation file's lines == the DB's compensated rows;
+    3. the compensation file's DISTINCT TARGET ROWS == the DB's
+       compensated rows.  The compensation chain is a ledger of EVENTS
+       — the same row's extras can be updated twice, and the second
+       update is a second event.  The DB's ``extras_compensated`` is a
+       flag, one bit per row.  Comparing the raw line count with the
+       flag count would red on the FIRST legitimate second update —
+       a wolf-crying criterion (判据自身的判据 D: a session whose
+       extras were updated must be GREEN).  The truth check #4 below
+       still validates EVERY event row individually, so no event can
+       hide;
     4. every compensation row's ``target_seq`` names a DB row that is
        externalised.
     """
@@ -419,11 +428,15 @@ def check_msg_inv5(workspace: Union[str, Path], conn: sqlite3.Connection,
                       "the main chain holds %d message line(s) but the DB "
                       "has %d externalised row(s)" % (message_lines,
                                                       db_external)))
-    if db_compensated is not None and len(comp_lines) != db_compensated:
-        out.append(_v(CODE_COMPENSATION_COUNT,
-                      "the compensation file holds %d line(s) but the DB has "
-                      "%d compensated row(s)" % (len(comp_lines),
-                                                 db_compensated)))
+    if db_compensated is not None:
+        comp_targets = {
+            (row.get("agent_id") or "", row.get("session_id") or "",
+             int(row.get("target_seq") or -1)) for row in comp_lines}
+        if len(comp_targets) != db_compensated:
+            out.append(_v(CODE_COMPENSATION_COUNT,
+                          "the compensation file covers %d distinct target "
+                          "row(s) but the DB has %d compensated row(s)"
+                          % (len(comp_targets), db_compensated)))
     # Every compensation row must name a row that exists.
     for row in comp_lines:
         if row.get("kind") != msg_chain.COMPENSATION_KIND:

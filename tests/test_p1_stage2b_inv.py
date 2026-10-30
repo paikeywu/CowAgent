@@ -211,4 +211,5 @@ def test_report_declares_chunks_landing_scope_and_deferred(tmp_path):
     st.close()
     # 报告必须写明跑的是 chunks 落地版 6 条 + 登记暂缓项，禁止笼统"INV 全绿"
     assert "chunks 落地版" in rep["scope"]
-    assert set(rep["deferred"]) == {"INV-4", "INV-5", "INV-7", "INV-8"}
+    # INV-5 已于阶段三 M 落地为 MSG-INV-2/3（施工图 W-3：两处必须同提交改）。
+    assert set(rep["deferred"]) == {"INV-4", "INV-7", "INV-8"}

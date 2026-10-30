@@ -115,6 +115,19 @@ CRITERION_FILES = ("phase2.py", "phase2_s3e.py", "phase2_s3h.py",
 #:          re-chunk of the truth file ⇒ every changed file is red
 #:   MU-26  a NULL statistic is an erasure without checking whether the
 #:          chunks side was ever migrated ⇒ "never measured" is red
+#:
+#: MU-27..MU-34 are the S3-M round's eight — the messages domain and the
+#: ledger's write-boundary prune:
+#:   MU-27  the MSG-INV group LOSES one criterion ⇒ "报绿但没查"
+#:   MU-28  an un-externalised library is judged GREEN ⇒ 判据自身的判据 A
+#:   MU-29  the inspector's wiring is REMOVED ⇒ W-1 is undone
+#:   MU-30  INV-5 is back in the deferred set ⇒ 施工图 W-3 is undone
+#:   MU-31  "not applicable" is disguised as 0.0 ⇒ 施工图 W-4 / N-8
+#:   MU-32  the write boundary does NOT prune the ledger ⇒ M6f cries wolf
+#:   MU-33  the write boundary prunes EVERYTHING ⇒ S3-L's restore loses
+#:          its witness (a blanket cascade)
+#:   MU-34  the M6f detector is BLINDED ⇒ the fix at the write boundary
+#:          would have made the detector blind to a foreign DELETE
 REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
     "test_p1_stage3e_criteria_mutants.py": (
         "MU-1", "MU-2", "MU-3", "MU-4", "MU-5", "MU-6", "MU-7", "MU-8", "MU-9",
@@ -127,6 +140,9 @@ REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
     ),
     "test_p1_stage3k_criteria_mutants.py": (
         "MU-21", "MU-22", "MU-23", "MU-24", "MU-25", "MU-26",
+    ),
+    "test_p1_stage3n_criteria_mutants.py": (
+        "MU-27", "MU-28", "MU-29", "MU-30", "MU-31", "MU-32", "MU-33", "MU-34",
     ),
 }
 

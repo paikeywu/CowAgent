@@ -280,6 +280,35 @@ def externalise_session(conn: sqlite3.Connection, workspace: Union[str, Path],
     if existing:
         prev = existing[-1].get("line_hash") or msg_chain.MSG_GENESIS_PREV_HASH
 
+    # **The double-write guard (施工图 W-5).**  A stage-4 crash between
+    # step 2 (the JSONL write) and step 5 (the DB emptying) leaves the
+    # rows in BOTH places — and the ``content IS NOT NULL`` selector
+    # above picks them up AGAIN on the next run, appending the same
+    # seqs a second time (JSONL lines > DB external rows → MSG-INV-5
+    # red, and the chain now carries two copies of one message).
+    #
+    # **Resume is FORBIDDEN; the batch is rolled back as a WHOLE.**  The
+    # overlap this guard detects is precisely the crash signature: seqs
+    # the file already holds and the DB still offers.  Silently skipping
+    # them would be "断点续跑" — a half-migrated state nobody can
+    # distinguish from a complete one.  The only legal way out is
+    # :func:`rollback_externalise_batch` (backup API + delete the
+    # batch's directory), after which the migration starts over clean.
+    existing_seqs = {int(line["seq"]) for line in existing
+                     if line.get("seq") is not None}
+    overlap = sorted(existing_seqs.intersection(
+        int(r[0]) for r in rows))
+    if overlap:
+        raise MsgMigrationError(
+            "session %r: the JSONL %s already holds %d of the seq(s) the DB "
+            "still offers (%s%s) — a previous stage-4 run crashed between "
+            "the file write and the DB emptying, and re-running would "
+            "DOUBLE-WRITE (施工图 W-5: resume is FORBIDDEN).  Roll the "
+            "whole batch back with rollback_externalise_batch() "
+            "(--stage rollback) and start the migration over."
+            % (session_id, rel, len(overlap), overlap[:5],
+               "…" if len(overlap) > 5 else ""))
+
     lines: List[Dict[str, Any]] = []
     for seq, role, content, created_at, run_id, extras, _rid in rows:
         line = msg_chain.build_msg_line(
@@ -455,6 +484,62 @@ def rollback_via_backup_api(db: Path, backup: Path) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# The stage-4 failure disposal — a WHOLE-batch rollback, never a resume
+# ---------------------------------------------------------------------------
+
+def rollback_externalise_batch(db: Path, backup: Path,
+                                workspace: Union[str, Path], *,
+                                batch_date: Optional[str] = None,
+                                keep_files: bool = False) -> Dict[str, Any]:
+    """Roll a FAILED stage-4 batch back as a WHOLE (施工图 W-5 / 阶段 4).
+
+    Two halves, both mandatory for a clean re-run:
+
+      1. **the DB is restored from the backup** via the SQLite backup
+         API (never ``cp`` — G-05a: a copy applies the STALE WAL and
+         resurrects rows, silently);
+      2. **the batch's export directory is removed** — the JSONL the
+         crashed run wrote is now unregistered (the restored DB points
+         at nothing), and leaving it in place would make the NEXT
+         migration's MSG-INV-5 red (chain lines > DB external rows)
+         and trip the double-write guard on the seqs it still holds.
+         ``batch_date=None`` removes the whole ``messages_export/``
+         tree — the correct choice when the batch being rolled back is
+         the only one; pass an explicit date to remove just one
+         batch's directory.  ``keep_files=True`` skips the removal for
+         forensics, and is REPORTED as such: the state is then
+         recovered-but-dirty, not clean.
+
+    The anchor chain (``.audit/msg_chain.jsonl``) is NOT touched: it is
+    append-only history — the batch DID happen — and MSG-INV-4 only
+    judges anchors of files that exist.
+    """
+    out: Dict[str, Any] = {
+        "db": str(db), "backup": str(backup),
+        "batch_date": batch_date, "keep_files": bool(keep_files),
+        "removed": [],
+    }
+    out["restore"] = rollback_via_backup_api(db, backup)
+    if keep_files:
+        out["files"] = ("KEPT for forensics — the export tree is now "
+                        "unregistered; expect MSG-INV-5 to report the "
+                        "mismatch until the tree is removed")
+        return out
+    root = msg_chain.export_root(workspace)
+    targets: List[Path] = []
+    if batch_date:
+        if (root / batch_date).is_dir():
+            targets.append(root / batch_date)
+    elif root.is_dir():
+        targets.append(root)
+    for target in targets:
+        removed_files = [str(p) for p in sorted(target.rglob("*.jsonl"))]
+        shutil.rmtree(target)
+        out["removed"].append({"dir": str(target), "files": removed_files})
+    return out
+
+
+# ---------------------------------------------------------------------------
 # The CLI
 # ---------------------------------------------------------------------------
 
@@ -479,6 +564,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--stage", default="all",
                     choices=("all", "backup", "externalise", "rollback"),
                     help="which stage to run")
+    ap.add_argument("--batch-date", default=None,
+                    help="rollback only: remove just this batch's directory "
+                         "(YYYY-MM-DD) instead of the whole messages_export/ "
+                         "tree")
+    ap.add_argument("--keep-files", action="store_true",
+                    help="rollback only: restore the DB but KEEP the crashed "
+                         "batch's files (forensics; the state stays dirty "
+                         "and MSG-INV-5 will say so)")
     ap.add_argument("--json", action="store_true", help="print the report as JSON")
     args = ap.parse_args(argv)
 
@@ -522,6 +615,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                 # of the work.
                 report["externalise"] = externalise_every_agent(
                     conn, workspace, dry_run=args.dry_run)
+        except MsgMigrationError as e:
+            # 施工图 W-5: the failure disposal is a WHOLE-batch rollback —
+            # resume is FORBIDDEN (the double-write guard is what usually
+            # raises here).  The operator is told the ONE legal way out,
+            # and the exit code says the stage did not complete.
+            report["verdict"] = "FAIL"
+            report["failure"] = str(e)
+            report["disposal"] = (
+                "roll the whole batch back: --stage rollback "
+                "[--batch-date YYYY-MM-DD] [--keep-files], then start the "
+                "migration over.  Do NOT re-run --stage externalise to "
+                "resume — the guard will refuse it again.")
+            print(json.dumps(report, ensure_ascii=False, indent=2)
+                  if args.json else report)
+            return 2
         finally:
             conn.close()
         report["verdict"] = "PASS"
@@ -531,7 +639,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.stage == "rollback":
         target = backup_dir / ("messages.p1-bak.db")
-        report["rollback"] = rollback_via_backup_api(db, target)
+        # 施工图 W-5 / 阶段 4: the rollback is the WHOLE batch — the DB
+        # restore AND the batch's export directory.  Restoring the DB
+        # alone leaves an unregistered JSONL tree behind, and the next
+        # migration would red on it (MSG-INV-5) or double-write into it.
+        report["rollback"] = rollback_externalise_batch(
+            db, target, workspace, batch_date=args.batch_date,
+            keep_files=args.keep_files)
         report["verdict"] = "PASS"
         print(json.dumps(report, ensure_ascii=False, indent=2) if args.json
               else report)

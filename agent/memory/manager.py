@@ -1626,6 +1626,24 @@ class MemoryManager:
             # agree" is indistinguishable from "the fingerprints agree on
             # the one table the fingerprint looked at".
             'schema_fingerprint_tables': schema_fp_tables,
+            # P1 阶段三 M (施工图 W-4 · 契约 v2 G-08 / N-8): the messages
+            # truth tree's two self-declarations.
+            #   * msg_chain_anchor_scope — the chain-head anchor lives in
+            #     the SAME directory tree as the JSONL it anchors
+            #     (".audit/" inside messages_export/).  That is a known,
+            #     REGISTERED exposure (风控 G-08): an attacker who can
+            #     rewrite the file can rewrite its anchor.  The status
+            #     page carries the registration, so it is a fact on the
+            #     page rather than a finding in a report.
+            #   * cold_read_latency_ms — N-8: there is NO warm-up for a
+            #     cold session, so the cold-read latency must be
+            #     SELF-REPORTED instead of hidden by a warm-up.  Measured
+            #     live by reading ONE externalised line through the real
+            #     ContentReader; None when this library holds no
+            #     externalised messages (or the probe could not run) —
+            #     "not applicable" is a first-class answer, not a zero.
+            'msg_chain_anchor_scope': 'same_dir',
+            'cold_read_latency_ms': self._probe_cold_read_latency_ms(),
             # P1 阶段二-B T3: the read-path freshness probe counters — stale
             # hits must be self-reported, not discovered by luck (风控: 自曝
             # 不能是撞运气自曝).
@@ -1634,6 +1652,49 @@ class MemoryManager:
                 round(embedded / chunks, 4) if chunks else 0.0
             ),
         }
+
+    def _probe_cold_read_latency_ms(self) -> Optional[float]:
+        """N-8 (施工图 W-4): time ONE cold read from the messages truth tree.
+
+        The probe reads a single externalised message line through the real
+        ``ContentReader`` — a FRESH reader, so the file-content cache does
+        not turn the measurement into a warm read.  It returns ``None``
+        (not 0) when there is nothing to measure: a library without a
+        ``messages`` table or without externalised rows has no cold read,
+        and "not applicable" must not masquerade as "instantly fast".
+
+        The probe NEVER raises: a status page that dies on its own probe
+        reports nothing at all.
+        """
+        try:
+            from agent.memory import msg_chain
+        except Exception:
+            return None
+        try:
+            workspace = self.config.get_workspace()
+            if not msg_chain.export_root(workspace).is_dir():
+                return None
+            row = self.storage.conn.execute(
+                "SELECT content_path, content_anchor FROM messages "
+                "WHERE content_state = 'external' AND content_path IS NOT NULL "
+                "ORDER BY id LIMIT 1").fetchone()
+        except Exception:
+            # No messages table (most libraries) or an unreadable one —
+            # both are "not applicable", never an error.
+            return None
+        if not row:
+            return None
+        rel, anchor = row[0], row[1]
+        if not rel or not anchor:
+            return None
+        try:
+            import time as _time
+            reader = msg_chain.ContentReader(workspace)
+            start = _time.perf_counter()
+            reader.text_of(rel, anchor)
+            return round((_time.perf_counter() - start) * 1000.0, 3)
+        except Exception:
+            return None
 
     def _reranker_status(self) -> str:
         """configured+reachable / configured+unreachable / local / off.

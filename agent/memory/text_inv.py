@@ -668,7 +668,8 @@ def check_shelf_lag(root: Path) -> Dict[str, Any]:
 # precisely WHICH of 03 号's INVs are landed here and which are pending.
 DEFERRED_INVS = {
     "INV-4": "element_index 稳定 id（element 体系未上线）",
-    "INV-5": "fact_sessions/messages_export 只追加（messages 外置为 §8 阶段三）",
+    # INV-5 已于 P1 阶段三 M 落地：messages 外置的「只追加」判据是
+    # MSG-INV-2/3（agent/memory/msg_inv.py），不再是暂缓项（施工图 W-3）。
     "INV-7": "element_tags（element 体系未上线）",
     "INV-8": "refs/element_links 无悬空（chunks 无 refs 列）",
 }

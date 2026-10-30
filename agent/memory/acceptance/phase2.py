@@ -920,6 +920,30 @@ _S3R_CRITERIA = [
     ("XF", "judge_xf_cross_end_fingerprint_is_uniform"),
 ]
 
+# ---------------------------------------------------------------------------
+# S3-M · the messages-domain criteria (施工图 阶段 5 工序 ①).
+#
+# They live in their own module (``phase2_s3m``) because the subject is
+# the MESSAGES domain — a second domain with its own truth tree (the
+# JSONL chain), its own state machine (``content_state``), its own
+# baseline and its own deferred set.  Folding them into S3-E would hide
+# the fact that they judge something DIFFERENT from the chunks side.
+#
+# **The verdict is spoken by the acceptance side (施工图 §3.1).**  The
+# implementation provides the primitives; the criterion reads what the
+# patrol published and says GREEN / RED / NOTRUN.  That is why this
+# module exists at all, and why it reads ``msg_inv``'s output instead
+# of re-deriving it: two mouths for one question is how J-3×M6e ended
+# up disagreeing 17/17.
+_S3M_CRITERIA = [
+    ("M-1", "judge_m1_msg_inv_group_is_complete"),
+    ("M-2", "judge_m2_un_externalised_is_notrun"),
+    ("M-3", "judge_m3_the_wiring_is_real"),
+    ("M-4", "judge_m4_inv5_is_no_longer_deferred"),
+    ("M-5", "judge_m5_status_self_reports"),
+    ("M-6", "judge_m6_ledger_orphans_are_pruned_at_the_write_boundary"),
+]
+
 # The criteria that GUARD the criteria (MU-12 / MU-14 / the replay).
 _GUARD_CRITERIA = [
     ("MU-12", "judge_mu12_three_states_are_real"),
@@ -1035,6 +1059,24 @@ def _load_s3r():
     return out
 
 
+def _load_s3m():
+    """The S3-M criterion functions, bound to the workspace."""
+    from agent.memory.acceptance import phase2_s3m
+
+    ws = Path(resolve_workspace(ARGS.workspace)[0])
+    out = []
+    for group, attr in _S3M_CRITERIA:
+        fn = getattr(phase2_s3m, attr)
+
+        def make(fn=fn, ws=ws):
+            def run(report):
+                return fn(report, ws)
+            return run
+
+        out.append((group, make()))
+    return out
+
+
 def main() -> int:
     workspace, how = resolve_workspace(ARGS.workspace)
 
@@ -1099,6 +1141,12 @@ def main() -> int:
 
     # The S3-R criteria (M6f · XF) — wired in this round.
     for group, fn in _load_s3r():
+        if ARGS.only and not group.startswith(ARGS.only):
+            continue
+        guarded(fn, report)
+
+    # The S3-M criteria (the messages domain: MSG-INV-1..7) — 施工图 阶段 5.
+    for group, fn in _load_s3m():
         if ARGS.only and not group.startswith(ARGS.only):
             continue
         guarded(fn, report)

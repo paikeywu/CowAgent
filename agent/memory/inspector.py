@@ -298,6 +298,9 @@ class Inspector:
         self._check_public_rows(report)
         # P1 阶段二-B T5: INV 第 9 检查组（03 号 §八的 chunks 落地版 6 条）。
         report["text_inv"] = self._check_text_externalization(report)
+        # P1-阶段三 M (施工图 W-1): the messages-domain criteria MSG-INV-1..7
+        # run ON LINE — a criterion that only runs in tests patrols nothing.
+        report["msg_inv"] = self._check_msg_externalization(report)
         # P1-阶段三 第四轮: the body-origin check group.
         report["body_origin"] = self._check_body_origin(report)
         # P1-阶段三 第六轮 (S3-I): the ERASURE check — has the certified
@@ -946,6 +949,77 @@ class Inspector:
                             **{k: val for k, val in v.items()
                                if k not in ("reason", "code", "path",
                                             "detail", "severity")})
+        return result
+
+    # -- check 9b: the messages-domain invariants (P1 阶段三 M, 施工图 W-1) ----
+
+    def _check_msg_externalization(self, report: Dict[str, Any]
+                                   ) -> Dict[str, Any]:
+        """MSG-INV-1..7, run by the patrol — not only by the tests.
+
+        施工图 W-1: 判据只在 tests 里跑等于线上无人巡检，而「检测器覆盖
+        不到的地方，就是泄漏活着的地方」。  The criteria themselves live in
+        ``agent.memory.msg_inv`` (the ONE implementation); this method only
+        CALLS them and puts the result into the report, the same wiring
+        pattern as :meth:`_check_text_externalization`.
+
+        Three contract points:
+
+        * **NOTRUN is a first-class answer.**  A library without
+          ``messages_export/`` (nothing externalised — every non-ROOT
+          library, per N-7) reports NOTRUN, never GREEN: "nothing to
+          judge" and "judged, all good" are different answers.
+        * **MSG-INV-6's heal is the ONE sanctioned write** (裁决 C-7:
+          the inspector owns the crash recovery of ``pending`` rows).
+          Everything else stays REPORT-ONLY.
+        * **A GREEN patrol appends a new baseline** (``write_baseline``):
+          the monotonicity criteria MSG-INV-2/3 compare against the
+          LAST BELIEVED state, and a baseline that only the migration
+          writes grows stale on the first post-migration append.  The
+          baseline is append-only, so the history of what was believed
+          is itself preserved.  A RED or NOTRUN patrol writes NOTHING —
+          a baseline recorded over a broken state would launder it.
+        """
+        from agent.memory import msg_inv
+
+        db = self._index_db_path()
+        if not db.is_file():
+            return {"scope": "messages 外置域 (MSG-INV-1..7)",
+                    "verdict": "NOTRUN", "fingerprint": "index-missing",
+                    "checks": {}, "violations": [], "violation_count": 0}
+        try:
+            # agent_id="": the patrol covers EVERY agent's sessions — the
+            # ROOT library holds nine agents' messages, and a patrol bound
+            # to one of them is blind to the other eight.
+            result = msg_inv.run_msg_invariants(
+                self.workspace_root, db, "")
+        except Exception as e:
+            self._violation(report, "gap-rule:msg-inv-error",
+                            self._relative_to_self(str(db)),
+                            f"the MSG-INV criteria could not run: "
+                            f"{type(e).__name__}: {e}",
+                            _SEV_HIGH, code="msg-inv-error")
+            return {"scope": "messages 外置域 (MSG-INV-1..7)",
+                    "verdict": "NOTRUN",
+                    "fingerprint": f"run-error:{type(e).__name__}",
+                    "checks": {}, "violations": [], "violation_count": 0}
+        for v in result.get("violations", []):
+            self._violation(report, v.get("reason", "msg-inv"),
+                            v.get("path", ""), v.get("detail", ""),
+                            v.get("severity", _SEV_HIGH),
+                            code=v.get("code"),
+                            **{k: val for k, val in v.items()
+                               if k not in ("reason", "code", "path",
+                                            "detail", "severity")})
+        if result.get("verdict") == msg_inv.GREEN:
+            try:
+                baseline = msg_inv.write_baseline(self.workspace_root)
+                result["baseline"] = baseline
+            except Exception as e:
+                # A baseline that cannot be written does not break the
+                # patrol — but it is SAID, because the next patrol's
+                # MSG-INV-2/3 will compare against a stale one.
+                result["baseline_error"] = f"{type(e).__name__}: {e}"
         return result
 
     # -- check 6: the release projection's health (P0-13 L-3) -----------------
