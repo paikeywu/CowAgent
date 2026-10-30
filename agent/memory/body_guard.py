@@ -136,7 +136,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 #: The chunk-guard trigger names.  They are NOT one of the FTS triggers
 #: the old build drops, so a legacy ``sync()`` cannot remove them by
@@ -154,6 +154,23 @@ GUARD_TRIGGER_UPDATE = "chunks_body_keep_bu"
 #: The files-side guard trigger names.
 GUARD_TRIGGER_FILES_UPDATE = "files_body_keep_bu"
 GUARD_TRIGGER_FILES_INSERT = "files_body_keep_bi"
+#: The files-side SNAPSHOT trigger — the one the sixth round MISSED.
+#:
+#: ``INSERT OR REPLACE`` is a DELETE followed by an INSERT, so a
+#: BEFORE INSERT trigger that looks at the stored row finds NOTHING
+#: (the row is already gone).  Measured (S3-K): the legacy build's
+#: ``INSERT OR REPLACE INTO files (...)`` erased the statistics even
+#: with the guard installed, because the stored row was gone by the
+#: time the INSERT trigger ran.  The chunks side has had its BEFORE
+#: DELETE snapshot since the sixth round; the files side had not.
+GUARD_TRIGGER_FILES_DELETE = "files_body_keep_bd"
+#: The files-side RESTORE trigger (AFTER INSERT), fed by the snapshot.
+GUARD_TRIGGER_FILES_RESTORE = "files_body_keep_bi_ai"
+
+#: The files-side snapshot table.  It is separate from the chunks-side
+#: keep table because the two have different keys (the files table's
+#: key is ``path``, not ``id``).
+GUARD_TABLE_FILES = "files_keep"
 
 #: The keep table and the columns it carries.
 GUARD_TABLE = "body_keep"
@@ -576,8 +593,52 @@ END""".format(
             for c in FILES_PROTECTED_COLUMNS),
         key=FILES_KEY)
 
+    # --- the files DELETE shape (the one that was NOT covered) --------
+    # ``INSERT OR REPLACE`` is a DELETE followed by an INSERT, so by
+    # the time the BEFORE INSERT trigger runs the stored row is GONE
+    # and there is nothing to restore from.  Measured (S3-K): the
+    # legacy build's ``INSERT OR REPLACE INTO files (...)`` erased the
+    # statistics even with the guard installed — and the chunks side
+    # had had its BEFORE DELETE snapshot since the sixth round, while
+    # the files side had not.  The two sides must have the same
+    # coverage, or the guard protects one axis and not the other.
+    #
+    # The snapshot is taken BEFORE the delete, so it holds the
+    # statistics the row HAD; the AFTER INSERT trigger then restores
+    # them.  This mirrors the chunks side exactly.
+    files_delete_trigger = """
+CREATE TRIGGER {name} BEFORE DELETE ON files
+WHEN OLD.chunk_count IS NOT NULL AND OLD.chunker_version IS NOT NULL
+BEGIN
+    INSERT OR REPLACE INTO {tbl} ({key}, chunk_count, chunker_version)
+    VALUES (OLD.{key}, OLD.chunk_count, OLD.chunker_version);
+END""".format(name=GUARD_TRIGGER_FILES_DELETE, tbl=GUARD_TABLE_FILES,
+              key=FILES_KEY)
+
+    # The restore side: AFTER INSERT, from the snapshot.  It restores
+    # ONLY the statistics, and only when the snapshot holds a MEASURED
+    # pair (so a file that really produced no chunks keeps its NULL —
+    # Rule D: "not measured" is not "zero").
+    files_restore_trigger = """
+CREATE TRIGGER {name} AFTER INSERT ON files
+WHEN NEW.chunk_count IS NULL AND NEW.chunker_version IS NULL
+ AND EXISTS (SELECT 1 FROM {tbl} k WHERE k.{key} = NEW.{key}
+             AND k.chunk_count IS NOT NULL AND k.chunker_version IS NOT NULL)
+BEGIN
+    UPDATE files SET
+        {restores}
+    WHERE {key} = NEW.{key};
+END""".format(
+        name=GUARD_TRIGGER_FILES_RESTORE,
+        tbl=GUARD_TABLE_FILES, key=FILES_KEY,
+        restores=", ".join(
+            "{c} = (SELECT k.{c} FROM {tbl} k WHERE k.{key} = NEW.{key})"
+            .format(c=c, tbl=GUARD_TABLE_FILES, key=FILES_KEY)
+            for c in FILES_PROTECTED_COLUMNS))
+
     return [insert_trigger, update_trigger, delete_trigger, restore_trigger,
-            state_restore_trigger, files_update_trigger, files_insert_trigger]
+            state_restore_trigger, files_update_trigger, files_insert_trigger,
+            files_delete_trigger, files_restore_trigger]
 
 
 def table_ddl() -> str:
@@ -590,12 +651,138 @@ CREATE TABLE IF NOT EXISTS {tbl} (
     text_state TEXT, body_origin TEXT)""".format(tbl=GUARD_TABLE)
 
 
+# ---------------------------------------------------------------------------
+# the certification ledger (P1-阶段三 S3-K)
+# ---------------------------------------------------------------------------
+
+#: The ledger of certifications.  **Not** the keep table: the keep table
+#: records what a row looked like BEFORE a write touched it (and only
+#: for the rows a write actually touched), while the ledger records that
+#: somebody CHECKED a row against the truth layer and FOUND IT EQUAL.
+CERT_TABLE = "cert_ledger"
+
+
+def cert_table_ddl() -> str:
+    """The certification ledger.
+
+    **Why a ledger and not the keep table.**  The keep table is written
+    by the guard's triggers, so it holds a row only when a write
+    threatened it — a newly written row is NOT in it (measured on the
+    live ROOT library: 7 rows written after the last inspection were
+    absent from ``body_keep``).  So the keep table cannot answer "was
+    this row ever certified?" — and the question M6a asks is exactly
+    that.
+
+    The ledger answers it by construction: a row is written into it
+    **when it is certified**, by the certifier, with the values that
+    were verified and the time of the certification.  A row that is
+    absent was never certified; a row that is present but disagrees with
+    the current row was downgraded after it was certified.
+
+    It is not part of the FTS machinery, so a legacy FTS rebuild cannot
+    take it away.
+    """
+    return """
+CREATE TABLE IF NOT EXISTS {tbl} (
+    id TEXT PRIMARY KEY,
+    text_state TEXT,
+    body_origin TEXT,
+    body_path TEXT,
+    body_hash TEXT,
+    certified_at INTEGER,
+    certified_by TEXT)""".format(tbl=CERT_TABLE)
+
+
+def record_certification(conn: sqlite3.Connection, row_id: str,
+                         text_state: str, body_origin: str,
+                         body_path: str = "", body_hash: str = "",
+                         certified_by: str = "certify",
+                         certified_at: Optional[int] = None) -> bool:
+    """Write ONE certification into the ledger.
+
+    The row is REPLACED, not appended: the ledger holds the LATEST
+    certification of a row, and a second certification of the same row
+    is a new fact about the same row.  (A history would be a different
+    table with a different name — the criterion only ever asks "what
+    was this row certified as, and does the row still agree?".)
+    """
+    import time as _time
+
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO {tbl} (id, text_state, body_origin, "
+            "body_path, body_hash, certified_at, certified_by) "
+            "VALUES (?,?,?,?,?,?,?)".format(tbl=CERT_TABLE),
+            (row_id, text_state, body_origin, body_path, body_hash,
+             int(certified_at if certified_at is not None else _time.time()),
+             certified_by))
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def certification_records(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """The ledger's contents, as a report.
+
+    The counts are the ones the criteria ask for:
+    ``certified`` (how many rows have a certification record), and
+    ``stale`` (how many certified rows no longer hold the state they
+    were certified in — a DOWNGRADE, proven by the ledger).
+    """
+    out: Dict[str, Any] = {
+        "table": CERT_TABLE,
+        "present": False,
+        "certified": 0,
+        "stale": 0,
+        "stale_rows": [],
+    }
+    try:
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+    except sqlite3.Error:
+        return out
+    if CERT_TABLE not in tables:
+        return out
+    out["present"] = True
+    try:
+        out["certified"] = conn.execute(
+            "SELECT COUNT(*) FROM {t}".format(t=CERT_TABLE)).fetchone()[0]
+        rows = conn.execute(
+            "SELECT l.id, l.text_state, c.text_state, c.path "
+            "FROM {t} l JOIN chunks c ON c.id = l.id "
+            "WHERE c.text_state IS NOT l.text_state".format(t=CERT_TABLE)
+        ).fetchall()
+        out["stale"] = len(rows)
+        out["stale_rows"] = [
+            {"id": r[0], "certified_state": r[1], "current_state": r[2],
+             "path": r[3]} for r in rows[:50]]
+    except sqlite3.Error as e:
+        out["error"] = str(e)
+    return out
+
+
 def guard_trigger_names() -> Tuple[str, ...]:
     """Every trigger the guard owns — the one list the installer drops
     and the status check compares."""
     return (GUARD_TRIGGER, GUARD_TRIGGER_UPDATE, GUARD_TRIGGER_DELETE,
             GUARD_TRIGGER_RESTORE, GUARD_TRIGGER_STATE,
-            GUARD_TRIGGER_FILES_UPDATE, GUARD_TRIGGER_FILES_INSERT)
+            GUARD_TRIGGER_FILES_UPDATE, GUARD_TRIGGER_FILES_INSERT,
+            GUARD_TRIGGER_FILES_DELETE, GUARD_TRIGGER_FILES_RESTORE)
+
+
+def files_table_ddl() -> str:
+    """The files-side snapshot table.
+
+    Separate from the chunks-side keep table because the two have
+    different keys: the chunks table is keyed by ``id``, the files
+    table by ``path``.  It is not part of the FTS machinery, so a
+    legacy FTS rebuild cannot take it away.
+    """
+    return """
+CREATE TABLE IF NOT EXISTS {tbl} (
+    {key} TEXT PRIMARY KEY,
+    chunk_count INTEGER,
+    chunker_version INTEGER)""".format(tbl=GUARD_TABLE_FILES, key=FILES_KEY)
 
 
 def stored_trigger_sql(conn: sqlite3.Connection) -> str:
@@ -728,6 +915,10 @@ def ensure_guard(conn: sqlite3.Connection) -> Dict[str, Any]:
         # the pointers.
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(table_ddl())
+        if files_ok:
+            # The files-side snapshot table (the files side's own keep
+            # table — its key is ``path``, not ``id``).
+            conn.execute(files_table_ddl())
         for name in guard_trigger_names():
             conn.execute("DROP TRIGGER IF EXISTS %s" % name)
         for statement in trigger_sqls():
@@ -819,6 +1010,30 @@ def erasure_census(conn: sqlite3.Connection) -> Dict[str, Any]:
     erased afterwards has the same shape but a ``last_write`` NEWER
     than the migration's own timestamp — and that is the fact that
     separates the two.
+
+    **P1-阶段三 S3-K: "not certified YET" is not "erased".**
+
+    The counts above cannot tell those two apart: a row that was
+    written five minutes ago and has not been through the certification
+    yet looks EXACTLY like a row whose certified state was wiped.  So
+    the census now carries the WITNESSES, and the witnesses are what
+    the verdict is built from:
+
+    * ``downgrade_proven`` — the guard's snapshot table says this row
+      WAS ``'mirror'`` and the row says it is not.  That is an erasure,
+      proven, not inferred.
+    * ``pointer_lost`` — the snapshot says the row HAD a pointer and the
+      row has none.  Also proven.
+    * ``not_certified`` — the row has a pointer and a decided origin
+      but nobody has certified it yet.  This is the inspector's own
+      PENDING WORK, not damage.
+    * ``never_decided`` — ``body_origin='unresolved'``: nobody ever
+      decided this row.  A gap, not damage.
+
+    The two proven counters are what "was it erased" is decided by.  A
+    criterion that called "not certified yet" "erased" would be red on
+    every newly written page — and a permanently red check is a check
+    nobody reads.
     """
     out: Dict[str, Any] = {}
     try:
@@ -843,6 +1058,62 @@ def erasure_census(conn: sqlite3.Connection) -> Dict[str, Any]:
         out["projection"] = conn.execute(
             "SELECT COUNT(*) FROM chunks WHERE text_state='projection'"
         ).fetchone()[0]
+        # --- the discrimination (S3-K) -----------------------------------
+        # "has a pointer and a decided origin, but nobody has certified
+        # it yet" — the inspector's pending work, NOT damage.
+        out["not_certified"] = conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE text_state<>'mirror' "
+            "AND body_origin='file' AND body_path IS NOT NULL"
+        ).fetchone()[0]
+        out["never_decided"] = out["unresolved"]
+        # --- the witnesses ------------------------------------------------
+        # The guard's snapshot table records what the row looked like
+        # BEFORE the last write.  A row that WAS certified and is not
+        # any more is an erasure that is PROVEN, not inferred.
+        out["downgrade_proven"] = 0
+        out["pointer_lost"] = 0
+        out["keep_rows"] = 0
+        try:
+            out["keep_rows"] = conn.execute(
+                "SELECT COUNT(*) FROM body_keep").fetchone()[0]
+            if out["keep_rows"]:
+                out["downgrade_proven"] = conn.execute(
+                    "SELECT COUNT(*) FROM body_keep k "
+                    "JOIN chunks c ON c.id = k.id "
+                    "WHERE k.text_state='mirror' AND c.text_state<>'mirror'"
+                ).fetchone()[0]
+                out["pointer_lost"] = conn.execute(
+                    "SELECT COUNT(*) FROM body_keep k "
+                    "JOIN chunks c ON c.id = k.id "
+                    "WHERE k.body_path IS NOT NULL AND c.body_path IS NULL"
+                ).fetchone()[0]
+        except sqlite3.Error:
+            pass
+        out["erased"] = int(out["downgrade_proven"]) + int(out["pointer_lost"])
+        # --- the certification ledger (P1-阶段三 S3-K) ------------------
+        # The keep table holds the rows a WRITE threatened; the ledger
+        # holds the rows somebody CHECKED.  The two witnesses answer
+        # different questions, and the census reports both:
+        #
+        #   * the ledger's ``stale`` — a certified row that no longer
+        #     holds the state it was certified in: a PROVEN downgrade,
+        #     even for a row the keep table never saw;
+        #   * the ledger's ``certified`` — how many rows have a
+        #     certification record at all.
+        #
+        # A row that is in NEITHER (never certified, never threatened) is
+        # "pending work", and it is counted, not judged.
+        try:
+            cert = certification_records(conn)
+            out["cert_ledger_present"] = bool(cert.get("present"))
+            out["certified_records"] = int(cert.get("certified", 0))
+            out["cert_stale"] = int(cert.get("stale", 0))
+            out["cert_stale_rows"] = cert.get("stale_rows", [])
+        except sqlite3.Error:
+            out["cert_ledger_present"] = False
+            out["certified_records"] = 0
+            out["cert_stale"] = 0
+            out["cert_stale_rows"] = []
         last = conn.execute(
             "SELECT MAX(updated_at) FROM chunks").fetchone()[0]
         out["last_write"] = last
@@ -858,5 +1129,14 @@ def erasure_census(conn: sqlite3.Connection) -> Dict[str, Any]:
     except sqlite3.Error as e:
         return {"error": str(e)}
     out["intact"] = (out.get("undecided", 1) == 0
-                     and out.get("no_pointer", 1) == 0)
+                      and out.get("no_pointer", 1) == 0)
+    # ``erased`` is the load-bearing verdict (S3-K): it is built from
+    # the WITNESSES, not from "some rows are not certified yet".
+    #
+    # The certification ledger is a THIRD witness: a certified row that
+    # no longer holds the state it was certified in is a PROVEN
+    # downgrade, whether or not a write ever threatened it (the keep
+    # table only holds the rows a write threatened).
+    out["erased"] = int(out.get("erased", 0)) + int(out.get("cert_stale", 0))
+    out["erased_verdict"] = (out.get("erased", 0) == 0)
     return out

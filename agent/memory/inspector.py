@@ -170,6 +170,11 @@ def run_inspection(workspace_root: Path | str, *,
     ① ``trigger='shelf-rebuild'`` — agent/memory/shelf.py calls this before
        every full rebuild (the report feeds the gaps view).
     ② ``trigger='startup'``      — called once by the runtime at startup.
+       **P1-阶段三 S3-K: this one is now actually wired** — it used to be
+       DOCUMENTED and called from nowhere, which is a promise the code
+       did not keep.  ``bridge/agent_initializer.py`` calls it (through
+       the certification) on the same background thread as the memory
+       sync, right after the index has been refreshed.
     ③ ``trigger='manual'``       — ``python -m agent.memory.inspector
        --workspace <dir>`` (or this function) at any time.
 
@@ -298,6 +303,21 @@ class Inspector:
         # P1-阶段三 第六轮 (S3-I): the ERASURE check — has the certified
         # state been erased since the migration put it there?
         report["erasure"] = self._check_erasure(report)
+        # P1-阶段三 第七轮 (S3-K): the two M6 criteria, in the form a
+        # criterion file calls.  They are separate from the erasure
+        # check on purpose:
+        #
+        #   * M6a (coverage) asks "is every row with a file behind it
+        #     certified?" — it catches "a new page is written and nobody
+        #     certifies it", which is a GAP;
+        #   * M6b (downgrade) asks "has a certified row been demoted?"
+        #     — it catches damage, and it is the only one that is a
+        #     HIGH violation.
+        #
+        # The two do not overlap: a row absent from the ledger is M6a's
+        # business; a row in the ledger that no longer holds its
+        # certified state is M6b's.
+        report["m6"] = self._check_m6(report)
         # P1-阶段三 第四轮: the inspector is the DESIGNATED SETTER of the
         # 'mirror' state (设计 §3.1).  It runs AFTER the invariants, because
         # the promotion is only legal for the rows the invariants just
@@ -1076,6 +1096,90 @@ class Inspector:
 
     # -- check 8: index schema drift (P0-17 B-3) ----------------------------
 
+    def _check_m6(self, report: Dict[str, Any]) -> Dict[str, Any]:
+        """P1-阶段三 第七轮 (S3-K) — the two M6 criteria, for THIS
+        workspace's own index.
+
+        The rule lives in ``agent.memory.certify``; this method only
+        CALLS it and puts the result into the report, so the inspector
+        and the criterion file cannot disagree about what "certified"
+        means.
+
+        REPORT-ONLY, like every other check here.
+        """
+        from agent.memory.certify import (
+            VERDICT_FAIL,
+            VERDICT_NOTRUN,
+            judge_m6a_coverage,
+            judge_m6b_downgrade,
+        )
+
+        db = self._index_db_path()
+        out: Dict[str, Any] = {
+            "scope": "m6",
+            "verdict": VERDICT_NOTRUN,
+            "detail": "",
+            "m6a": {},
+            "m6b": {},
+            "violations": [],
+            "violation_count": 0,
+        }
+        if not db.is_file():
+            out["detail"] = "the index is not there"
+            return out
+        try:
+            conn = sqlite3.connect(str(db))
+        except sqlite3.Error as e:
+            out["detail"] = "the index cannot be opened: %s" % e
+            return out
+        try:
+            a = judge_m6a_coverage(conn)
+            b = judge_m6b_downgrade(conn)
+        finally:
+            conn.close()
+        out["m6a"] = a
+        out["m6b"] = b
+
+        violations = []
+        if a.get("verdict") == VERDICT_FAIL:
+            violations.append({
+                "severity": "MID",
+                "reason": "m6a: the certification coverage",
+                "path": str(db),
+                "detail": ("%d row(s) with a file behind them have never "
+                           "been certified — they are pending work, not "
+                           "damage: %s"
+                           % (a.get("not_certified", 0),
+                              a.get("detail", ""))),
+            })
+        if b.get("verdict") == VERDICT_FAIL:
+            rows = b.get("downgraded", [])
+            violations.append({
+                "severity": "HIGH",
+                "reason": "m6b: a certified row was downgraded",
+                "path": str(db),
+                "detail": ("%d certified row(s) no longer hold the state "
+                           "they were certified in: %s"
+                           % (b.get("downgrades", 0),
+                              "; ".join(
+                                  "%s certified=%s now=%s"
+                                  % (r["id"][:10], r["certified_state"],
+                                     r["current_state"])
+                                  for r in rows[:5]))),
+            })
+        out["violations"] = violations
+        out["violation_count"] = len(violations)
+        if VERDICT_FAIL in (a.get("verdict"), b.get("verdict")):
+            out["verdict"] = VERDICT_FAIL
+        else:
+            out["verdict"] = "PASS" if VERDICT_NOTRUN not in (
+                a.get("verdict"), b.get("verdict")) else VERDICT_NOTRUN
+        out["fingerprint"] = ("m6a: %s (%d not certified) | m6b: %s "
+                              "(%d downgrade(s))"
+                              % (a.get("verdict"), a.get("not_certified", 0),
+                                 b.get("verdict"), b.get("downgrades", 0)))
+        return out
+
     def _check_erasure(self, report: Dict[str, Any]) -> Dict[str, Any]:
         """P1-阶段三 第六轮 (S3-I) — the ERASURE check.
 
@@ -1133,23 +1237,46 @@ class Inspector:
         violations = []
         # The certified state must be there.  A row that fell back to
         # 'projection'/'unresolved' is the ERASED shape.
-        if census.get("undecided"):
+        #
+        # P1-阶段三 S3-K: the verdict is built from the WITNESSES, not
+        # from "some rows are not certified".  A row written five
+        # minutes ago and not certified yet is the inspector's own
+        # pending work, NOT damage — and calling it damage would make
+        # this check red on every newly written page.  A permanently
+        # red check is a check nobody reads.
+        #
+        # So:
+        #   * ``downgrade_proven`` / ``pointer_lost``  → a PROVEN
+        #     erasure (the snapshot says it WAS certified / had a
+        #     pointer, and the row says it is not any more);
+        #   * ``not_certified`` → pending certification (reported, not
+        #     a violation);
+        #   * ``never_decided`` → a gap (nobody decided this row yet).
+        if census.get("erased"):
             violations.append({
                 "severity": "HIGH",
                 "reason": "erasure: the certified state was lost",
                 "path": str(db),
-                "detail": ("%s of %s rows are undecided again "
-                           "('projection'/'unresolved') — the certified "
-                           "state was erased after the migration"
-                           % (census.get("undecided"), census.get("rows"))),
+                "detail": ("%d row(s) were PROVEN to have been certified (or "
+                           "to have had a pointer) and are not any more — "
+                           "the guard's snapshot says so (%d downgrade(s), "
+                           "%d pointer(s) lost)"
+                           % (census.get("erased"),
+                              census.get("downgrade_proven", 0),
+                              census.get("pointer_lost", 0))),
             })
-        if census.get("no_pointer"):
+        if census.get("no_pointer") and not census.get("pointer_lost"):
+            # No pointer, but no proof that one was there: the rows were
+            # never decided.  That is a GAP (the migration / the
+            # certification has not reached them), not an erasure.
             violations.append({
-                "severity": "HIGH",
-                "reason": "erasure: the pointer was lost",
+                "severity": "MID",
+                "reason": "erasure: the pointer was never filled",
                 "path": str(db),
-                "detail": ("%s of %s rows have no body_path — the pointer "
-                           "was erased after the migration"
+                "detail": ("%s of %s rows have no body_path and no evidence "
+                           "that one was ever there — the row's origin was "
+                           "never decided ('unresolved'), so this is a GAP "
+                           "to be certified, not a proven erasure"
                            % (census.get("no_pointer"), census.get("rows"))),
             })
         if census.get("files_without_stats"):
@@ -1166,10 +1293,14 @@ class Inspector:
             "scope": "erasure",
             "verdict": verdict,
             "fingerprint": ("rows=%s certified=%s undecided=%s no_pointer=%s "
+                            "not_certified=%s never_decided=%s erased=%s "
                             "files_without_stats=%s last_write=%s"
                             % (census.get("rows"), census.get("certified"),
                                census.get("undecided"),
                                census.get("no_pointer"),
+                               census.get("not_certified"),
+                               census.get("never_decided"),
+                               census.get("erased"),
                                census.get("files_without_stats"),
                                census.get("last_write"))),
             "census": census,
@@ -1336,58 +1467,37 @@ class Inspector:
 
         The write is counted and reported: "how many rows were promoted"
         is a number the delivery document carries.
+
+        **P1-阶段三 S3-K: the setter now delegates to the ONE
+        certification rule.**  This method used to spell the rule out
+        itself, and it had two gaps that the round found:
+
+        * it only looked at rows whose ``body_origin`` was already
+          ``'file'`` — so a row written by a writer that fills no body
+          columns (``body_origin='unresolved'``, no pointer at all) could
+          NEVER be certified, no matter how many times this ran;
+        * it only ever looked at **this** workspace's index, so the
+          other fifteen libraries of the family were never certified.
+
+        Both are fixed in ``agent.memory.certify`` — the pointer is
+        DERIVED first (by the migration's own D1 rule), and the whole
+        family is reachable.  This method now calls that one
+        implementation, so the inspector and the CLI cannot disagree
+        about what "certified" means.
         """
-        from agent.memory.body_pointer import ORIGIN_FILE
+        from agent.memory.certify import certify_library
 
         db = self._index_db_path()
         out: Dict[str, Any] = {"promoted": 0, "checked": 0, "skipped": 0}
         if not db.is_file():
             return out
-        try:
-            conn = sqlite3.connect(str(db))
-        except sqlite3.Error:
-            return out
-        try:
-            cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)")}
-            if "body_origin" not in cols:
-                return out
-            from agent.memory.body_pointer import rebuild_from_anchor
-            from agent.memory.body_pointer import resolve_truth_file
-
-            rows = conn.execute(
-                "SELECT id, body_path, body_anchor, text, text_state "
-                "FROM chunks WHERE body_origin=? AND text_state<>'mirror'",
-                (ORIGIN_FILE,)).fetchall()
-            promoted = []
-            for cid, bpath, banchor, text, _state in rows:
-                out["checked"] += 1
-                if not bpath or not banchor:
-                    out["skipped"] += 1
-                    continue
-                truth = resolve_truth_file(self.workspace_root, bpath)
-                if truth is None:
-                    out["skipped"] += 1
-                    continue
-                frag = rebuild_from_anchor(truth, banchor)
-                if frag is None or frag != (text or ""):
-                    # Not byte-equal -> NOT verified -> NOT promoted.
-                    out["skipped"] += 1
-                    continue
-                promoted.append(cid)
-            if promoted:
-                conn.executemany(
-                    "UPDATE chunks SET text_state='mirror' WHERE id=? "
-                    "AND body_origin=? AND text_state<>'mirror'",
-                    [(cid, ORIGIN_FILE) for cid in promoted])
-                conn.commit()
-            out["promoted"] = len(promoted)
-        except sqlite3.Error:
-            try:
-                conn.rollback()
-            except sqlite3.Error:
-                pass
-        finally:
-            conn.close()
+        report = certify_library(self.workspace_root, db,
+                                 name=self.workspace_root.name)
+        out["promoted"] = int(report.get("promoted", 0))
+        out["checked"] = int(report.get("checked", 0))
+        out["skipped"] = int(report.get("refused", 0))
+        out["derived"] = int(report.get("derived", 0))
+        out["refusals"] = report.get("refusals", [])
         return out
 
     def _check_schema_drift(self, report: Dict[str, Any]) -> None:
@@ -1627,7 +1737,38 @@ def main(argv: Optional[List[str]] = None) -> int:
                     choices=["shelf-rebuild", "startup", "manual"])
     ap.add_argument("--json", action="store_true",
                     help="print the full report as JSON")
+    ap.add_argument("--certify-mirror", action="store_true",
+                    help="certify the 'mirror' state of EVERY live library "
+                         "of the workspace (P1-阶段三 S3-K) and print the "
+                         "counts, then exit.  This is the repeatable form "
+                         "of the promotion the inspector does as a side "
+                         "effect: it is idempotent, it refuses every row "
+                         "that does not pass the byte test, and it lists "
+                         "the refusals.")
     args = ap.parse_args(argv)
+
+    if args.certify_mirror:
+        from agent.memory.certify import certify_family
+
+        report = certify_family(args.workspace)
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            print("certify: workspace=%s libraries=%d"
+                  % (report["workspace"], report["library_count"]))
+            for lib in report["libraries"]:
+                print("   %-22s promoted=%-4d derived=%-4d refused=%-4d "
+                      "remaining=%d"
+                      % (lib["library"], lib["promoted"], lib["derived"],
+                         lib["refused"], lib.get("remaining", 0)))
+                for r in lib["refusals"]:
+                    print("      REFUSED %s  %s  %s"
+                          % (r["id"][:10], r["reason"],
+                             r.get("detail", "")))
+            print("TOTAL: promoted=%d derived=%d refused=%d remaining=%d"
+                  % (report["promoted"], report["derived"],
+                     report["refused"], report["remaining"]))
+        return 1 if report["refused"] else 0
 
     report = Inspector(args.workspace).inspect(trigger=args.trigger)
     if args.json:

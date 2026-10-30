@@ -307,6 +307,65 @@ class MemoryManager:
         except Exception:
             return 0
 
+    def _certify_after_write(self) -> Dict[str, Any]:
+        """Certify the rows this workspace just wrote (P1-阶段三 S3-K).
+
+        **The question this answers:** "a knowledge page was written —
+        when does its projection row become ``'mirror'``?"
+
+        **The answer, before this method existed: never.**  The
+        ``'mirror'`` state has a designated setter (the inspector), but
+        the inspector only ran when somebody ran it, and only ever
+        looked at ONE workspace.  So a row written after the last
+        inspection stayed ``'projection'`` forever, and the other
+        fifteen libraries of the family were never certified at all.
+
+        **The mechanism now:** the write path certifies what it wrote,
+        immediately, in-process.  There is no new daemon, no new
+        scheduler entry and no new trigger point — the certification
+        rides on the write that made the row uncertifiable.
+
+        **Why after the write and not inside it.**  The certification
+        reads the TRUTH LAYER and compares the fragment with the stored
+        text.  The truth file must exist and be complete before the
+        comparison means anything, and the file is written by the
+        caller (the knowledge skill writes the page, then the index is
+        updated).  Certifying inside the write would race the file.
+
+        **What it does NOT do.**  It never certifies a row that does not
+        pass the byte test, and it never certifies a row whose text is
+        not a chunk of its file.  A refusal is counted and logged; the
+        row stays ``'projection'``, which is the honest state for "not
+        verified yet".
+
+        The certification is REPORT-ONLY for the caller: a failure
+        here must never break the write that succeeded.
+        """
+        try:
+            from agent.memory.certify import certify_library
+        except Exception:
+            return {"error": "certify module unavailable"}
+        try:
+            workspace = Path(self.config.get_workspace())
+            db = Path(self.storage.db_path) if hasattr(self.storage, "db_path") \
+                else None
+            if db is None:
+                return {"error": "the storage does not expose its path"}
+            report = certify_library(workspace, db, name=workspace.name)
+        except Exception as e:
+            from common.log import logger
+            logger.warning(
+                "[MemoryManager] The certification after the write did not "
+                "complete: %s: %s", type(e).__name__, e)
+            return {"error": "%s: %s" % (type(e).__name__, e)}
+        if report.get("promoted") or report.get("derived"):
+            from common.log import logger
+            logger.info(
+                "[MemoryManager] certified %d row(s) (%d pointer(s) "
+                "derived) in %s", report.get("promoted", 0),
+                report.get("derived", 0), report.get("db"))
+        return report
+
     def _report_guard_discards(self, before: int) -> Dict[str, Any]:
         """Say out loud what the guard dropped during this sync (P0-22).
 
@@ -909,7 +968,16 @@ class MemoryManager:
             chunk_count=len(memory_chunks),
             chunker_version=TextChunker.CHUNKER_VERSION,
         )
-    
+
+        # P1-阶段三 S3-K: certify what this write produced.
+        #
+        # ``add_memory`` writes a BLOB — no truth file, so its own row
+        # is honestly ``'blob'`` and stays ``'projection'`` (a blob has
+        # nothing to mirror).  But the certification still runs, because
+        # this call may ALSO have written rows that DO have a truth
+        # file, and those must not be left uncertified.
+        self._certify_after_write()
+
     async def sync(self, force: bool = False):
         """
         Synchronize memory from files.
@@ -1394,6 +1462,12 @@ class MemoryManager:
         # without this the two sides would hold two different beliefs
         # about the same row and neither would know.
         self._report_guard_discards(discards_before)
+
+        # P1-阶段三 S3-K: certify the rows this sync just wrote.  Without
+        # this, a row written after the last inspection stays
+        # 'projection' forever — the 'mirror' state would be a claim
+        # about the past, not about the current index.
+        self._certify_after_write()
 
         self._dirty = False
 

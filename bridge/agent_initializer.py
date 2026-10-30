@@ -989,6 +989,40 @@ class AgentInitializer:
                 if workspace_key is not None:
                     with _memory_sync_lock:
                         _memory_sync_inflight.discard(workspace_key)
+            # P1-阶段三 S3-K: the startup trigger of the inspector.
+            #
+            # The inspector documents THREE trigger points, and until now
+            # two of them were called (the shelf rebuild and the manual
+            # CLI) while ``trigger='startup'`` was documented and NEVER
+            # called from anywhere — a documented entry point that does
+            # not exist is a promise the code does not keep.
+            #
+            # It is wired here, at the one place where the runtime has
+            # just refreshed the index: the certification needs the truth
+            # layer to be current, and the sync has just made it so.
+            # It runs on the same background thread as the sync, so it
+            # costs the first message nothing.
+            #
+            # The certification is REPORT-ONLY here: a failure must not
+            # take the session down, and the report says what happened.
+            try:
+                from agent.memory.certify import certify_family
+
+                report = certify_family(workspace_key) if workspace_key else {}
+                promoted = int(report.get("promoted", 0) or 0)
+                derived = int(report.get("derived", 0) or 0)
+                refused = int(report.get("refused", 0) or 0)
+                if promoted or derived or refused:
+                    logger.info(
+                        "[AgentInitializer] the startup certification: "
+                        "promoted=%d derived=%d refused=%d "
+                        "(libraries=%s)",
+                        promoted, derived, refused,
+                        report.get("library_count"))
+            except Exception as e:
+                logger.warning(
+                    "[AgentInitializer] The startup certification did not "
+                    "complete: %s: %s", type(e).__name__, e)
 
         threading.Thread(
             target=_run, daemon=True, name="memory-sync"
