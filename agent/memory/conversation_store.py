@@ -3178,6 +3178,74 @@ class ConversationStore:
             except Exception as e:
                 logger.warning(f"[ConversationStore] Migration (messages.agent_id) failed: {e}")
 
+        # P1 阶段三 M · stage 2: lift the NOT NULL on ``messages.content``.
+        #
+        # ``ALTER TABLE`` cannot lift a NOT NULL — only a table rebuild
+        # can.  Stage 4 (the externalisation) writes ``content = NULL``
+        # for every externalised row, so a library whose ``content``
+        # still carries NOT NULL cannot be externalised AT ALL: the
+        # write fails with "NOT NULL constraint failed: messages.content".
+        #
+        # **This call site was MISSING** (measured: the method existed
+        # with no caller anywhere in the tree), which made stage 2 dead
+        # code.  The library that happened to migrate was the one whose
+        # ``sessions`` table was still keyed by ``session_id`` alone:
+        # ``_ensure_composite_key`` rebuilds ``messages`` as a side
+        # effect, and that rebuild's DDL declares ``content`` nullable.
+        # A library whose ``sessions`` primary key was ALREADY composite
+        # skipped that rebuild and kept NOT NULL forever — so exactly
+        # the libraries that were already migrated could not migrate
+        # again.
+        #
+        # **Placement — and why it is HERE and not elsewhere.**
+        #
+        # * AFTER the five columns: the rebuild copies the REAL pointer
+        #   values.  ``_msg_copy_exprs`` would fall back to the DEFAULTS
+        #   for a column that is not there yet, which is a silent
+        #   downgrade of a row that had already been externalised.
+        # * AFTER ``agent_id`` is added: the rebuild's copy names
+        #   ``agent_id`` explicitly, so a library that does not have the
+        #   column yet fails with "no such column: agent_id" — and
+        #   because a DDL failure inside the rebuild leaves a HALF-BUILT
+        #   ``messages_new`` behind (measured — see
+        #   :func:`_ensure_content_nullable`), that stray table then
+        #   breaks the NEXT rebuild with "table messages_new already
+        #   exists".  That is not hypothetical: it is what broke
+        #   ``test_multi_agent_merge_survives_shared_session_id`` when
+        #   the call site was first placed here.
+        # * BEFORE ``_INDEX_DDL``: the rebuild OWNS the index — it drops
+        #   and recreates ``idx_messages_session`` itself, because a
+        #   renamed table loses its indexes and an index that is
+        #   silently gone is an index nobody notices until the table is
+        #   slow.  Running ``_INDEX_DDL`` afterwards is a no-op
+        #   (``CREATE INDEX IF NOT EXISTS``), so the index is created
+        #   exactly once, by the code that knows it was dropped.
+        #
+        # The rebuild itself is ONE transaction — an explicit
+        # ``BEGIN IMMEDIATE``, NOT ``with conn:`` (裁决 G-05d forbids
+        # ``executescript`` here, and the explicit BEGIN is what makes
+        # the DDL roll back too: MEASURED — Python's sqlite3 opens an
+        # implicit transaction before DML only, so a ``CREATE TABLE``
+        # inside ``with conn:`` is committed the moment it runs, and a
+        # later failure leaves the half-built table behind).  It keeps
+        # every ``id`` (the AUTOINCREMENT key the TTS snapshot refers
+        # to) and re-creates the index explicitly.
+        try:
+            if self._ensure_content_nullable(conn):
+                logger.info(
+                    "[ConversationStore] Migrated: messages.content is now NULLABLE "
+                    "(P1 阶段三 M · stage 2)"
+                )
+        except Exception as e:
+            # Not fatal: a library whose ``content`` stays NOT NULL still
+            # serves conversations — it simply cannot be externalised, and
+            # the externalisation path says so.  Failing the whole open
+            # would take the conversation history down over a migration
+            # detail, which is a worse outcome than a library that keeps
+            # working with its content inline.
+            logger.error(
+                "[ConversationStore] Migration (content nullable) failed: %s" % e)
+
         # Now that agent_id is guaranteed present on both tables, (re)create the
         # agent-scoped indexes. Safe on every path: a fresh install created the
         # tables via _DDL a moment ago, an upgrade just added the column.
@@ -3336,7 +3404,35 @@ class ConversationStore:
             "[ConversationStore] Rebuilding messages with a nullable content "
             "column (P1 阶段三 M · messages 外置)"
         )
-        with conn:
+        # **The explicit ``BEGIN IMMEDIATE`` is load-bearing.**
+        #
+        # Python's sqlite3 legacy transaction control opens an implicit
+        # transaction before DML (INSERT/UPDATE/DELETE/REPLACE) — but NOT
+        # before DDL (CREATE/DROP/ALTER).  So inside ``with conn:`` a
+        # ``CREATE TABLE`` is committed the moment it runs, and a later
+        # failure rolls back only the DML: the half-built
+        # ``messages_new`` SURVIVES.
+        #
+        # MEASURED on this machine (Python 3.15 / SQLite 3.53.4):
+        #
+        #   with conn:            -> after the rollback, ``t_new`` is STILL
+        #                             there
+        #   explicit BEGIN IMMEDIATE -> after the rollback, ``t_new`` is gone
+        #
+        # And that leftover is not harmless: the NEXT rebuild then fails
+        # with "table messages_new already exists" — which is how a
+        # single failed migration turned into a broken merge.
+        # (That is exactly what broke
+        # ``test_multi_agent_merge_survives_shared_session_id`` when the
+        # call site was first placed before the ``agent_id`` column
+        # existed.)
+        #
+        # So: one EXPLICIT transaction, no ``executescript`` (裁决
+        # G-05d), and a rollback that undoes the DDL too.
+        if conn.in_transaction:
+            conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
             conn.execute("DROP INDEX IF EXISTS idx_messages_session")
             conn.execute(
                 """
@@ -3377,6 +3473,15 @@ class ConversationStore:
                 "CREATE INDEX IF NOT EXISTS idx_messages_session "
                 "ON messages (agent_id, session_id, seq)"
             )
+            conn.commit()
+        except Exception:
+            # The rollback undoes the DDL as well — no half-built
+            # ``messages_new`` is left behind.
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
         return True
 
     def _connect(self) -> sqlite3.Connection:

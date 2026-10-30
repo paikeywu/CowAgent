@@ -94,105 +94,33 @@ def _reorder_fts_triggers_behind_guard(conn: sqlite3.Connection) -> bool:
 
     True when it acted.
 
-    **The rule, and why it is load-bearing.**  SQLite runs a table's
-    triggers in ``sqlite_master`` rowid order.  The body guard's AFTER
-    INSERT restore trigger updates the protected columns of the row the
-    writer just inserted; that update fires the FTS AFTER UPDATE trigger,
-    whose ``delete`` command reads the content table.  When the guard
-    runs AFTER the FTS triggers, the FTS index already holds the row
-    while the content table already holds the REPLACED one — the tokens
-    disagree, and SQLite reports ``database disk image is malformed``.
+    **This is a THIN ALIAS, not a second implementation.**  The logic
+    lives in :func:`agent.memory.body_guard.reorder_fts_triggers_behind_guard`
+    — the module that OWNS the triggers — because ``ensure_guard`` needs
+    it too, and two copies of an ordering rule is one copy that will
+    drift.  (P1 阶段三 N: the copy that used to live HERE was the only
+    one that ran during a sweep, so a repair inside ``ensure_guard``
+    left the order broken until somebody swept — and writing the
+    library in between failed with "database disk image is malformed".)
 
-    **How the order is fixed — and the mistake this module first made.**
-    A re-created trigger lands at the END of ``sqlite_master``.  So the
-    obvious move ("re-create the FTS triggers so they end up behind the
-    guard") does NOT work when the guard itself was just re-created:
-    the guard is ALREADY at the end, so re-creating the FTS triggers
-    moves THEM to the end too — and the guard stays in front of the
-    OLD FTS rows... no: it moves them behind the guard, but the guard
-    is behind the FTS rows it was supposed to precede.  Measured on
-    this machine: after the first sweep, 14 libraries had the FTS
-    triggers at rowid 0..5 and the body guard at 8..16 — the guard was
-    BEHIND, which is the failure this function exists to prevent.
+    The rule itself, and the measurement that settles its direction:
+    SQLite runs a table's triggers in ``sqlite_master`` rowid order; a
+    re-created trigger lands at the END of it.  The guard's AFTER INSERT
+    restore trigger updates the row the writer just inserted, and that
+    update fires the FTS AFTER UPDATE trigger, whose ``delete`` command
+    reads the content table.  MEASURED A/B on this machine:
 
-    **The correct move is to re-create the GUARD's triggers.**  They
-    land at the end of ``sqlite_master``, and the FTS triggers (which
-    were not touched) stay where they are — so the guard ends up behind
-    them.  That is also wrong.
+        guard AHEAD  (guard_max < fts_min): the legacy write SUCCEEDS
+        guard BEHIND (guard_max > fts_min): ``database disk image is
+                                            malformed``
 
-    So neither trigger group can be "moved" by re-creating it alone:
-    what matters is the RELATIVE order, and re-creating one group puts
-    it LAST.  The rule that actually holds the invariant is the one the
-    storage layer uses: **re-create the FTS triggers LAST** — i.e.
-    drop and re-create the FTS sync triggers, and re-create the guard's
-    triggers BEFORE them.  Concretely, in ONE transaction:
-
-        1. drop the FTS sync triggers and the body guard's triggers;
-        2. re-create the body guard's triggers;
-        3. re-create the FTS sync triggers.
-
-    The result is: guard first, FTS second — and that is the order the
-    legacy DELETE-then-INSERT shape needs.
-
-    **The index guard (``chunks_guard_bi`` / ``chunks_guard_bu``) is
-    NOT an FTS trigger** and must not be treated as one: it is a
-    visibility guard with its own ordering requirements, and the first
-    version of this function swept it into the "FTS" group by accident
-    (it only excluded the body guard's names).  It is left exactly
-    where it is.
+    So the invariant is ``guard_max < fts_min`` — the guard fires
+    FIRST — and the fix is to drop and re-create BOTH groups, guard
+    first and FTS second, in ONE transaction.
     """
-    body_guard_names = {
-        "chunks_body_keep_bi", "chunks_body_keep_bu", "chunks_body_keep_bd",
-        "chunks_body_keep_bi_ai", "chunks_body_keep_st_ai",
-        "files_body_keep_bu", "files_body_keep_bi", "files_body_keep_bd",
-        "files_body_keep_bi_ai",
-    }
-    # The FTS sync triggers — the ones that mirror the content table
-    # into the FTS index.  The index guard is NOT one of them.
-    fts_names = {
-        "chunks_ai", "chunks_ad", "chunks_au",
-        "chunks_trigram_ai", "chunks_trigram_ad", "chunks_trigram_au",
-    }
-    try:
-        rows = conn.execute(
-            "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
-            "AND sql IS NOT NULL ORDER BY rowid").fetchall()
-    except sqlite3.Error:
-        return False
-    if not rows:
-        return False
-    stored = {r[0]: r[1] for r in rows}
-    order = [r[0] for r in rows]
+    from agent.memory.body_guard import reorder_fts_triggers_behind_guard
 
-    guard_rows = [n for n in order if n in body_guard_names]
-    fts_rows = [n for n in order if n in fts_names]
-    if not guard_rows or not fts_rows:
-        return False
-    if max(order.index(n) for n in guard_rows) < \
-            min(order.index(n) for n in fts_rows):
-        return False  # already in the right order
-
-    try:
-        if conn.in_transaction:
-            conn.commit()
-        conn.execute("BEGIN IMMEDIATE")
-        for name in fts_rows + guard_rows:
-            conn.execute("DROP TRIGGER IF EXISTS %s" % name)
-        # The GUARD first, then the FTS triggers: a re-created trigger
-        # lands at the end, so this order is the one that ends up with
-        # the guard ahead of the FTS triggers.
-        for name in guard_rows:
-            conn.execute(stored[name])
-        for name in fts_rows:
-            conn.execute(stored[name])
-        conn.commit()
-    except sqlite3.Error:
-        try:
-            conn.rollback()
-        except sqlite3.Error:
-            pass
-        return False
-    return True
+    return reorder_fts_triggers_behind_guard(conn)
 
 
 def install_body_guard_on(db_path: Union[str, Path]) -> Dict[str, Any]:

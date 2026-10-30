@@ -1038,6 +1038,113 @@ def _expected_trigger_map() -> Dict[str, str]:
     return out
 
 
+#: The FTS sync triggers — the ones that mirror the content table into the
+#: FTS index.  They are NOT the guard's, and the index guard
+#: (``chunks_guard_bi`` / ``chunks_guard_bu``) is NOT one of them: it is
+#: a visibility guard with its own ordering requirements.
+FTS_SYNC_TRIGGERS = frozenset({
+    "chunks_ai", "chunks_ad", "chunks_au",
+    "chunks_trigram_ai", "chunks_trigram_ad", "chunks_trigram_au",
+})
+
+
+def reorder_fts_triggers_behind_guard(conn: sqlite3.Connection) -> bool:
+    """Put the body guard's triggers AHEAD of the FTS sync triggers.
+
+    True when it acted.
+
+    **The rule, and why it is load-bearing.**  SQLite runs a table's
+    triggers in ``sqlite_master`` rowid order.  The body guard's AFTER
+    INSERT restore trigger updates the protected columns of the row the
+    writer just inserted; that update fires the FTS AFTER UPDATE trigger,
+    whose ``delete`` command reads the content table.  When the guard
+    runs AFTER the FTS triggers, the FTS index already holds the row
+    while the content table already holds the REPLACED one — the tokens
+    disagree, and SQLite reports ``database disk image is malformed``.
+
+    MEASURED on this machine (A/B, same fixture, both arms written with
+    the legacy DELETE-then-INSERT shape):
+
+        guard AHEAD  (guard_max=21 < fts_min=32): the write SUCCEEDS
+        guard BEHIND (guard_max=49 > fts_min=32): ``sqlite3.DatabaseError:
+                                                   database disk image is
+                                                   malformed``
+
+    So the invariant is ``guard_max < fts_min`` — the guard fires
+    FIRST.  (A delivery note asserted the opposite; the measurement
+    above is what settled it.)
+
+    **How the order is fixed — and the mistake this module first made.**
+    A re-created trigger lands at the END of ``sqlite_master``.  So the
+    obvious move ("re-create the FTS triggers so they end up behind the
+    guard") does NOT work when the guard itself was just re-created:
+    the guard is ALREADY at the end, so re-creating the FTS triggers
+    moves THEM to the end too — and the guard stays in front of the
+    OLD FTS rows... no: it moves them behind the guard, but the guard
+    is behind the FTS rows it was supposed to precede.
+
+    **The correct move is to re-create the GUARD's triggers.**  They
+    land at the end of ``sqlite_master``, and the FTS triggers (which
+    were not touched) stay where they are — so the guard ends up behind
+    them.  That is also wrong.
+
+    So neither trigger group can be "moved" by re-creating it alone:
+    what matters is the RELATIVE order, and re-creating one group puts
+    it LAST.  The rule that actually holds the invariant is: **drop and
+    re-create BOTH groups, guard first and FTS second**, in ONE
+    transaction.  The result is: guard first, FTS second.
+
+    This module used to keep that logic in ``guard_sweep`` — but
+    ``guard_sweep`` only runs when somebody sweeps, while
+    :func:`ensure_guard` runs on every open.  A repair inside
+    ``ensure_guard`` therefore left the order broken until the next
+    sweep, and writing the library in between fails with "malformed".
+    So the logic lives HERE, in the module that owns the triggers, and
+    ``guard_sweep`` calls it.
+    """
+    body_guard_names = set(guard_trigger_names())
+    try:
+        rows = conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+            "AND sql IS NOT NULL ORDER BY rowid").fetchall()
+    except sqlite3.Error:
+        return False
+    if not rows:
+        return False
+    stored = {r[0]: r[1] for r in rows}
+    order = [r[0] for r in rows]
+
+    guard_rows = [n for n in order if n in body_guard_names]
+    fts_rows = [n for n in order if n in FTS_SYNC_TRIGGERS]
+    if not guard_rows or not fts_rows:
+        return False
+    if max(order.index(n) for n in guard_rows) < \
+            min(order.index(n) for n in fts_rows):
+        return False  # already in the right order
+
+    try:
+        if conn.in_transaction:
+            conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        for name in fts_rows + guard_rows:
+            conn.execute("DROP TRIGGER IF EXISTS %s" % name)
+        # The GUARD first, then the FTS triggers: a re-created trigger
+        # lands at the end, so this order is the one that ends up with
+        # the guard ahead of the FTS triggers.
+        for name in guard_rows:
+            conn.execute(stored[name])
+        for name in fts_rows:
+            conn.execute(stored[name])
+        conn.commit()
+    except sqlite3.Error:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        return False
+    return True
+
+
 def is_installed(conn: sqlite3.Connection) -> bool:
     """True when the guard is installed AND its bodies are the current ones.
 
@@ -1123,7 +1230,15 @@ def ensure_guard(conn: sqlite3.Connection) -> Dict[str, Any]:
             files_reason = "the files table has no %s column" % FILES_KEY
 
     if is_installed(conn):
-        return {"status": "present", "files_guard": files_ok}
+        # The guard's BODIES are current — but the ORDER may still be
+        # wrong, and the order is a separate property from the bodies.
+        # (``is_installed`` compares by NAME, on purpose: the order in
+        # ``sqlite_master`` is not part of a trigger's definition.)
+        # A library whose order is broken is writable-but-broken, so the
+        # order is restored here even on the no-op path.
+        out = {"status": "present", "files_guard": files_ok}
+        out["fts_reordered"] = reorder_fts_triggers_behind_guard(conn)
+        return out
 
     existed = bool(stored_trigger_sql(conn))
     try:
@@ -1170,6 +1285,19 @@ def ensure_guard(conn: sqlite3.Connection) -> Dict[str, Any]:
         out["files_reason"] = files_reason
     else:
         out["files_guard"] = True
+    # **P1 阶段三 N: a re-install lands the guard at the END of
+    # ``sqlite_master``, i.e. BEHIND the FTS sync triggers.**  And the
+    # order is load-bearing: with the guard behind, the legacy
+    # DELETE-then-INSERT shape fails with "database disk image is
+    # malformed" (MEASURED — see
+    # :func:`reorder_fts_triggers_behind_guard`).
+    #
+    # Before this call, the order was only fixed by ``guard_sweep`` —
+    # i.e. by somebody remembering to sweep.  Between a repair here and
+    # the next sweep, the library was WRITABLE-BUT-BROKEN: reading it
+    # was fine, writing it raised malformed.  The order is a property of
+    # the LIBRARY, so it is restored here, where the repair happens.
+    out["fts_reordered"] = reorder_fts_triggers_behind_guard(conn)
     return out
 
 
