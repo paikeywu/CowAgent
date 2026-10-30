@@ -219,6 +219,76 @@ def _write_ledger(conn: sqlite3.Connection,
     return written
 
 
+def prune_orphans(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Remove the ledger entries whose chunk no longer exists.
+
+    **Why the certifier does this.**  The ledger is the certifier's OWN
+    record — it is written by the certifier and by nobody else — so the
+    certifier is the only component that may prune it.  Leaving the
+    pruning to an external tool means the ledger can drift out of shape
+    between two certifier runs, and the drift is invisible: every
+    criterion that reads the ledger JOINS it to ``chunks``, so an orphan
+    entry is invisible to M6a (it counts rows without a witness), to
+    M6b (it compares witnesses with their chunks) and to M6c (it counts
+    mirror rows without a witness).  That is the general shape of this
+    round's leaks: **a detector that does not cover a thing cannot
+    report that thing.**
+
+    **Why orphans appear at all.**  The chunk id is
+    ``md5("path:start:end[:part]")`` — derived from the row's POSITION,
+    not its content.  So when the truth-layer file changes and the
+    chunker re-cuts it, the rows get NEW ids and the old ids are gone;
+    the ledger still holds the old ids.  MEASURED on this machine: the
+    ROOT library's ``AGENT.md`` / ``RULE.md`` / ``USER.md`` entries
+    orphaned on every re-cut (those files are re-read every session), and
+    the ``memory/shelf/*.md`` entries orphaned when the shelf was
+    rewritten.
+
+    **What is deleted, and what is not.**  Only the entries whose chunk
+    is GONE.  The chunks themselves are never touched, and no
+    certification is invented for the chunk that replaced an orphan —
+    re-certifying is the certifier's own job, and it happens in the
+    ordinary certification pass (which reaches every row the ledger does
+    not mention).
+
+    **Why deleting is safe here.**  The ledger is a derived witness over
+    the chunks, not a record of conversations and not knowledge.  An
+    orphan certifies a row that is not there, so it certifies nothing.
+    The rule "never physically delete" governs the CONVERSATION and
+    KNOWLEDGE records; this is a witness for a subject that no longer
+    exists.
+    """
+    out: Dict[str, Any] = {"pruned": 0, "ids": []}
+    try:
+        from agent.memory.body_guard import cert_table_ddl
+
+        conn.execute(cert_table_ddl())
+        rows = conn.execute(
+            "SELECT l.id FROM cert_ledger l WHERE NOT EXISTS "
+            "(SELECT 1 FROM chunks c WHERE c.id = l.id)").fetchall()
+    except sqlite3.Error as e:
+        out["error"] = "sqlite error: %s" % e
+        return out
+    if not rows:
+        return out
+    ids = [r[0] for r in rows]
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for cid in ids:
+            conn.execute("DELETE FROM cert_ledger WHERE id=?", (cid,))
+        conn.commit()
+    except sqlite3.Error as e:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        out["error"] = "sqlite error: %s" % e
+        return out
+    out["pruned"] = len(ids)
+    out["ids"] = ids[:50]
+    return out
+
+
 def backfill_ledger(conn: sqlite3.Connection) -> Dict[str, Any]:
     """Seed the ledger with the rows that were ALREADY certified.
 
@@ -241,16 +311,29 @@ def backfill_ledger(conn: sqlite3.Connection) -> Dict[str, Any]:
     from the ledger) and it is a SEPARATE, explicitly-called step: it
     must never run implicitly during a certification, because that
     would silently paper over a row that was never certified.
+
+    **P1-阶段三 第八轮: the backfill PRUNES first.**  A backfill that
+    only adds would keep re-seeding entries for rows that no longer
+    exist — MEASURED: the ROOT library's 15 ``AGENT.md``/``RULE.md``/
+    ``USER.md`` orphans were all ``certified_by='backfill'``, because
+    the backfill ran on a row that the chunker later re-cut.  So the
+    orphans are pruned BEFORE the seeding, and the seeding then sees a
+    ledger that matches the chunks.
     """
     from agent.memory.body_guard import cert_table_ddl, record_certification
 
-    out: Dict[str, Any] = {"written": 0, "already": 0, "skipped": 0}
+    out: Dict[str, Any] = {"written": 0, "already": 0, "skipped": 0,
+                            "pruned": 0}
     try:
         conn.execute(cert_table_ddl())
         cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)")}
         if "text_state" not in cols:
             out["skipped"] = -1
             return out
+        # PRUNE FIRST: an entry for a chunk that is gone must not be
+        # counted as "already certified", and it must not be re-seeded.
+        pruned = prune_orphans(conn)
+        out["pruned"] = pruned.get("pruned", 0)
         have = {r[0] for r in conn.execute("SELECT id FROM cert_ledger")}
         rows = conn.execute(
             "SELECT id, text_state, body_origin, body_path, body_hash "
@@ -794,12 +877,43 @@ def certify_family(workspace: Path | str, *, dry_run: bool = False,
     default and must stay explicit: a backfill that ran implicitly would
     silently turn "never certified" into "certified", which is the exact
     thing the coverage criterion exists to detect.
+
+    **P1-阶段三 第八轮: the certification PRUNES the orphans.**  Unlike
+    the backfill, the pruning is NOT optional and it is NOT off by
+    default — and the asymmetry is deliberate:
+
+      * the backfill WRITES a certification claim ("this row was
+        certified"), so it must be explicit: a backfill that ran
+        implicitly would turn "never certified" into "certified";
+      * the pruning REMOVES a claim about a row that no longer exists.
+        It cannot make anything look certified — a row with no chunk
+        cannot be certified at all — so it carries no such risk, and
+        leaving it optional would let the ledger accumulate witnesses to
+        rows that stopped existing.
+
+    MEASURED on this machine: without the pruning, the ledger grew 3
+    orphan entries within 20 minutes of a cleanup, because the chunker
+    re-cut the files whose entries the certifier had just written.  The
+    orphans are the certifier's own residue, and the certifier is the
+    only component that may remove them.
     """
     workspace = Path(workspace)
     libs = enumerate_live(workspace)
     reports = []
     backfilled = 0
+    pruned = 0
     for lib in libs:
+        if not dry_run:
+            # The prune runs on EVERY certification pass, backfill or not.
+            try:
+                conn = sqlite3.connect(str(lib["db"]))
+                try:
+                    res = prune_orphans(conn)
+                    pruned += int(res.get("pruned", 0))
+                finally:
+                    conn.close()
+            except sqlite3.Error:
+                pass
         if backfill and not dry_run:
             try:
                 conn = sqlite3.connect(str(lib["db"]))
@@ -822,6 +936,7 @@ def certify_family(workspace: Path | str, *, dry_run: bool = False,
         "dry_run": bool(dry_run),
         "backfill": bool(backfill),
         "backfilled": backfilled,
+        "pruned": pruned,
         "libraries": reports,
         "library_count": len(reports),
         "promoted": total_promoted,

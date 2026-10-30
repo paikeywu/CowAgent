@@ -1443,10 +1443,26 @@ class MemoryManager:
         # index that already had files may still contain chunks from an older
         # chunker (file hashes do not change when only the chunker does), so it
         # stays unstamped and /memory status will suggest a rebuild.
+        #
+        # P1-阶段三 第八轮 (T4): the key is ``last_migration_chunker_version``
+        # — the name says what the value actually IS.  The old key
+        # (``chunker_version``) claimed to describe the whole index, and it
+        # does not: it is stamped only on a rebuild-from-empty, so an index
+        # whose files were later re-cut by a newer chunker keeps a value that
+        # is false for most of its files.  MEASURED on this machine: all 16
+        # libraries carried ``chunker_version=3`` while ``files.chunker_version``
+        # said 4 for the great majority of their rows.
+        #
+        # The old key is NOT deleted here: it is the historical record of
+        # what the index was built with, and every reader accepts both
+        # spellings (``embedding.state.detect_chunker_version``).  The
+        # migration that copies the old value into the new key is
+        # ``agent.memory.meta_chunker_key``.
         if files_before == 0:
             try:
                 self.storage.set_meta(
-                    "chunker_version", str(TextChunker.CHUNKER_VERSION)
+                    "last_migration_chunker_version",
+                    str(TextChunker.CHUNKER_VERSION)
                 )
             except Exception:
                 pass

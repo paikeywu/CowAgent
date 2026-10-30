@@ -58,21 +58,56 @@ class TestDetectChunkerVersion(unittest.TestCase):
         self.assertIsNone(detect_chunker_version(self.storage))
 
     def test_detect_matches_when_stamped(self):
+        self.storage.set_meta("last_migration_chunker_version",
+                               str(TextChunker.CHUNKER_VERSION))
+        self.assertEqual(
+            detect_chunker_version(self.storage), TextChunker.CHUNKER_VERSION
+        )
+
+    def test_detect_matches_when_stamped_under_the_legacy_name(self):
+        """The reader must find the version under the LEGACY name too.
+
+        The rename does not delete the old key, so a library stamped
+        before it carries only the old spelling — and a reader that knew
+        one spelling would report "no version" for a library that HAS
+        one.
+        """
         self.storage.set_meta("chunker_version", str(TextChunker.CHUNKER_VERSION))
         self.assertEqual(
             detect_chunker_version(self.storage), TextChunker.CHUNKER_VERSION
         )
 
     def test_detect_mismatch_for_old_version(self):
-        self.storage.set_meta("chunker_version", str(TextChunker.CHUNKER_VERSION - 1))
+        self.storage.set_meta("last_migration_chunker_version",
+                               str(TextChunker.CHUNKER_VERSION - 1))
         self.assertNotEqual(
             detect_chunker_version(self.storage), TextChunker.CHUNKER_VERSION
         )
 
 
 class TestSyncStampsVersion(unittest.TestCase):
-    """MemoryManager.sync stamps chunker_version only when starting from an
-    empty index."""
+    """MemoryManager.sync stamps the chunker version only when starting from
+    an empty index.
+
+    **P1-阶段三 第八轮 (T4): the stamp is written under the HONEST key
+    name, ``last_migration_chunker_version``** — the old key
+    (``chunker_version``) claimed to describe the whole index, and it does
+    not: it is written only on a rebuild-from-empty, so an index whose
+    files were later re-cut by a newer chunker keeps a value that is
+    false for most of its files.  MEASURED on this machine: all 16
+    libraries carried ``chunker_version=3`` while
+    ``files.chunker_version`` said 4 for the great majority of their
+    rows.
+
+    The reader (``detect_chunker_version``) accepts BOTH spellings, so a
+    library stamped before the rename still reports its version — and
+    the tests below assert exactly that, because "the writer writes the
+    new name" and "the reader finds either name" are two different
+    claims and both must hold.
+    """
+
+    #: The key the writer stamps.
+    STAMP_KEY = "last_migration_chunker_version"
 
     def _make(self, ws):
         import config
@@ -104,7 +139,7 @@ class TestSyncStampsVersion(unittest.TestCase):
         m = self._make(ws)
         asyncio.run(m.sync(force=True))
         self.assertEqual(
-            m.storage.get_meta("chunker_version"),
+            m.storage.get_meta(self.STAMP_KEY),
             str(TextChunker.CHUNKER_VERSION),
         )
 
@@ -118,7 +153,7 @@ class TestSyncStampsVersion(unittest.TestCase):
         # First (empty->full) sync stamps the current version.
         asyncio.run(m.sync(force=True))
         self.assertEqual(
-            m.storage.get_meta("chunker_version"), str(TextChunker.CHUNKER_VERSION)
+            m.storage.get_meta(self.STAMP_KEY), str(TextChunker.CHUNKER_VERSION)
         )
         # Add a second file; index is now non-empty before sync, so the stamp
         # must stay whatever it was (not unset, not blindly rewritten).
@@ -127,7 +162,30 @@ class TestSyncStampsVersion(unittest.TestCase):
             f.write("# B\n\n其他内容。" * 300)
         asyncio.run(m.sync())
         self.assertEqual(
-            m.storage.get_meta("chunker_version"), str(TextChunker.CHUNKER_VERSION)
+            m.storage.get_meta(self.STAMP_KEY), str(TextChunker.CHUNKER_VERSION)
+        )
+
+    def test_a_legacy_stamp_is_still_readable(self):
+        """A library stamped before the rename must still report its version.
+
+        The rename does NOT delete the old key: it is the historical
+        record of what the index was built with, and a reader that knows
+        only the old spelling must not find the record missing.
+        """
+        ws = tempfile.mkdtemp()
+        os.makedirs(os.path.join(ws, "knowledge", "infra"))
+        with open(os.path.join(ws, "knowledge", "infra", "a.md"), "w",
+                  encoding="utf-8") as f:
+            f.write("# A\n\n内容。" * 400)
+        m = self._make(ws)
+        asyncio.run(m.sync(force=True))
+        # Simulate a library that was stamped before the rename: only the
+        # legacy key is present.
+        m.storage.conn.execute("DELETE FROM _meta WHERE key=?", (self.STAMP_KEY,))
+        m.storage.set_meta("chunker_version", str(TextChunker.CHUNKER_VERSION))
+        m.storage.conn.commit()
+        self.assertEqual(
+            detect_chunker_version(m.storage), TextChunker.CHUNKER_VERSION
         )
 
     def test_sync_indexes_shared_knowledge_outside_agent_workspace(self):

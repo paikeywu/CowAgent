@@ -74,6 +74,12 @@ from agent.memory.body_pointer import (  # noqa: E402
     resolve_truth_file,
 )
 from agent.memory.chunker import TextChunker  # noqa: E402
+from agent.memory.cross_end import (  # noqa: E402
+    TOKEN_DIMENSIONS,
+    cross_end_dimension_fingerprint,
+    cross_end_dimensions,
+    cross_end_fingerprint,
+)
 from agent.memory.naming import canonical_text  # noqa: E402
 from agent.memory.rebuilder import _chunk_id  # noqa: E402
 from agent.memory.schema_drift import (  # noqa: E402
@@ -1629,24 +1635,34 @@ def step_a6_running_the_right_code(live: List[Dict[str, Any]],
     there, so the check is trivially satisfied — but "trivially
     satisfied on the machine you tested" is not the same as "checked".
 
-    **The five items, and what each one catches:**
+    **The SIX items, and what each one catches:**
 
       1. ``agent.memory.__file__`` — the file the interpreter ACTUALLY
          imported.  Catches "the installed copy, not the source tree".
       2. ``git rev-parse HEAD`` — the commit of the source tree.  Catches
          "the right tree, the wrong commit".
       3. ``schema_fingerprint`` **plus the tables it covers** — the
-         shape of the index.  Catches "the code is right but the
+         COLUMN shape of the index.  Catches "the code is right but the
          database is not the one this code expects".
-      4. ``body_path IS NULL`` count — the thing the migration was
+      4. **the CROSS-END fingerprint** (P1-阶段三 第八轮) — the token
+         built from SEVEN dimensions, of which the TRIGGER TEXT is the
+         one the column fingerprint cannot see.  Catches "the columns
+         agree but the BEHAVIOUR does not" — the exact failure measured
+         on this machine, where all 16 libraries reported ONE identical
+         column fingerprint while 14 of them still restored
+         ``text_state`` from the guard's keep table and 2 restored it
+         from the certification ledger.
+      5. ``body_path IS NULL`` count — the thing the migration was
          supposed to fill.
-      5. the before/after row count and the CONTENT DIGEST — the
+      6. the before/after row count and the CONTENT DIGEST — the
          migration's own effect.
 
     **Every item prints its ACTUAL VALUE**, never just PASS/FAIL: a
     criterion that prints only the verdict cannot be audited by the
     reader, and the reader is the one who has to decide whether the
-    machine is in the state the report claims.
+    machine is in the state the report claims.  And item 4 prints the
+    per-dimension hashes — so the reader can see WHICH dimension
+    differs, not merely that something did.
     """
     import subprocess
 
@@ -1684,7 +1700,44 @@ def step_a6_running_the_right_code(live: List[Dict[str, Any]],
             describe_schema_fingerprint(fp), fp is not None))
         break  # one library is enough for the shape; the rest are in M1
 
-    # --- 4. the pointers that are supposed to be filled ----------------
+    # --- 4. the CROSS-END fingerprint (the seven dimensions) ---------
+    #
+    # **This is the item that catches what item 3 cannot.**  The column
+    # fingerprint says "these indexes can run the same queries"; the
+    # cross-end fingerprint says "these indexes BEHAVE the same", and
+    # the difference between those two sentences is the trigger body.
+    #
+    # The item is PASS when every library carries the SAME cross-end
+    # token — and the per-dimension hashes are printed, so a drift can
+    # be located without re-running anything.
+    cross_tokens: Dict[str, List[str]] = {}
+    cross_detail: List[str] = []
+    for lib in live:
+        try:
+            xfp = cross_end_fingerprint(lib["db"])
+            dims = cross_end_dimensions(lib["db"])
+        except Exception as e:
+            xfp = "error: %s" % e
+            dims = None
+        if xfp and dims:
+            cross_tokens.setdefault(xfp, []).append(lib["name"])
+            cross_detail.append(
+                "     %-22s %s" % (lib["name"], xfp[:16]))
+            for dim in TOKEN_DIMENSIONS:
+                cross_detail.append(
+                    "        %-14s %s"
+                    % (dim, cross_end_dimension_fingerprint(dims, dim)))
+    uniform = len(cross_tokens) == 1
+    cross_value = ("%d distinct token(s) over %d libraries"
+                   % (len(cross_tokens), len(live)))
+    if uniform and cross_tokens:
+        only = list(cross_tokens.values())[0]
+        cross_value = ("%s over %d libraries (%s)"
+                       % (list(cross_tokens.keys())[0][:16], len(only),
+                          ", ".join(only[:4]) + ("..." if len(only) > 4 else "")))
+    items.append(("④ cross-end fingerprint", cross_value, uniform))
+
+    # --- 5. the pointers that are supposed to be filled ----------------
     # This is a MEASUREMENT, not a gate.  A non-zero count here does
     # NOT mean "the wrong code ran" — it means the data has rows with
     # no pointer, which is the honest state for a row whose truth file
@@ -1706,11 +1759,11 @@ def step_a6_running_the_right_code(live: List[Dict[str, Any]],
         except sqlite3.Error:
             pass
     measurements: List[Tuple[str, str]] = [
-        ("④ body_path IS NULL (all libraries)",
+        ("⑤ body_path IS NULL (all libraries)",
          "%d of %d rows" % (null_total, rows_total)),
     ]
 
-    # --- 5. the effect of this very run --------------------------------
+    # --- 6. the effect of this very run --------------------------------
     for lib in live:
         try:
             conn = _open_ro(lib["db"])
@@ -1725,19 +1778,19 @@ def step_a6_running_the_right_code(live: List[Dict[str, Any]],
         before_rows = pre.get("chunks")
         before_digest = pre.get("chunks_digest")
         measurements.append((
-            "⑤ rows / content digest [%s]" % lib["name"],
+            "⑥ rows / content digest [%s]" % lib["name"],
             "rows %s -> %s   digest %s -> %s" % (
                 before_rows if before_rows is not None else "(no baseline)",
                 rows,
                 (before_digest or "(no baseline)")[:16],
                 (digest or "(none)")[:16])))
 
-    # **The verdict is about the CODE IDENTITY only.**  Items ① ② ③
-    # answer "is this run against the code the report describes?" —
-    # that is what this criterion is for.  Items ④ ⑤ are the DATA
-    # state, printed so the reader can see the migration's effect;
-    # they are measured, not judged here (the M4 criteria own the
-    # pointer question).
+    # **The verdict is about the CODE IDENTITY only.**  Items ①②③④
+    # answer "is this run against the code the report describes, and is
+    # the fleet in one shape?" — that is what this criterion is for.
+    # Items ⑤⑥ are the DATA state, printed so the reader can see the
+    # migration's effect; they are measured, not judged here (the M4
+    # criteria own the pointer question).
     ok = all(good for _label, _value, good in items)
     detail = []
     for label, value, _good in items:
@@ -1745,22 +1798,30 @@ def step_a6_running_the_right_code(live: List[Dict[str, Any]],
     for label, value in measurements:
         detail.append("  %-34s %s" % (label, value))
     detail.append("")
+    if cross_detail:
+        detail.append("  the cross-end fingerprint, per library and per "
+                      "dimension:")
+        detail.extend(cross_detail)
+        detail.append("")
     detail.append("(every item prints its ACTUAL VALUE — a verdict alone "
                   "cannot be audited by the reader)")
-    detail.append("① ② ③ are the VERDICT (code identity: is this run "
-                  "against the code the report describes?).")
-    detail.append("④ ⑤ are MEASUREMENTS (the data state; the M4 "
+    detail.append("①②③④ are the VERDICT (code identity + fleet shape).")
+    detail.append("⑤⑥ are MEASUREMENTS (the data state; the M4 "
                   "criteria own the pointer question).")
+    detail.append("④'s dimensions: %s" % (", ".join(TOKEN_DIMENSIONS),))
     report.criterion(
         "A6.CODE",
-        "the run is against THIS source tree (the code identity), with "
-        "the data state printed beside it",
+        "the run is against THIS source tree (the code identity), the "
+        "fleet's cross-end fingerprint is uniform, and the data state is "
+        "printed beside it",
         "PASS" if ok else "FAIL",
         "\n".join(detail),
         agent_memory_file=mem_file,
         git_head=head,
         body_path_null=null_total,
-        rows=rows_total)
+        rows=rows_total,
+        cross_end_uniform=uniform,
+        cross_end_groups={k: v for k, v in cross_tokens.items()})
 
 
 # --------------------------------------------------------------------------
