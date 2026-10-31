@@ -146,7 +146,42 @@ _ESC = r"(?:\\)*"
 #: backslashes (the escape depth), and the closing delimiter must match
 #: the opening one.
 _QOPEN = _ESC + r"(?P<q>['\"])"
-_QVAL = r"(?:[^'\"\n]|\\.)+?"
+#: **The two alternatives are DISJOINT, and that is load-bearing.**
+#:
+#: The original was ``(?:[^'"\n]|\\.)+?`` — the character class could match a
+#: backslash too, so a backslash could be consumed EITHER by the class OR
+#: by the escape branch.  Two ways to match the same character ⇒ when the
+#: closing delimiter could not be satisfied, the engine had exponentially
+#: many partitions to try.
+#:
+#: MEASURED (2026-11-01): one message in the live ROOT library (8,319
+#: characters) made ``S2-sshpass-quoted`` run for **more than 20
+#: seconds**; the other eleven forms were instant.  The message contained
+#: an ``sshpass -p '`` whose closing quote was not where the pattern
+#: needed it.  So a single message could hang the credential masker —
+#: and the masker runs on **every message written** (the database throat
+#: and the truth source), so one message could stall the write path.
+#:
+#: The fix keeps the language and removes the ambiguity: the escape
+#: branch owns the backslash, and the character class refuses it.
+#:
+#:   ``(?:\\.|[^'"\\\n])+``
+#:
+#: Ordering the branches the other way (``(?:\\.|[^'"\n])+?``) does
+#: **NOT** fix it — the engine still falls back to the class when the
+#: escape branch fails, so the ambiguity (and the blow-up) remains.
+#: MEASURED: that variant still timed out.
+#:
+#: The positive match is unchanged: on the F-5 synthetic corpus it still
+#: yields ``('sshpass -p ', 'SYNTHETIC-CREDENTIAL-DO-NOT-USE', "'")``.
+#:
+#: One semantic note: the quantifier is now greedy rather than lazy.
+#: That is safe here because the character class refuses the quote
+#: character, so the value always ends at the first unescaped quote —
+#: the shortest and the longest value coincide.  (The escape branch can
+#: span a quote, but then the closing delimiter that follows it is the
+#: one that terminates the value, so the two lengths still agree.)
+_QVAL = r"(?:\\.|[^'\"\\\n])+"
 _QCLOSE = _ESC + r"(?P=q)"
 
 
