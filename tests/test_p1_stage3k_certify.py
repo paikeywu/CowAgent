@@ -583,7 +583,26 @@ def test_the_files_guard_does_not_fire_without_the_guard(tmp_path):
 
     Two tests, one behaviour: the first says "the guard holds", this
     one says "nothing else holds it".
+
+    **P1 阶段三 N 后续二 (F-1): the guard is now DROPPED EXPLICITLY.**
+
+    The comment used to say "NO guard installed" — but nothing dropped
+    it.  The test reached that state only because the body-column guard
+    used to be installed BEFORE the ``files`` table existed (so the
+    files side was skipped) — i.e. it relied on the F-1 DEFECT to
+    produce its own premise.
+
+    MEASURED: once the guard is installed where its dependencies exist
+    (the F-1 fix), the files side IS installed, the statistics survive,
+    and the reverse case stopped reproducing — the test went red.
+
+    A reverse case that gets its premise from a defect is not a reverse
+    case; it is a test of the defect.  So the premise is now
+    established explicitly: the guard's triggers are dropped, and the
+    test ASSERTS that it is really gone before it measures anything.
     """
+    from agent.memory import body_guard as bg
+
     db = tmp_path / "memory" / "long-term" / "index.db"
     db.parent.mkdir(parents=True, exist_ok=True)
     storage = MemoryStorage(db_path=str(db))
@@ -594,7 +613,16 @@ def test_the_files_guard_does_not_fire_without_the_guard(tmp_path):
             "chunker_version, updated_at) VALUES ('memory/a.md','memory',"
             "'h',1,10,3,4,strftime('%s','now'))")
         conn.commit()
-        # NO guard installed.
+        # NO guard installed — dropped EXPLICITLY, and the premise is
+        # asserted rather than assumed.
+        for name in bg.guard_trigger_names():
+            conn.execute("DROP TRIGGER IF EXISTS %s" % name)
+        conn.commit()
+        present = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger'")}
+        assert not (present & set(bg.guard_trigger_names())), (
+            "the reverse case needs NO guard: %s are still installed"
+            % sorted(present & set(bg.guard_trigger_names())))
         conn.execute(
             "INSERT OR REPLACE INTO files (path, source, hash, mtime, size, "
             "updated_at) VALUES ('memory/a.md','memory','h2',2,20,"

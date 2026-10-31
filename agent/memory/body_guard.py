@@ -1145,6 +1145,40 @@ def reorder_fts_triggers_behind_guard(conn: sqlite3.Connection) -> bool:
     return True
 
 
+def files_side_protectable(conn: sqlite3.Connection) -> bool:
+    """Whether the FILES side of the guard can be installed at all.
+
+    **P1 阶段三 N 后续二 (F-1).  "This side cannot be protected" and
+    "the guard needs re-installing" are two DIFFERENT facts, and
+    :func:`is_installed` used to conflate them.**
+
+    The files-side triggers read ``files.chunk_count`` and
+    ``files.chunker_version``.  A library whose ``files`` table does
+    not have those columns cannot carry them — so on that library the
+    files side is **not needed**, not **stale**.
+
+    Measured (this round): ``is_installed`` demanded all nine trigger
+    names, so a library whose files side is legitimately unprotectable
+    reported ``False`` FOREVER — and ``ensure_guard`` therefore took
+    the re-install path on every open, which lands the guard at the
+    END of ``sqlite_master`` and flips the trigger order (the order is
+    load-bearing — see :func:`reorder_fts_triggers_behind_guard`).
+
+    So the question "is the guard current?" must be asked **per side**,
+    and a side that CANNOT be protected must not make the answer
+    "no".
+    """
+    try:
+        fcols = {r[1] for r in conn.execute("PRAGMA table_info(files)")}
+    except sqlite3.Error:
+        return False
+    if not fcols:
+        return False
+    if FILES_KEY not in fcols:
+        return False
+    return all(c in fcols for c in FILES_PROTECTED_COLUMNS)
+
+
 def is_installed(conn: sqlite3.Connection) -> bool:
     """True when the guard is installed AND its bodies are the current ones.
 
@@ -1159,6 +1193,14 @@ def is_installed(conn: sqlite3.Connection) -> bool:
     trigger order again (measured: that flip is what makes the legacy
     DELETE-then-INSERT shape fail with "database disk image is
     malformed").
+
+    **P1 阶段三 N 后续二 (F-1): the answer is per SIDE.**  The chunks
+    side is always required.  The files side is required only when it
+    CAN be installed (:func:`files_side_protectable`) — a library
+    without the statistics columns has nothing to protect on that side,
+    and that is a legitimate state, not a drift.  Before this change
+    the two were conflated and the answer was "never" for such a
+    library, which made every open re-install the guard.
     """
     names = guard_trigger_names()
     try:
@@ -1172,7 +1214,12 @@ def is_installed(conn: sqlite3.Connection) -> bool:
     expected = _expected_trigger_map()
     if not stored:
         return False
-    for name in names:
+    # The chunks side is required on every library.
+    required = [n for n in names if n.startswith("chunks_")]
+    # The files side is required only when it can be installed at all.
+    if files_side_protectable(conn):
+        required += [n for n in names if n.startswith("files_")]
+    for name in required:
         if name not in expected:
             continue  # the files-side trigger may be skipped
         if name not in stored:

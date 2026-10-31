@@ -557,7 +557,41 @@ class MemoryStorage:
         return None if report == "ok" else report
 
     def _repair_search_indexes(self, conn: sqlite3.Connection):
-        """Rebuild whichever search index is flagged or found broken."""
+        """Rebuild whichever search index is flagged or found broken.
+
+        **P1 阶段三 N 后续二 (F-1): the trigram backfill flag may only be
+        written when the trigram index ACTUALLY EXISTS.**
+
+        MEASURED (this round): this method runs on the BACKGROUND
+        MAINTENANCE THREAD, on a SECOND connection, and it writes
+        ``_TRIGRAM_DONE='1'`` from ``self.trigram_fts5_available`` — a
+        value that belongs to the instance that scheduled the thread,
+        NOT to the database it is about to touch.
+
+        So: an instance whose build CAN open the trigram index
+        (``trigram_fts5_available = True``) schedules the thread; a
+        LATER instance whose build CANNOT (an older SQLite without the
+        tokenizer) opens the same file, DETACHES the trigram index and
+        DELETES the flag — because the flag must go with the triggers,
+        or a later capable build would trust an index missing every
+        write made in between.  And then the FIRST instance's thread
+        wakes up, sees the flag absent, and writes it back — on a
+        database whose trigram triggers are GONE.
+
+        The result is a library that says "the trigram index is
+        complete" while it has no trigram triggers at all: the flag is
+        a claim about an index that does not exist.
+
+        MEASURED: the race reproduces 1/36 on the pre-fix code and
+        6/36 with the F-1 fix (the fix changed the interleaving, not
+        the defect) — so it was ALREADY there, and the F-1 work made
+        it more likely to be hit.
+
+        The fix: write the flag only when the trigram index is really
+        there.  The flag is a claim ABOUT the index, so it may only be
+        made when the index exists — the check is the trigger set, and
+        it is made on THIS connection, about THIS database.
+        """
         if not self.fts5_available:
             return
         from common.log import logger
@@ -581,11 +615,29 @@ class MemoryStorage:
                         conn, self._drop_trigram_objects, self._create_trigram_objects
                     )
                     self._refill_index(conn, "chunks_fts_trigram")
-                with conn:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO _meta(key, value) VALUES(?, '1')",
-                        (_TRIGRAM_DONE,),
-                    )
+                # **F-1: the flag may only be written if the trigram
+                # index is really there.**  ``self.trigram_fts5_available``
+                # belongs to THIS instance, but this connection may be
+                # looking at a database whose trigram index another
+                # instance detached — and then the flag would claim an
+                # index that does not exist.  The check is made HERE,
+                # on THIS connection, about THIS database.
+                trigram_present = bool(conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                    "AND name = 'chunks_trigram_ai'"
+                ).fetchone())
+                if trigram_present:
+                    with conn:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO _meta(key, value) VALUES(?, '1')",
+                            (_TRIGRAM_DONE,),
+                        )
+                else:
+                    # The index is not there: the flag must NOT claim it
+                    # is.  (And if one is present, it must go.)
+                    with conn:
+                        conn.execute(
+                            "DELETE FROM _meta WHERE key = ?", (_TRIGRAM_DONE,))
 
     @staticmethod
     def _recreate(conn: sqlite3.Connection, drop, create):
@@ -760,44 +812,28 @@ class MemoryStorage:
         # the content table already holds the replaced one); with the
         # guard running FIRST — the fifth round's order — the same
         # shape passes.
-        try:
-            from agent.memory.body_guard import install_guard as _install_body_guard
-
-            _install_body_guard(self.conn)
-        except Exception as e:
-            # Loud, not silent: a guard that cannot be installed is a
-            # guard that does not exist.
-            from common.log import logger
-            logger.error(
-                f"[MemoryStorage] Body-column guard could not be installed "
-                f"on {self.db_path}: {e}"
-            )
-            raise
-
-        # P1-阶段三 第六轮 (S3-I): keep the guard's triggers AHEAD of the
-        # FTS triggers.
         #
-        # SQLite runs a table's triggers in ``sqlite_master`` rowid
-        # order, and a re-installed trigger lands at the END of it.  So
-        # when the guard is REPAIRED (its body changed — e.g. this round
-        # changed the rules), the drop-and-create moves it BEHIND the
-        # FTS triggers, and the order flips.
+        # **P1 阶段三 N 后续二 (F-1): the INSTALL is moved DOWN, to just
+        # after the ``files`` table and its statistics columns exist.**
         #
-        # The flipped order is not cosmetic: the guard's AFTER INSERT
-        # restore trigger updates the protected columns of the row the
-        # writer just inserted, and that update fires the FTS AFTER
-        # UPDATE trigger — whose 'delete' command reads the content
-        # table.  When the guard runs AFTER the FTS triggers, the row is
-        # already in the FTS index while the content table already holds
-        # the REPLACED row, the tokens disagree, and SQLite reports
-        # "database disk image is malformed".  Measured: with the guard
-        # ahead of the FTS triggers the legacy DELETE-then-INSERT shape
-        # passes; with it behind, it fails with exactly that error.
+        # MEASURED (this round): the install used to happen HERE — 130
+        # lines BEFORE the ``files`` table was created and before
+        # ``chunk_count`` / ``chunker_version`` were added.  The files
+        # side of the guard reads those two columns, so at this point
+        # the files side could not be installed: ``ensure_guard`` saw
+        # no statistics columns, said "the files side cannot be
+        # protected", SKIPPED the four files-side triggers — and then
+        # ``is_installed`` (which demanded all nine names) reported
+        # False FOREVER.  Every open therefore took the re-install
+        # path, and a re-install lands the guard at the END of
+        # ``sqlite_master`` — which flips the load-bearing order.
         #
-        # The repair is to re-create the FTS triggers, which puts them
-        # at the end of ``sqlite_master`` — behind the guard again.
-        if self.fts5_available:
-            self._reorder_fts_triggers_behind_guard()
+        # The install must happen where the guard's own dependencies
+        # exist.  The chunks-side triggers need the body columns
+        # (created above); the files-side triggers need the statistics
+        # columns (created below).  So the install goes HERE, after
+        # both — see the call further down, right after
+        # ``_migrate_files_columns()``.
 
         # Create indexes
         self.conn.execute("""
@@ -891,6 +927,22 @@ class MemoryStorage:
         # same way). Additive, in place, idempotent — a database an older build
         # wrote simply lacks the columns until this build opens it.
         self._migrate_files_columns()
+
+        # **P1 阶段三 N 后续二 (F-1): the body-column guard is installed
+        # HERE, not above.**
+        #
+        # The guard has two sides, and each side has its own dependency:
+        # the chunks side needs the body columns (created above), the
+        # files side needs ``files.chunk_count`` / ``files.chunker_version``
+        # (created just above).  Installing it before the files side's
+        # dependencies existed made ``ensure_guard`` skip the four
+        # files-side triggers, which made ``is_installed`` report False
+        # forever, which made EVERY open re-install the guard — and a
+        # re-install lands the guard at the END of ``sqlite_master``,
+        # flipping the load-bearing trigger order.  Measured: on a fresh
+        # library the first open installed 5/9 triggers and the second
+        # installed 9/9, with the rowids moving.
+        self._install_body_column_guard()
 
         self.conn.commit()
 
@@ -1185,6 +1237,72 @@ class MemoryStorage:
         conn.execute("DROP TRIGGER IF EXISTS chunks_trigram_au")
         conn.execute("DROP TABLE IF EXISTS chunks_fts_trigram")
 
+    def _install_body_column_guard(self):
+        """Install the body-column guard and repair the trigger ORDER.
+
+        **P1 阶段三 N 后续二 (F-1).**  Two things happen here, and they
+        are deliberately in ONE place:
+
+        1. the guard is installed (and repaired if its bodies are stale);
+        2. the FTS sync triggers are put BEHIND the guard.
+
+        The second is not a repair of the install — it is a repair of a
+        property of the LIBRARY, and it must run on EVERY open, not only
+        on the open that re-installed the guard.
+
+        **Why "every open" and not "only on re-install" — MEASURED.**
+        ``is_installed`` compares the trigger BODIES by name and says
+        nothing about their POSITION.  So a library can have
+        byte-identical, current trigger bodies and still be in the
+        broken order — and the only thing that knows about the order is
+        this repair.  Measured (this round): after deliberately
+        re-creating the FTS triggers so they landed last,
+        ``is_installed`` still reported True while the order was broken,
+        and ``ensure_guard`` on that "present" path was the only thing
+        that restored it.  If the repair ran only on the re-install
+        path, a library whose order was broken by anything else would
+        stay broken — and the symptom is "the library writes fine, then
+        fails with *database disk image is malformed*".
+
+        So: the repair runs on BOTH paths, and it is idempotent and
+        cheap (it does nothing when the order is already right).
+        """
+        try:
+            from agent.memory.body_guard import install_guard as _install_body_guard
+
+            _install_body_guard(self.conn)
+        except Exception as e:
+            # Loud, not silent: a guard that cannot be installed is a
+            # guard that does not exist.
+            from common.log import logger
+            logger.error(
+                f"[MemoryStorage] Body-column guard could not be installed "
+                f"on {self.db_path}: {e}"
+            )
+            raise
+
+        # P1-阶段三 第六轮 (S3-I): keep the guard's triggers AHEAD of the
+        # FTS triggers.
+        #
+        # SQLite runs a table's triggers in ``sqlite_master`` rowid
+        # order, and a re-installed trigger lands at the END of it.  So
+        # when the guard is REPAIRED (its body changed — e.g. this round
+        # changed the rules), the drop-and-create moves it BEHIND the
+        # FTS triggers, and the order flips.
+        #
+        # The flipped order is not cosmetic: the guard's AFTER INSERT
+        # restore trigger updates the protected columns of the row the
+        # writer just inserted, and that update fires the FTS AFTER
+        # UPDATE trigger — whose 'delete' command reads the content
+        # table.  When the guard runs AFTER the FTS triggers, the row is
+        # already in the FTS index while the content table already holds
+        # the REPLACED row, the tokens disagree, and SQLite reports
+        # "database disk image is malformed".  Measured: with the guard
+        # ahead of the FTS triggers the legacy DELETE-then-INSERT shape
+        # passes; with it behind, it fails with exactly that error.
+        if self.fts5_available:
+            self._reorder_fts_triggers_behind_guard()
+
     def _reorder_fts_triggers_behind_guard(self):
         """Put the FTS sync triggers BEHIND the body-column guard.
 
@@ -1203,50 +1321,63 @@ class MemoryStorage:
         Measured: with the guard ahead of the FTS triggers the legacy
         DELETE-then-INSERT shape passes; with it behind, it fails.
 
-        The repair is to re-create the FTS triggers, which puts them at
-        the end of ``sqlite_master`` — behind the guard again.  It is
-        idempotent and cheap: the triggers are re-created from their
-        stored SQL, and the FTS index itself is untouched.
+        **P1 阶段三 N 后续二 (F-1): this method used to be a SECOND
+        COPY of the ordering rule, and the copy was wrong.**
+
+        The private copy listed only six guard trigger names — it was
+        missing ``chunks_body_keep_st_ai`` (added by S3-L) — and it
+        treated **everything else on the ``chunks`` table** as an FTS
+        trigger, including the index guard's ``chunks_guard_bi`` /
+        ``chunks_guard_bu``.  So it re-created
+        ``chunks_body_keep_st_ai`` as if it were an FTS trigger and put
+        it at the END of ``sqlite_master`` — BEHIND the FTS triggers.
+
+        MEASURED on 0.114's live library (after the fast-forward to
+        ``b09bba41``): every library reported the order broken, and the
+        trigger dump showed exactly one offender —
+
+            rowid=55..60  chunks_ai / chunks_ad / chunks_au (+ trigram)
+            rowid=63      chunks_body_keep_st_ai   ← BEHIND the FTS ones
+
+        while the other eight guard triggers sat at 47..54, correctly
+        ahead.  One trigger, one rule, and the private copy got it
+        wrong because it had its own list.
+
+        So the rule now lives in ONE place —
+        :func:`agent.memory.body_guard.reorder_fts_triggers_behind_guard`
+        — and this method only calls it.  Two copies of one rule is one
+        copy that will drift, and the copy that drifts is the one
+        nobody runs.
         """
-        try:
-            rows = self.conn.execute(
-                "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
-                "AND tbl_name='chunks' AND sql IS NOT NULL"
-            ).fetchall()
-        except sqlite3.Error:
-            return
-        guard_names = ("chunks_body_keep_bi", "chunks_body_keep_bu",
-                       "chunks_body_keep_bd", "chunks_body_keep_bi_ai",
-                       "files_body_keep_bu", "files_body_keep_bi")
-        fts_rows = [r for r in rows if r[0] not in guard_names]
-        if not fts_rows:
-            return
-        # Only act when the order is actually wrong: the guard's
-        # triggers must come FIRST.
-        order = [r[0] for r in rows]
-        first_guard = min((order.index(n) for n in guard_names
-                           if n in order), default=None)
-        first_fts = min((order.index(r[0]) for r in fts_rows), default=None)
-        if first_guard is None or first_fts is None:
-            return
-        if first_guard < first_fts:
-            return  # already in the right order
-        try:
-            for r in fts_rows:
-                self.conn.execute("DROP TRIGGER IF EXISTS %s" % r[0])
-            for r in fts_rows:
-                self.conn.execute(r[1])
-            self.conn.commit()
-        except sqlite3.Error:
+        from agent.memory.body_guard import reorder_fts_triggers_behind_guard
+
+        if not reorder_fts_triggers_behind_guard(self.conn):
+            # False means "nothing to do" (already in the right order)
+            # OR "could not repair it".  The caller cannot tell the two
+            # apart from here, so the WARNING is deliberately loud: the
+            # symptom of a broken order is a library that reads fine and
+            # then fails to write with 'database disk image is
+            # malformed'.
+            from agent.memory import body_guard as _bg
+            import sqlite3 as _sqlite3
+
             try:
-                self.conn.rollback()
-            except sqlite3.Error:
-                pass
-            from common.log import logger
-            logger.warning(
-                "[MemoryStorage] could not re-order the FTS triggers behind "
-                "the body-column guard; the legacy DELETE-then-INSERT shape "
-                "may report 'database disk image is malformed'")
+                rows = self.conn.execute(
+                    "SELECT name, rowid FROM sqlite_master "
+                    "WHERE type='trigger' ORDER BY rowid").fetchall()
+            except _sqlite3.Error:
+                return
+            names = set(_bg.guard_trigger_names())
+            guard_rows = [r for r in rows if r[0] in names]
+            fts_rows = [r for r in rows if r[0] in _bg.FTS_SYNC_TRIGGERS]
+            if guard_rows and fts_rows:
+                if max(r[1] for r in guard_rows) > min(r[1] for r in fts_rows):
+                    from common.log import logger
+                    logger.warning(
+                        "[MemoryStorage] could not re-order the FTS triggers "
+                        "behind the body-column guard; the legacy "
+                        "DELETE-then-INSERT shape may report 'database disk "
+                        "image is malformed'")
 
     @staticmethod
     def _create_trigram_objects(conn: sqlite3.Connection):
