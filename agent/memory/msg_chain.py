@@ -61,6 +61,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from agent.memory.naming import canonical_text  # noqa: F401  (imported, per C-2)
+from agent.memory import cred_mask
 
 
 # ---------------------------------------------------------------------------
@@ -318,13 +319,37 @@ def build_msg_line(*, seq: int, agent_id: str, session_id: str, role: str,
 
     ``extras`` is carried on the line (so nothing is lost) but is NOT
     part of the hash — see ``msg_line_hash``.
+
+    **The credential masking happens HERE, and it happens BEFORE the
+    hash is computed** (F-5 · C-1).
+
+    Why here and not somewhere else: this function is the ONLY place a
+    message line is BUILT (measured 2026-10-31: the two callers are
+    ``msg_migrate.append_rows_to_truth`` — the delete path's archive —
+    and ``msg_migrate.externalise_session`` — the stage-4 externalisation
+    — and ``append_msg_line`` has no production caller at all).  A
+    filter anywhere else would leave a path unmasked.
+
+    Why BEFORE the hash: ``msg_line_hash`` includes ``content`` in its
+    payload, so masking after the hash would make the stored hash
+    describe text that is no longer there — every read of that line
+    would raise ``ContentDriftError`` and MSG-INV-7 would go RED.
+    Masking first makes the hash and the text describe the same bytes,
+    so the chain stays self-consistent and the read path keeps working.
+
+    The masker is shape-based (``agent.memory.cred_mask``), not
+    value-based: it enumerates the credential FORMS (argv, quoted argv,
+    kv assignment, JSON field, URL userinfo, env assignment, export,
+    bare identifier assignment) including their DELIMITER forms, because
+    a rule that excludes the quote characters silently misses the
+    credential on the machine's own shape (``sshpass -p '<v>'``).
     """
     line: Dict[str, Any] = {
         "seq": int(seq),
         "agent_id": agent_id or "",
         "session_id": session_id,
         "role": role,
-        "content": content,
+        "content": cred_mask.mask_text(content) if content else content,
         "created_at": int(created_at),
         "run_id": run_id or "",
         "prev_hash": prev_hash,

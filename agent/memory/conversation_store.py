@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 from common.log import logger
 
 from agent.memory import msg_chain
+from agent.memory import cred_mask
 
 _CST = timezone(timedelta(hours=8))
 
@@ -324,6 +325,30 @@ def _msg_copy_exprs(conn: sqlite3.Connection) -> str:
         for col in ("content_path", "content_anchor", "content_hash",
                     "content_state", "extras_compensated")
     )
+
+
+def _msg_mask_expr() -> str:
+    """The SQL expression that masks a ``messages.content`` on the way in.
+
+    Masking is a Python-side shape matcher, so it is exposed to SQLite as
+    a REGISTERED FUNCTION (``cred_mask.mask_text``) rather than being
+    re-implemented in SQL — a second masker would be a second normaliser.
+
+    The function is registered by :func:`_register_mask_functions` on the
+    connection that runs the copy.  A connection without it raises at
+    prepare time ("no such function"), which is the right failure: a
+    silent unmasked import would be worse.
+    """
+    return "mask_cred(content)"
+
+
+def _register_mask_functions(conn: sqlite3.Connection) -> None:
+    """Register the credential-masking function on a connection.
+
+    ``deterministic=True`` lets SQLite cache the result per row.
+    """
+    conn.create_function("mask_cred", 1, cred_mask.mask_text,
+                         deterministic=True)
 
 
 def _is_visible_user_message(content: Any) -> bool:
@@ -1107,8 +1132,24 @@ class ConversationStore:
                     inserted = 0
                     for msg in messages:
                         role = msg.get("role", "")
+                        # **The credential masking happens at the DATABASE
+                        # throat too** (F-5 · C-1).
+                        #
+                        # Masking only in the export layer would leave the
+                        # `messages.content` projection holding the
+                        # credential, and the read path serves that
+                        # projection verbatim (an `inline` row is returned
+                        # as-is).  So the export filter alone would stop
+                        # the DISK copy while the credential kept flowing
+                        # through every live reader.
+                        #
+                        # The SAME implementation as the export layer's
+                        # (`agent.memory.cred_mask`) — two maskers would
+                        # be two normalisers, and two normalisers are how
+                        # the same text comes to mean two things.
                         content = json.dumps(
-                            msg.get("content", ""), ensure_ascii=False
+                            cred_mask.mask_content(msg.get("content", "")),
+                            ensure_ascii=False
                         )
                         extras_obj = msg.get("extras") or {}
                         extras = json.dumps(extras_obj, ensure_ascii=False) if extras_obj else ""
@@ -3812,6 +3853,9 @@ def _merge_secondary_agents() -> None:
 
 def _merge_one_agent(conn: sqlite3.Connection, src_path: str, agent_id: str) -> None:
     """Attach a source Agent DB and copy its conversation rows in, tagged."""
+    # The masking function must exist on THIS connection before the copy
+    # statement is prepared (F-5 · C-1).
+    _register_mask_functions(conn)
     conn.execute("ATTACH DATABASE ? AS src", (src_path,))
     try:
         src_tables = {
@@ -3858,14 +3902,19 @@ def _merge_one_agent(conn: sqlite3.Connection, src_path: str, agent_id: str) -> 
                 run_id = "COALESCE(run_id, '')" if "run_id" in message_cols else "''"
                 # id -> NULL so the global file re-issues AUTOINCREMENT ids and
                 # cross-file ids never collide; dedupe is on (agent_id, session_id, seq).
+                #
+                # The content is masked on the way in (F-5 · C-1): this is a
+                # WRITE path into ``messages.content``, so the same throat
+                # rule applies — a merged library must not import another
+                # library's credential.
                 conn.execute(
                     f"""
                     INSERT OR IGNORE INTO messages
                         (agent_id, session_id, seq, role, content, created_at, extras, run_id)
-                    SELECT ?, session_id, seq, role, content, created_at,
+                    SELECT ?, session_id, seq, role, {mask_expr}, created_at,
                            {extras}, {run_id}
                     FROM src.messages
-                    """,
+                    """.format(mask_expr=_msg_mask_expr()),
                     (agent_id,),
                 )
             if "runs" in src_tables:
