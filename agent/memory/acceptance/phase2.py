@@ -944,6 +944,23 @@ _S3M_CRITERIA = [
     ("M-6", "judge_m6_ledger_orphans_are_pruned_at_the_write_boundary"),
 ]
 
+# ---------------------------------------------------------------------------
+# P2-1 · the L2 persona layer.
+#
+# They live in their own module (``phase2_p2``) because they judge a
+# DIFFERENT subject: not a library's state, but the workspace's PERSONA
+# layer — whether the roles REFERENCE it or COPY it.  Folding them into
+# the S3-M group would hide the fact that they measure something else.
+#
+# The layer is judged over the SHARED ROOT (where ``persona/`` lives),
+# not over a library — so these criteria take a root, not a connection.
+_P2_CRITERIA = [
+    ("P2-1a", "judge_p2_1a_the_layer_exists"),
+    ("P2-2a", "judge_p2_2a_referring_not_copying"),
+    ("P2-2b", "judge_p2_2b_the_fingerprint_agrees_everywhere"),
+    ("P2-3a", "judge_p2_3a_the_layer_is_judgeable"),
+]
+
 # The criteria that GUARD the criteria (MU-12 / MU-14 / the replay).
 _GUARD_CRITERIA = [
     ("MU-12", "judge_mu12_three_states_are_real"),
@@ -1059,6 +1076,34 @@ def _load_s3r():
     return out
 
 
+def _load_p2():
+    """The P2-1 criteria (the L2 persona layer).
+
+    **They are skipped, not failed, when the module is unavailable** —
+    an absent criterion module is NOT a red: it means the layer's
+    criteria have not been written yet, and saying "the persona layer
+    is broken" would be a lie (it was never measured).
+    """
+    try:
+        from agent.memory.acceptance import phase2_p2 as mod
+    except Exception:
+        return []
+    ws = Path(resolve_workspace(ARGS.workspace)[0])
+    out = []
+    for cid, name in _P2_CRITERIA:
+        fn = getattr(mod, name, None)
+        if fn is None:
+            continue
+
+        def make(fn=fn, ws=ws):
+            def run(report):
+                return fn(report, ws)
+            return run
+
+        out.append((cid, make()))
+    return out
+
+
 def _load_s3m():
     """The S3-M criterion functions, bound to the workspace."""
     from agent.memory.acceptance import phase2_s3m
@@ -1147,6 +1192,14 @@ def main() -> int:
 
     # The S3-M criteria (the messages domain: MSG-INV-1..7) — 施工图 阶段 5.
     for group, fn in _load_s3m():
+        if ARGS.only and not group.startswith(ARGS.only):
+            continue
+        guarded(fn, report)
+
+    # The P2-1 criteria (the L2 persona layer) — judged over the
+    # SHARED ROOT.  The workspace is the shared root unless the caller
+    # says otherwise.
+    for group, fn in _load_p2():
         if ARGS.only and not group.startswith(ARGS.only):
             continue
         guarded(fn, report)
