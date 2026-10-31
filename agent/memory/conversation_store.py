@@ -3911,7 +3911,7 @@ def _merge_one_agent(conn: sqlite3.Connection, src_path: str, agent_id: str) -> 
                     f"""
                     INSERT OR IGNORE INTO messages
                         (agent_id, session_id, seq, role, content, created_at, extras, run_id)
-                    SELECT ?, session_id, seq, role, {mask_expr}, created_at,
+                    SELECT ?, session_id, seq, role, {{mask_expr}}, created_at,
                            {extras}, {run_id}
                     FROM src.messages
                     """.format(mask_expr=_msg_mask_expr()),

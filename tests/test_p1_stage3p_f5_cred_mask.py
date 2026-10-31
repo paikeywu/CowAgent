@@ -191,6 +191,65 @@ def test_f5_c2_database_throat_persists_no_credential_shape(tmp_path):
         assert SECRET not in content
 
 
+def test_f5_c2b_the_merge_does_not_import_a_credential(tmp_path):
+    """F5-C2b: the cross-library MERGE is a third write throat.
+
+    ``_merge_one_agent`` copies another Agent's ``messages`` rows into
+    this one.  A merged library must not import another library's
+    credential.
+
+    **This criterion exists because the merge path was BROKEN and only
+    running it found that.**  The masking is a registered SQLite
+    FUNCTION (``mask_cred``), and the statement that uses it is an
+    f-string — so the placeholder had to be escaped (``{{mask_expr}}``).
+    The first version raised ``NameError: name 'mask_expr' is not
+    defined`` at merge time, and the merge is a RARE path (it runs when
+    a secondary workspace is opened), so no other criterion touched it.
+
+    The lesson: a throat that is only exercised occasionally needs its
+    own criterion, or it stays broken until the next time it runs for
+    real.
+    """
+    import json as _json
+    import sqlite3 as _sqlite3
+
+    from agent.memory import conversation_store as cs
+
+    src = tmp_path / "src.db"
+    conn = _sqlite3.connect(str(src))
+    conn.execute(
+        "CREATE TABLE messages (id INTEGER PRIMARY KEY, agent_id TEXT, "
+        "session_id TEXT, seq INTEGER, role TEXT, content TEXT, "
+        "created_at INTEGER, extras TEXT, run_id TEXT)")
+    for i, text in enumerate(SAMPLES.values()):
+        conn.execute(
+            "INSERT INTO messages (agent_id, session_id, seq, role, content, "
+            "created_at, extras, run_id) VALUES (?,?,?,?,?,?,?,?)",
+            ("src-agent", "sess-src", i, "assistant",
+             _json.dumps({"text": text}), 1, "", "r"))
+    conn.commit()
+    conn.close()
+
+    from agent.memory.conversation_store import ConversationStore
+    dst = tmp_path / "dst.db"
+    store = ConversationStore(db_path=dst, agent_id="dst-agent")
+    dconn = _sqlite3.connect(str(dst))
+    dconn.row_factory = _sqlite3.Row
+    try:
+        cs._merge_one_agent(dconn, str(src), "src-agent")
+        rows = dconn.execute(
+            "SELECT content FROM messages WHERE agent_id = 'src-agent'"
+        ).fetchall()
+    finally:
+        dconn.close()
+
+    assert rows, "the merge copied no rows — the criterion measured nothing"
+    for r in rows:
+        forms = cred_mask.scan_forms(r["content"])
+        assert not forms, ("a merged row carries a credential shape: %r" % forms)
+        assert SECRET not in r["content"]
+
+
 def test_f5_c2_breaker_no_masking_in_the_database_throat(monkeypatch):
     """B2: with the masker disabled, F5-C2 must FAIL.
 
