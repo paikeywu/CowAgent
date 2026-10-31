@@ -1368,13 +1368,23 @@ def step_m7(workspace: Path, live: List[Dict[str, Any]], report: Report,
         errors = []
         if not dry_run:
             storage = MemoryStorage(db_path=str(db))
+            # ONE cache for the whole batch.  Without it every file paid
+            # for a full scan of the truth layer (resolve() +
+            # release_mismatches()), so rebuilding N files was O(N^2) in
+            # scans -- measured 300 files: 42.6s -> 4.8s with the cache
+            # (resolve() 300 -> 1).  The cache re-checks the truth layer's
+            # signature on every call, so an edit made during the batch is
+            # still picked up.
+            from agent.memory.release_state import ReleaseStateCache
+            release_cache = ReleaseStateCache(ws)
             try:
                 for rel in files:
                     truth_file = resolve_truth_file(ws, rel)
                     if truth_file is None:
                         continue
                     try:
-                        rebuild_file(storage, ws, truth_file)
+                        rebuild_file(storage, ws, truth_file,
+                                    release_state=release_cache)
                         rebuilt += 1
                     except Exception as e:
                         errors.append("%s: %s" % (rel, e))

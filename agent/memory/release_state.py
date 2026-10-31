@@ -426,23 +426,73 @@ class ReleaseStateCache:
     re-parsing every markdown file on every query would be a per-search
     cost, so the state is cached behind a cheap signature (file count +
     newest mtime of the truth layer and of the tombstone directory).
+
+    The cache also carries the front-matter/tombstone **mismatches**
+    (``get_with_mismatches``).  They come from the SAME truth layer as the
+    state, and the rebuilder needs BOTH: the flags decide what it writes,
+    the mismatches decide what it reports.  Before this, the rebuilder had
+    to call ``release_mismatches()`` itself -- a second full scan of the
+    truth layer -- so a cached state still cost a full scan per file, and
+    a batch rebuild was O(N^2) in scans.
+
+    Both are behind the SAME signature, so they can never disagree: the
+    state and the mismatch list always describe the same tree.
     """
 
     def __init__(self, workspace_root: Path | str) -> None:
         self.workspace_root = Path(workspace_root)
         self._state: ReleaseState = ReleaseState()
+        self._mismatches: List[str] = []
+        self._mismatch_signature: Tuple = ()
+
+    def _refresh(self, signature: Tuple) -> None:
+        """Re-derive the state AND the mismatches for one tree.
+
+        ONE place does the re-resolve, and BOTH values come from it.
+        That matters: an earlier version of this class had the resolve
+        logic in ``get()`` AND a second copy in ``get_with_mismatches()``.
+        A mutation applied to one copy left the other one intact, so the
+        invalidation could be broken in the path the rebuilder actually
+        uses while the other path still looked right.  Two copies of one
+        rule is how they drift apart.
+        """
+        state = resolve(self.workspace_root)
+        # resolve() computed its own signature; keep the one we compared
+        # against so the next call does not re-resolve on a stale value.
+        self._state = ReleaseState(
+            released_paths=state.released_paths,
+            sealed_paths=state.sealed_paths,
+            sealed_owner=state.sealed_owner,
+            released_fact_ids=state.released_fact_ids,
+            signature=signature,
+        )
+        mm = release_mismatches(self.workspace_root)
+        self._mismatches = list(mm.get("tombstone_only", ())) + \
+            list(mm.get("frontmatter_only", ()))
+        self._mismatch_signature = signature
 
     def get(self) -> ReleaseState:
         signature = tree_signature(self.workspace_root)
         if signature != self._state.signature:
-            state = resolve(self.workspace_root)
-            # resolve() computed its own signature; keep the one we compared
-            # against so the next call does not re-resolve on a stale value.
-            self._state = ReleaseState(
-                released_paths=state.released_paths,
-                sealed_paths=state.sealed_paths,
-                sealed_owner=state.sealed_owner,
-                released_fact_ids=state.released_fact_ids,
-                signature=signature,
-            )
+            self._refresh(signature)
         return self._state
+
+    def get_with_mismatches(self) -> Tuple[ReleaseState, List[str]]:
+        """``(state, mismatches)`` for the SAME tree -- one scan, not two.
+
+        The mismatch list is derived from the same truth layer as the
+        state, and both are refreshed together behind one signature check,
+        so a caller can never act on a state and mismatches that describe
+        different trees.
+        """
+        signature = tree_signature(self.workspace_root)
+        if signature != self._state.signature:
+            self._refresh(signature)
+        elif signature != self._mismatch_signature:
+            # The state was already cached but the mismatch list was not
+            # (e.g. a caller filled the state through another path).
+            mm = release_mismatches(self.workspace_root)
+            self._mismatches = list(mm.get("tombstone_only", ())) + \
+                list(mm.get("frontmatter_only", ()))
+            self._mismatch_signature = signature
+        return self._state, list(self._mismatches)

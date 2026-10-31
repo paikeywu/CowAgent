@@ -167,6 +167,19 @@ def rebuild_file(
 
     Returns a small dict describing what was written. Raises ``RebuildError``
     (or the underlying error) on failure, with the old projection untouched.
+
+    ``release_state`` — how the caller supplies the release flags:
+
+    * ``None`` (default) — this function resolves them itself, by scanning
+      the truth layer.  **That scan is O(the whole truth layer)**, so
+      calling this per file in a batch is O(N^2) in scans.
+    * a ``ReleaseStateCache`` — the flags come from the cache, which
+      re-checks the truth layer's signature on every call (so an edit made
+      mid-batch is still noticed) and re-scans only when the tree moved.
+      The cache also carries the front-matter/tombstone mismatches, so the
+      mismatch audit is written exactly as before.
+    * a bare ``ReleaseState`` — the flags are taken as-is.  There are no
+      mismatches to report in that case, so no mismatch audit is written.
     """
     workspace = Path(workspace_root)
     fp = Path(file_path)
@@ -212,6 +225,38 @@ def rebuild_file(
     mismatches: List[str] = []
     if release_state is None:
         release_state, mismatches = recompute_release_flags(workspace)
+    else:
+        # A caller that already holds the release state must NOT make this
+        # file pay for a fresh full scan of the truth layer.  That is what
+        # turned a batch rebuild into O(N^2): 300 files x (resolve() +
+        # release_mismatches()), each of which re-reads and re-parses every
+        # markdown file on disk.
+        #
+        # The state may come from a ``ReleaseStateCache`` (it then also
+        # carries the mismatches) or be a bare ``ReleaseState`` (then there
+        # are no mismatches to report -- and no mismatch audit is written,
+        # because there is nothing to report).
+        #
+        # Cached state is re-validated against the truth layer's signature
+        # on EVERY call, so a truth-layer edit in the middle of a batch is
+        # still noticed: the cache re-resolves itself.  A bare ReleaseState
+        # has no signature to check, so it is taken as-is (the caller owns
+        # its freshness).
+        getter = getattr(release_state, "get_with_mismatches", None)
+        if getter is not None:
+            release_state, mismatches = getter()
+        else:
+            # A bare ReleaseState: the flags are used, but there are no
+            # mismatches to report.  Say so OUT LOUD -- silently dropping
+            # the mismatch list would make the rebuild stop reporting a
+            # front-matter/tombstone disagreement, which is a silent loss
+            # of the audit trail rather than a visible one.
+            logger.warning(
+                "[rebuilder] release_state carries no mismatch list; the "
+                "release-mismatch audit will NOT be written for this "
+                "rebuild.  Pass a ReleaseStateCache instead if the audit "
+                "matters.")
+            mismatches = []
     element_released, file_sealed = release_state.flags_for(rel)
     sealed_owner = release_state.owner_for(rel) if file_sealed else None
 
