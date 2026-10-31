@@ -104,29 +104,183 @@ def _lower_thinking(params: dict) -> Optional[dict]:
     return dict(params, output_config=dict(output_config, effort=lower))
 
 
-def _abort_response(response) -> None:
-    """Unblock a reader stuck in recv() on this response's socket."""
+def _response_sock(response):
+    """The socket behind a streaming response, or None when it cannot be found.
+
+    The three accessors are tried in order because urllib3 has moved the
+    socket between releases: ``raw._fp.fp.raw._sock`` (the socket file
+    object), ``raw._connection.sock`` and ``raw.connection.sock`` (the
+    connection's own handle).
+    """
     raw = getattr(response, "raw", None)
-    getters = (
+    if raw is None:
+        return None
+    for get_sock in (
         lambda: raw._fp.fp.raw._sock,
         lambda: raw._connection.sock,
         lambda: raw.connection.sock,
-    )
-    for get_sock in getters:
+    ):
         try:
             sock = get_sock()
         except Exception:
             continue
         if sock is not None:
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            break
+            return sock
+    return None
+
+
+def _abort_response(response) -> None:
+    """Tell the peer the connection is over.  It does NOT close the response.
+
+    **Why this does NOT call ``response.close()`` (measured, 2026-10-31).**
+
+    The reader thread is blocked inside ``recv()`` while holding the
+    ``BufferedReader``'s internal lock, and ``response.close()`` needs that
+    SAME lock (``http.client.HTTPResponse.close`` -> ``_close_conn`` ->
+    ``fp.close()``).  So the watchdog thread blocked for as long as the peer
+    kept the connection open — measured 28.9 s and 38.8 s in two runs — and
+    the abort was useless.
+
+    ``socket.shutdown()`` does NOT wake a blocked reader on Windows
+    either (measured: the reader stayed blocked in all four shutdown
+    variants, and the socket-object close left it blocked too).  Only
+    closing the file descriptor wakes it, and that cannot be done from
+    another thread while the ``BufferedReader`` owns the socket.
+
+    So the abort is deliberately NOT a cross-thread ``close()``.  The read
+    side instead runs with a socket READ timeout (see
+    :func:`_stream_read_timeout`), which makes ``recv()`` return with a
+    timeout once the stream has been silent past the stall limit; the
+    reader — which owns the lock and is no longer blocked — then decides
+    the stream is stalled and ends it.  No lock fight, no unbounded hang.
+    """
+    sock = _response_sock(response)
+    if sock is None:
+        return
     try:
-        response.close()
-    except Exception:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
         pass
+
+
+def _stream_read_timeout() -> float:
+    """The socket READ timeout for a streaming request.
+
+    It must be LONGER than the stall limit, for one reason: the read
+    timeout is what finally ends a stalled stream, and a stream may
+    legitimately be quiet for up to the stall limit while the model thinks.
+    A read timeout shorter than the limit would destroy a healthy stream.
+
+    The margin over the limit also absorbs the watchdog's own check
+    interval (``min(5.0, limit / 3)``): by the time the read timeout
+    fires, the stream has been quiet for strictly more than the limit, so
+    "this is a stall" is a fact, not a guess.
+
+    This is the READ half only — see :func:`_stream_timeout`.
+    """
+    limit = STREAM_STALL_SECONDS
+    return max(1.0, float(limit) * 1.2)
+
+
+#: The CONNECT timeout for every Claude request (streaming or not).
+#:
+#: It is deliberately NOT derived from the stall limit: establishing the
+#: connection and reading the response are different failure modes.  A
+#: slow route to the API says nothing about how long the model may think
+#: once it is connected, and a stream that is legitimately quiet for the
+#: whole stall limit must not have its CONNECT budget cut down to match.
+#:
+#: Every request path in this module used to pass a single ``timeout=180``,
+#: which requests expands to ``(connect=180, read=180)``.  The streaming
+#: path now needs a LONGER read timeout than 180 (it is derived from the
+#: stall limit), so it passes a tuple.  The connect half must stay at 180
+#: in both paths — a single value there would silently tighten (or
+#: loosen) the connect budget as the stall limit changes.
+CONNECT_TIMEOUT = 180
+
+
+def _request_timeout() -> tuple:
+    """The ``(connect, read)`` timeout tuple for a NON-STREAMING request.
+
+    The original code passed a single ``timeout=180``, which ``requests``
+    expands into ``(connect=180, read=180)``.  Passing the explicit tuple
+    is the same thing, said out loud — and it means every request path in
+    this module states its connect budget the same way, so a reader (or a
+    criterion) never has to re-derive what a bare number expands to.
+    """
+    return (CONNECT_TIMEOUT, CONNECT_TIMEOUT)
+
+
+def _stream_timeout() -> tuple:
+    """The ``(connect, read)`` timeout tuple for a STREAMING request.
+
+    ``requests`` expands a single float into ``(connect=that, read=that)``,
+    so passing only the read timeout would ALSO shorten the connect
+    budget — from 180 s down to the stall-derived value — which is a
+    behaviour change nobody asked for and which makes the connect budget
+    drift whenever the stall limit changes.
+
+    Hence the explicit tuple: the CONNECT half stays at
+    :data:`CONNECT_TIMEOUT` (unchanged from the original single-value
+    call), and only the READ half follows the stall limit.
+    """
+    return (CONNECT_TIMEOUT, _stream_read_timeout())
+
+
+def _is_stalled(watchdog) -> bool:
+    """Has the stream been quiet for longer than the stall limit?
+
+    This is the DECISION, and it does not depend on the watchdog thread
+    having run: the reader asks it itself, at the moment the read timeout
+    ends the wait.  Asking the watchdog's flag alone would be a race —
+    the watchdog only checks every ``min(5.0, limit / 3)`` seconds, so it
+    may not have tripped yet even though the stream is plainly stalled.
+    """
+    if watchdog is None:
+        return False
+    if watchdog.tripped:
+        return True
+    return watchdog.idle_seconds() > watchdog.limit
+
+
+def _iter_lines_or_stall(response, watchdog):
+    """Yield the response's lines, and END the stream when it stalls.
+
+    **Why this wrapper exists (measured, 2026-10-31).**
+
+    The read side used to be a plain ``response.iter_lines()``.  When the
+    peer went silent, the reader sat inside ``recv()`` holding the
+    ``BufferedReader``'s lock, and the watchdog thread — whose abort
+    called ``response.close()`` — blocked on that SAME lock until the peer
+    gave up (measured 28.9 s and 38.8 s).  The abort was therefore
+    useless, and the stream only ended when the peer happened to close
+    the connection: an unbounded hang.
+
+    The fix gives the socket a READ timeout that is LONGER than the stall
+    limit (see :func:`_stream_read_timeout`).  So when the read times
+    out, the stream has been quiet for strictly more than the limit — the
+    stall is a FACT, not a guess — and this thread, which owns the read
+    lock and is NOT blocked any more, decides it and ends the stream.
+
+    ``requests`` maps urllib3's ``ReadTimeoutError`` onto
+    ``requests.ConnectionError``, so the timeout arrives here as a
+    ``RequestException``.
+    """
+    try:
+        for line in response.iter_lines():
+            yield line
+    except requests.exceptions.RequestException:
+        if not _is_stalled(watchdog):
+            raise
+        # The stream is stalled and we are the thread that owns the read
+        # side, so we can end it here — no cross-thread close(), no lock
+        # fight.  The caller sees a stall, exactly as before.
+        logger.warning(
+            "[Claude] Stream read timed out after %.1fs of silence "
+            "(stall limit %.1fs); ending the stream",
+            watchdog.idle_seconds(), watchdog.limit)
+        watchdog.tripped = True
+        return
 
 
 class _StallWatchdog:
@@ -143,6 +297,10 @@ class _StallWatchdog:
 
     def beat(self) -> None:
         self._last = time.monotonic()
+
+    def idle_seconds(self) -> float:
+        """How long the stream has been quiet."""
+        return time.monotonic() - self._last
 
     def stop(self) -> None:
         self._stop.set()
@@ -255,7 +413,7 @@ class ClaudeAPIBot(Bot, OpenAIImage):
                 headers=headers,
                 json=data,
                 proxies=proxies,
-                timeout=180
+                timeout=_request_timeout()
             )
 
             if response.status_code != 200:
@@ -444,7 +602,8 @@ class ClaudeAPIBot(Bot, OpenAIImage):
             }
             proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
             resp = requests.post(f"{self.api_base}/messages",
-                                 headers=headers, json=data, proxies=proxies, timeout=180)
+                                 headers=headers, json=data, proxies=proxies,
+                                 timeout=_request_timeout())
 
             if resp.status_code != 200:
                 return {"error": True, "message": f"HTTP {resp.status_code}: {resp.text[:300]}"}
@@ -695,7 +854,7 @@ class ClaudeAPIBot(Bot, OpenAIImage):
             headers=headers,
             json=request_params,
             proxies=proxies,
-            timeout=180
+            timeout=_request_timeout()
         )
 
         if response.status_code != 200:
@@ -810,13 +969,21 @@ class ClaudeAPIBot(Bot, OpenAIImage):
         try:
             # Make streaming HTTP request
             proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
+            # The socket READ timeout is what finally ends a stalled stream.
+            # It is LONGER than the stall limit on purpose: a stream may be
+            # quiet for up to the limit while the model thinks, and a read
+            # timeout shorter than that would destroy a healthy stream.
+            #
+            # The CONNECT half stays at CONNECT_TIMEOUT: a slow route to
+            # the API must not be cut down to the stall-derived read budget.
+            timeout = _stream_timeout()
             response = requests.post(
                 f"{self.api_base}/messages",
                 headers=headers,
                 json=request_params,
                 proxies=proxies,
                 stream=True,
-                timeout=180
+                timeout=timeout
             )
 
             if response.status_code == 400 and EAGER_INPUT_STREAMING in response.text:
@@ -832,7 +999,7 @@ class ClaudeAPIBot(Bot, OpenAIImage):
                     json=request_params,
                     proxies=proxies,
                     stream=True,
-                    timeout=180
+                    timeout=timeout
                 )
 
             if response.status_code != 200:
@@ -852,7 +1019,7 @@ class ClaudeAPIBot(Bot, OpenAIImage):
 
             # Process streaming response
             watchdog = _StallWatchdog(response)
-            for line in response.iter_lines():
+            for line in _iter_lines_or_stall(response, watchdog):
                 if line:
                     line = line.decode('utf-8')
                     if line.startswith('data: '):
