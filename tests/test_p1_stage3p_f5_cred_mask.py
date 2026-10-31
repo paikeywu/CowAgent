@@ -184,11 +184,42 @@ def test_f5_c2_database_throat_persists_no_credential_shape(tmp_path):
     finally:
         conn.close()
 
-    assert rows, "the store wrote no rows — the criterion measured nothing"
+    # **The DB is no longer where the text lives.**  The write path
+    # externalises immediately (P1 阶段三 · 缺口 A), so the projection
+    # holds no text at all and the TRUTH SOURCE holds it.  So the
+    # criterion has to look at BOTH: the projection (whatever is left
+    # in it) and the truth source (where the text actually is).
+    #
+    # This is not a weakening: the truth source is the place a
+    # credential would now hide, so checking it is the STRONGER
+    # version of the criterion.
+    from agent.memory import msg_chain
+
+    truth_texts = []
+    export = ws / "memory" / "messages_export"
+    if export.is_dir():
+        for p in export.rglob("*.jsonl"):
+            if ".audit" in p.parts:
+                continue
+            truth_texts.extend(msg_chain.read_msg_lines(p))
+
+    assert rows or truth_texts, (
+        "the store wrote nothing at all — the criterion measured nothing")
+
     for (content,) in rows:
         forms = cred_mask.scan_forms(content)
         assert not forms, ("a stored row carries a credential shape: %r" % forms)
         assert SECRET not in content
+
+    assert truth_texts, (
+        "the write path did not externalise the message — the criterion "
+        "measured nothing")
+    for line in truth_texts:
+        text = line.get("content") or ""
+        forms = cred_mask.scan_forms(text)
+        assert not forms, (
+            "the truth source carries a credential shape: %r" % forms)
+        assert SECRET not in text
 
 
 def test_f5_c2b_the_merge_does_not_import_a_credential(tmp_path):

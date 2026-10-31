@@ -20,6 +20,7 @@ index has been populated by a different-dim model.
 
 from __future__ import annotations
 import asyncio
+import sqlite3
 import sys
 from dataclasses import dataclass
 from typing import Optional
@@ -63,9 +64,43 @@ def clear_index(db_path, storage=None) -> int:
     try:
         with storage._lock:
             before = storage.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-            storage.conn.execute("DELETE FROM chunks")
-            storage.conn.execute("DELETE FROM files")
-            storage.conn.commit()
+            # **The certification ledger must be pruned WITH the chunks.**
+            #
+            # This path deletes EVERY chunk row, and it did NOT touch the
+            # ledger — so after a rebuild the ledger held a witness for
+            # every row that no longer existed.  That is the orphan
+            # definition (``ledger_orphans.orphan_ledger_entries``: a
+            # ledger row whose id is not in ``chunks``), and M6f calls it
+            # a FAIL.  It is the same hole the two write paths close
+            # (``MemoryStorage.replace_file_chunks`` and
+            # ``MemoryStorage.delete_by_path`` prune in the SAME
+            # transaction — P1 阶段三 N, 任务二); this path was simply
+            # never added to the list.
+            #
+            # The prune is in the SAME transaction as the delete, for the
+            # same reason: a ledger entry that names a chunk which is
+            # still there is a witness; one that names a chunk that is
+            # gone is noise, and the window between the delete and the
+            # prune is exactly the window in which a reader would see
+            # it.
+            storage.conn.execute("BEGIN IMMEDIATE")
+            try:
+                storage.conn.execute("DELETE FROM chunks")
+                storage.conn.execute("DELETE FROM files")
+                # The ledger is a witness over the chunks — when the
+                # chunks are gone, every witness is an orphan by
+                # definition.  (Deleting a ledger row revokes a
+                # CERTIFICATION; it does not delete data — the ledger
+                # is a derived witness, not a copy.)
+                try:
+                    storage.conn.execute("DELETE FROM cert_ledger")
+                except sqlite3.Error:
+                    # A library that was never certified has no ledger.
+                    pass
+                storage.conn.commit()
+            except Exception:
+                storage.conn.rollback()
+                raise
             storage.reset_fts5()
     finally:
         if owns_storage:

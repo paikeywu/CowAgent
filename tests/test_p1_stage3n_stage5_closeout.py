@@ -48,11 +48,20 @@ from agent.memory.storage import MemoryChunk, MemoryStorage  # noqa: E402
 # ---------------------------------------------------------------------------
 
 def _workspace(tmp_path):
-    """A workspace with ONE index and a two-turn conversation."""
+    """A workspace with ONE index and a two-turn conversation.
+
+    **The rows stay INLINE on purpose.**  This file is about the BATCH
+    externalisation (``msg_migrate``) and about what the criteria say
+    about a library that was never externalised — so the fixture must
+    start in that state.  The write path now externalises by default
+    (P1 阶段三 · 缺口 A: the externalisation is an invariant of the
+    write, not a one-shot action), so the fixture says so explicitly
+    instead of relying on the old default.
+    """
     ws = tmp_path / "ws"
     (ws / "memory" / "long-term").mkdir(parents=True)
     db = ws / "memory" / "long-term" / "index.db"
-    store = ConversationStore(db, agent_id="")
+    store = ConversationStore(db, agent_id="", externalise=False)
     store.append_messages("s1", [
         {"role": "user", "content": "第一问"},
         {"role": "assistant", "content": "第一答"},

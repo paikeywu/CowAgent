@@ -33,11 +33,20 @@ from agent.memory.conversation_store import ConversationStore
 # ---------------------------------------------------------------------------
 
 def _workspace(tmp_path):
-    """A workspace with ONE index and a two-turn conversation."""
+    """A workspace with ONE index and a two-turn conversation.
+
+    **The rows stay INLINE on purpose.**  This file is about the BATCH
+    externalisation (``msg_migrate``) and about what the criteria say
+    about a library that was never externalised — so the fixture must
+    start in that state.  The write path now externalises by default
+    (P1 阶段三 · 缺口 A: the externalisation is an invariant of the
+    write, not a one-shot action), so the fixture says so explicitly
+    instead of relying on the old default.
+    """
     ws = tmp_path / "ws"
     (ws / "memory" / "long-term").mkdir(parents=True)
     db = ws / "memory" / "long-term" / "index.db"
-    store = ConversationStore(db, agent_id="")
+    store = ConversationStore(db, agent_id="", externalise=False)
     store.append_messages("s1", [
         {"role": "user", "content": "第一问"},
         {"role": "assistant", "content": "第一答"},
@@ -849,8 +858,8 @@ def test_two_agents_sharing_a_session_id_get_two_files(tmp_path):
     (ws / "memory" / "long-term").mkdir(parents=True)
     db = ws / "memory" / "long-term" / "index.db"
 
-    a = ConversationStore(db, agent_id="alpha")
-    b = ConversationStore(db, agent_id="beta")
+    a = ConversationStore(db, agent_id="alpha", externalise=False)
+    b = ConversationStore(db, agent_id="beta", externalise=False)
     a.append_messages("shared", [{"role": "user", "content": "A 的问题"}],
                       channel_type="agent")
     b.append_messages("shared", [{"role": "user", "content": "B 的问题"}],

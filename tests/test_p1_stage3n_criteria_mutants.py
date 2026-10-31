@@ -118,13 +118,19 @@ def _workspace_with_messages(tmp_path: Path) -> Path:
 
 def _un_externalised_workspace(tmp_path: Path) -> Path:
     """A workspace with a library that has a ``messages`` table but NO
-    externalised truth tree — the shape 判据自身的判据 A/B is about."""
+    externalised truth tree — the shape 判据自身的判据 A/B is about.
+
+    **The rows stay INLINE on purpose.**  The write path now
+    externalises by default (P1 阶段三 · 缺口 A: the externalisation is
+    an invariant of the write, not a one-shot action), so a fixture
+    that is ABOUT the un-externalised state has to say so explicitly.
+    """
     from agent.memory.conversation_store import ConversationStore
 
     ws = tmp_path / "ws"
     (ws / "memory" / "long-term").mkdir(parents=True)
     db = ws / "memory" / "long-term" / "index.db"
-    store = ConversationStore(db, agent_id="")
+    store = ConversationStore(db, agent_id="", externalise=False)
     store.append_messages("s1", [
         {"role": "user", "content": "第一问"},
         {"role": "assistant", "content": "第一答"},

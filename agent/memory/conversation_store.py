@@ -755,7 +755,8 @@ class ConversationStore:
         msgs = store.load_messages("user_123", max_turns=30)
     """
 
-    def __init__(self, db_path: Path, agent_id: str = ""):
+    def __init__(self, db_path: Path, agent_id: str = "",
+                 externalise: bool = True):
         self._db_path = db_path
         # The Agent every row read/written through this handle belongs to. The
         # default Agent keeps ``""`` so a single-Agent install never backfills a
@@ -763,6 +764,21 @@ class ConversationStore:
         # its own id. All queries are scoped by this so one global file can hold
         # every Agent's transcripts without one Agent seeing another's.
         self._agent_id = agent_id or ""
+        # **Whether a message written through this handle is moved OUT of the
+        # database immediately (P1 阶段三 · 缺口 A).**
+        #
+        # The default is True: the externalisation is an INVARIANT of the
+        # write, not an occasional action — measured on the live ROOT
+        # library (2026-11-01 03:00): 39,511 message rows, 7,061 of them
+        # inline, and the number GREW while the gap was being discussed,
+        # because the externalisation was a one-shot batch tool.
+        #
+        # It is a switch because a store that has no truth layer to write
+        # to (see ``_truth_layer_is_placed``) must keep its rows inline,
+        # and because a caller that wants the rows to STAY in the database
+        # — a bulk import, a fixture that is about the pre-externalisation
+        # state — needs to say so rather than have it undone afterwards.
+        self._externalise = bool(externalise)
         self._lock = threading.RLock()  # Use RLock to allow reentrant locking
         self._schema_identity: tuple = ()
         # True once the runs table is confirmed present. When it is not, run
@@ -896,6 +912,107 @@ class ConversationStore:
             return self._db_path.resolve().parents[2]
         except Exception:
             return Path(self._db_path).parent.parent.parent
+
+    def _truth_layer_is_placed(self) -> bool:
+        """Whether this store's truth layer has a well-defined location.
+
+        **Why this question exists.**  The truth source lives at
+        ``<workspace>/memory/messages_export`` and the store's index at
+        ``<workspace>/memory/long-term/index.db`` — so the workspace is
+        the DB path's grandparent (``_workspace_root``).  That is the
+        product's layout, and it is the ONLY layout the product uses.
+
+        A store whose index sits somewhere else (``/tmp/x/index.db``,
+        say) has a grandparent that is NOT a workspace: it may be
+        ``C:/Users/<user>/AppData/Local``, and writing the truth source
+        there would put it in a place shared by every process on the
+        machine — and the file name is derived from the session id, so
+        two unrelated stores would write the SAME file and the second
+        one would read the first one's lines.  (Measured 2026-11-01:
+        the tests that use a bespoke layout wrote their truth source
+        into ``AppData/Local/memory/messages_export/`` and the file
+        accumulated across runs, which produced a real
+        ``ContentDriftError``.)
+
+        So: **a store outside the product's layout keeps its rows
+        inline** — which is the honest state (the text is in the
+        database, and the database is where the reader will find it).
+        The product's own store always has the truth layer in place, so
+        the invariant holds where it matters.
+        """
+        try:
+            p = self._db_path
+        except Exception:
+            return False
+        parent = p.parent
+        return (parent.name == "long-term"
+                and parent.parent.name == "memory")
+
+    def _externalise_after_commit(self, conn, session_id: str,
+                                  seqs: List[int]) -> Dict[str, Any]:
+        """Move the rows just written OUT of the database, right now.
+
+        **Why the write path does this at all (P1 阶段三 · 缺口 A).**
+        The externalisation used to be a ONE-SHOT MIGRATION: the text
+        left the ``messages`` table when ``msg_migrate`` was run, and
+        every message written afterwards landed back in the table as
+        ``inline``.  Measured on the live ROOT library (2026-11-01
+        03:00): 39,511 message rows, **7,061 of them inline** — and the
+        number GREW while the gap was being discussed, because the
+        migration is not part of the product.
+
+        So the externalisation is made an **invariant of the write**:
+        after the commit, the rows this call wrote are moved into the
+        session's append-only JSONL immediately.
+
+        **Why this runs AFTER the commit, and not inside the
+        transaction.**  The JSONL write is not transactional: a
+        rollback would not undo it.  A file write inside the
+        transaction would therefore leave "the file has it, the DB does
+        not" behind a rollback — and that is MSG-INV-5 RED (the main
+        chain holds more message lines than the DB has externalised
+        rows).  The order is: commit the rows → write the file →
+        verify → anchor → point the rows at the file.
+
+        **Why it still runs inside ``self._lock``.**  The same
+        session's JSONL appends must be serialised (the chain's
+        ``prev_hash`` continues from the file's last line, so two
+        concurrent writers would each compute a different predecessor
+        and break the chain — MSG-INV-1 RED).
+
+        **What it does when the truth source cannot be written.**  The
+        rows are already committed, so they cannot be un-written; they
+        are left ``inline`` (they still hold their text, so the reader
+        still works) and the failure is REPORTED, never swallowed.  A
+        write that silently did not externalise is exactly the silent
+        failure this whole change exists to prevent.
+        """
+        from agent.memory import msg_write_ext
+
+        if not self._externalise:
+            # The caller asked for the rows to stay in the database.
+            return {"skipped": "disabled", "requested": len(seqs)}
+
+        if not self._truth_layer_is_placed():
+            # No truth layer to write to — see the method's docstring.
+            # The rows keep their text (state 'inline'), which is the
+            # honest state for a store whose truth layer has no
+            # location.
+            return {"skipped": "no-truth-layer", "requested": len(seqs)}
+
+        try:
+            report = msg_write_ext.externalise_messages(
+                conn, self._workspace_root(), self._agent_id,
+                session_id, seqs)
+        except msg_write_ext.WriteExternalisationError:
+            # The rows keep their text and stay ``inline``: the truth
+            # source could not be written, and the honest state of a
+            # row whose text is still in the database IS ``inline``.
+            # Swallowing this would make the loss invisible.
+            raise
+        except Exception:
+            raise
+        return report
 
     def _backfill_content(self, raw_content: Optional[str], rest: tuple,
                           reader) -> str:
@@ -1130,6 +1247,7 @@ class ConversationStore:
                         next_seq = max(next_seq, boundary[0])
 
                     inserted = 0
+                    inserted_seqs: List[int] = []
                     for msg in messages:
                         role = msg.get("role", "")
                         # **The credential masking happens at the DATABASE
@@ -1163,6 +1281,8 @@ class ConversationStore:
                             (aid, session_id, next_seq, role, content, now, extras, msg_run_id),
                         )
                         inserted += max(cur.rowcount, 0)
+                        if max(cur.rowcount, 0) > 0:
+                            inserted_seqs.append(next_seq)
                         next_seq += 1
 
                     # Incremental on purpose: on databases upgraded in place the
@@ -1188,7 +1308,18 @@ class ConversationStore:
                                         (title, aid, session_id),
                                     )
                                     break
-                    return True
+                # ---- the transaction is COMMITTED here ------------------
+                # The externalisation runs AFTER the commit, and still
+                # inside ``self._lock`` (R8: the same session's JSONL
+                # appends must be serialised).  It must NOT be inside
+                # the transaction: the JSONL write is not transactional
+                # — a rollback would not undo it, and a rolled-back
+                # transaction that had already written the file would
+                # leave "the file has it, the DB does not" (MSG-INV-5
+                # RED).  See ``agent.memory.msg_write_ext``.
+                if inserted_seqs:
+                    self._externalise_after_commit(conn, session_id, inserted_seqs)
+                return True
             finally:
                 conn.close()
 
