@@ -826,7 +826,7 @@ def test_muT13_removing_the_baseline_must_be_red(tmp_path):
     finally:
         phase2_s3y.compare_against_certified_baseline = original
 
-    assert states.get("ANCHOR-B(REAL)") == STATE_FAIL, (
+    assert states.get("ANCHOR(REAL)") == STATE_FAIL, (
         "去掉基准 ⇒ 拿失效的期望值去比 ⇒ 判红（而不是永远绿）\n" + printed)
     assert "文件已变(NOTRUN)=0" in printed, (
         "去掉基准后不应再有任何行被降级为「文件已变」\n" + printed)
@@ -835,7 +835,7 @@ def test_muT13_removing_the_baseline_must_be_red(tmp_path):
     # --- and the restore must go back to NOTRUN ---
     report, states, printed = _run(
         phase2_s3y.judge_anchor_tilde_n_uses_the_certified_baseline, ws)
-    assert states.get("ANCHOR-B(REAL)") == STATE_NOTRUN, (
+    assert states.get("ANCHOR(REAL)") == STATE_NOTRUN, (
         "还原基准 ⇒ 文件已变 ⇒ NOTRUN（不是 FAIL，也不是绿）\n" + printed)
     assert "「文件已变」名单" in printed, printed
 
@@ -870,7 +870,7 @@ def test_muT14_the_syntax_check_must_survive_the_degradation(tmp_path):
     report, states, printed = _run(
         phase2_s3y.judge_anchor_tilde_n_uses_the_certified_baseline, ws)
 
-    assert states.get("ANCHOR-B(REAL)") == STATE_FAIL, (
+    assert states.get("ANCHOR(REAL)") == STATE_FAIL, (
         "语法坏（即使文件已变）⇒ 必须仍然是 FAIL —— 降级的是**期望值来源**，"
         "不是检查的存在性\n" + printed)
     assert "语法/跨度坏(FAIL)=1" in printed, printed
@@ -905,7 +905,7 @@ def test_muT15_a_broken_anchor_must_still_be_red_with_an_unchanged_file(
     report, states, printed = _run(
         phase2_s3y.judge_anchor_tilde_n_uses_the_certified_baseline, ws)
 
-    assert states.get("ANCHOR-B(REAL)") == STATE_FAIL, (
+    assert states.get("ANCHOR(REAL)") == STATE_FAIL, (
         "文件未变而 ~N 不符 ⇒ 真坏的锚点 ⇒ 必须红\n" + printed)
     assert "~N 不符(FAIL)=1" in printed, printed
 
@@ -932,6 +932,6 @@ def test_muT16_the_unchanged_file_must_pass(tmp_path):
     report, states, printed = _run(
         phase2_s3y.judge_anchor_tilde_n_uses_the_certified_baseline, ws)
 
-    assert states.get("ANCHOR-B(REAL)") == STATE_PASS, (
+    assert states.get("ANCHOR(REAL)") == STATE_PASS, (
         "文件未变且 ~N 相符 ⇒ 必须绿（否则判据对一切都是红）\n" + printed)
     assert "实测通过=1" in printed, printed

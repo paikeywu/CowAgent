@@ -263,7 +263,7 @@ def judge_anchor_tilde_n_uses_the_certified_baseline(report: Report,
     libs = enumerate_live(workspace)
     if not libs:
         return report.judge_notrun(
-            "ANCHOR-B(REAL)", ANCHOR_BASELINE_NAME,
+            "ANCHOR(REAL)", ANCHOR_BASELINE_NAME,
             "没有活库 —— 不可判定，不是通过。")
 
     total_rows = 0
@@ -394,14 +394,14 @@ def judge_anchor_tilde_n_uses_the_certified_baseline(report: Report,
 
     if total_rows == 0:
         return report.judge_notrun(
-            "ANCHOR-B(REAL)", ANCHOR_BASELINE_NAME,
+            "ANCHOR(REAL)", ANCHOR_BASELINE_NAME,
             "\n".join(detail) + "\n没有带指针的行 —— 不可判定，不是通过。")
 
     if syntax_bad or span_bad or measured_bad:
         detail.append("")
         detail.append("  —— FAIL 的库: %s" % (", ".join(red_libraries) or "（无）"))
         return report.judge(
-            "ANCHOR-B(REAL)", ANCHOR_BASELINE_NAME,
+            "ANCHOR(REAL)", ANCHOR_BASELINE_NAME,
             False, "\n".join(detail))
 
     # --- the whole-criterion state ---
@@ -419,8 +419,8 @@ def judge_anchor_tilde_n_uses_the_certified_baseline(report: Report,
         detail.append("     真因是**投影陈旧**（DR-6 报），不是锚点坏了；"
                       "重新切块后本判据会自动回到 GREEN。")
         return report.judge_notrun(
-            "ANCHOR-B(REAL)", ANCHOR_BASELINE_NAME, "\n".join(detail))
+            "ANCHOR(REAL)", ANCHOR_BASELINE_NAME, "\n".join(detail))
 
     return report.judge(
-        "ANCHOR-B(REAL)", ANCHOR_BASELINE_NAME,
+        "ANCHOR(REAL)", ANCHOR_BASELINE_NAME,
         True, "\n".join(detail))
