@@ -205,11 +205,24 @@ def _probe_reconciliation(ws: Path, cands: List[Tuple[str, Path]]) -> Dict[str, 
     Returns::
 
         {"events": {rel: witness}, "second_pass_added": int,
-         "mtime_advanced": bool, "unclosed": [rel, ...]}
+         "mtime_advanced": bool,
+         "unclosable": {rel: reason},   # WHY it could not be closed
+         "error": None}
+
+    **The reason matters.**  "This one cannot be closed" is only useful if
+    the report says **why** — SEED's requirement (2026-11-01): the
+    criterion must be able to say *"this one cannot be closed, because
+    X"*.  So each unclosable path carries one of:
+
+      * ``NO_EVENT``   — the reconciliation produced **no event** for it
+        (the path is outside the candidate set, or it was skipped);
+      * ``EMPTY_WITNESS`` — it produced an event but **no witness**;
+      * ``WITNESS_MISMATCH`` — it produced a witness that does **not**
+        reproduce the current content.
     """
     out: Dict[str, Any] = {"events": {}, "second_pass_added": 0,
-                           "mtime_advanced": False, "unclosed": [],
-                           "error": None}
+                           "mtime_advanced": False, "unclosable": {},
+                           "post_witness": {}, "error": None}
     try:
         from agent.memory import external_edit, changes
     except Exception as e:  # pragma: no cover
@@ -246,37 +259,205 @@ def _probe_reconciliation(ws: Path, cands: List[Tuple[str, Path]]) -> Dict[str, 
             out["second_pass_added"] = len(second) - len(after_events)
             mtime_third = changes.latest_change_mtime(tmp)
             out["mtime_advanced"] = (mtime_after != mtime_third)
-            # Which paths could NOT be closed by the mechanism?
+            # Which paths could NOT be closed by the mechanism — and WHY.
+            #
+            # **The evidence is returned too.**  The criterion must not
+            # take the probe's WORD for it: the probe's verdict is
+            # checked against the copy log's final state by the judge
+            # (the cross-check).  A probe that claims "closable" while
+            # the copy log holds no witness is LYING, and a criterion
+            # that believes such a probe is exactly the "假守护者"
+            # this suite exists to kill.
+            final_last = _last_event_per_path(changes.read_changes(tmp))
+            out["post_witness"] = {
+                rel: (ev.get(WITNESS_KEY) or "")
+                for rel, ev in final_last.items()}
             for rel, real in cands:
                 H = _canon_hash(Path(real))
                 if not H:
+                    out["unclosable"][rel] = (
+                        "UNREADABLE", "文件读不到（算不出内容见证）")
                     continue
                 w = out["events"].get(rel)
                 if w is None:
-                    prior = _last_event_per_path(changes.read_changes(tmp)).get(rel)
+                    prior = final_last.get(rel)
                     pw = (prior or {}).get(WITNESS_KEY)
                     if pw == H:
                         continue          # already witnessed
-                    out["unclosed"].append(rel)
+                    if prior is None:
+                        out["unclosable"][rel] = (
+                            "NO_EVENT",
+                            "对账没有为这个路径产生任何事件"
+                            "（路径不在候选集内，或被跳过）")
+                    else:
+                        out["unclosable"][rel] = (
+                            "EMPTY_WITNESS",
+                            "对账产生了事件但见证为空（见证没写进去）")
                 elif w != H:
-                    out["unclosed"].append(rel)
+                    out["unclosable"][rel] = (
+                        "WITNESS_MISMATCH",
+                        "对账产生的见证复现不出当前内容"
+                        "（见证与内容不一致）")
         except Exception as e:
             out["error"] = "%s: %s" % (type(e).__name__, e)
     return out
 
 
+# ---------------------------------------------------------------------------
+# EE-1 · the truth layer's KNOWLEDGE part (the 2026-11-01 ruling)
+# ---------------------------------------------------------------------------
+
+def _index_knowledge_files(ws: Path, lib) -> List[Tuple[str, Path]]:
+    """The knowledge-layer truth files **this** workspace's index points at.
+
+    **Why this exists (SEED's ruling, 2026-11-01).**  The criterion
+    borrowed ``external_edit.truth_files`` verbatim, and that set does
+    **not** list ``knowledge/``.  Measured on the live workspace:
+
+      * ``truth_files(ROOT)`` = **87** entries, of which **0** are
+        ``knowledge/``;
+      * but the INDEX points at knowledge files — **2794 chunk rows**
+        across the 16 libraries, **all 2794 resolvable** to a real file;
+      * and the ROOT's change log carries **1018** ``knowledge/`` events,
+        **119** of them with a content witness;
+      * and the shared tree physically holds **121** markdown files.
+
+    ⇒ ``knowledge/`` IS the truth layer by every operational measure, and
+    a criterion that borrowed the borrowed set was watching **87 of ~206**
+    truth files — **the largest truth layer was invisible to the very
+    criterion that exists to watch it**.
+
+    **Ownership is by WHERE THE FILE LIVES, not by who points at it.**
+    The shared ``knowledge/`` tree is the ROOT's tree ⇒ it belongs to the
+    ROOT's log.  An agent workspace does **not** re-measure it (that would
+    count one debt twice).  An agent that keeps a **private** ``knowledge/``
+    copy keeps those files in its own log.
+
+    **The set is derived from the INDEX, never from a hard-coded path
+    list** — the same rule the writer uses (portable, no machine paths).
+    """
+    out: List[Tuple[str, Path]] = []
+    if lib is None:
+        return out
+    try:
+        from agent.memory.acceptance.live_libs import open_ro
+        conn = open_ro(lib.db)
+    except Exception:
+        return out
+    try:
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(chunks)").fetchall()}
+        if "body_path" not in cols:
+            return out
+        rows = conn.execute(
+            "SELECT DISTINCT body_path FROM chunks "
+            "WHERE body_path IS NOT NULL AND body_path LIKE 'knowledge/%'"
+        ).fetchall()
+    except Exception:
+        return out
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    from agent.memory.body_pointer import resolve_truth_file
+    ws_real = Path(ws).resolve()
+    seen: Set[str] = set()
+    for (bp,) in rows:
+        rel = str(bp).replace("\\", "/")
+        if rel in seen:
+            continue
+        real = resolve_truth_file(ws, rel)
+        if real is None:
+            continue
+        try:
+            real_r = Path(real).resolve()
+        except Exception:
+            continue
+        # Ownership: the file must physically live under THIS workspace.
+        try:
+            real_r.relative_to(ws_real)
+        except ValueError:
+            continue          # lives in another workspace's tree
+        seen.add(rel)
+        out.append((rel, Path(real)))
+    return out
+
+
+def _mechanism_born_of(ws: Path) -> Optional[str]:
+    """When the mechanism first ran **in this workspace** (its own log).
+
+    **Why per workspace, not global (B-2).**  The old code took the
+    EARLIEST ``external-edit`` event across all 16 workspaces — but only
+    **2** workspaces have ever had one (measured: ``cow`` 151 events /
+    ``agent-mvnewfyb`` 22; the other 14 have **zero**).  For those 14 the
+    old ``mechanism_born`` was **another workspace's timestamp** ⇒ a file
+    edited in a workspace whose mechanism had never run was judged against
+    a foreign clock.
+
+    **The result is a CAUSE LABEL, not an exemption.**  The criterion
+    does not decide "is this file excused?" by asking when the mechanism
+    started — see the judge below.
+    """
+    stamps = [str(e.get("at")) for e in _events(ws)
+              if e.get("source") == "external-edit" and e.get("at")]
+    return min(stamps) if stamps else None
+
+
+def _cause_label(born: Optional[str], mt: float) -> str:
+    """Why the file has no witness — as a LABEL, never as a pardon."""
+    if born is None:
+        return "本工作区的机制尚未触发过（自己的日志里没有 external-edit 事件）"
+    try:
+        import datetime
+        b = datetime.datetime.fromisoformat(str(born)[:19]).timestamp()
+    except Exception:
+        return "机制首次生效时间未知（%s）" % born
+    if mt and mt < b - 1:
+        return "最后一次编辑早于本工作区的机制首次生效（%s）" % born
+    return "最后一次编辑晚于本工作区的机制首次生效（%s）" % born
+
+
 def judge_external_edit_is_traceable(report, workspace: Path):
     """EE-1 (REAL): every truth-layer file carries a WITNESS that reproduces it.
 
-    **The question.**  A file that was edited outside our write paths
-    must leave a trace in the change log — and that trace must be
-    **verifiable** (it carries the content it witnessed), not merely
-    present.
+    **The subject — stated up front (the team rule: a criterion must
+    say which object it measures).**
 
-    **The states — and the split that matters.**  The design稿's A1
-    listed ``no-event`` as a violation without saying what a violation
-    MEANS, and DR-2 (the守门人's criterion) reads as "the same red".
-    They are NOT the same red, and this criterion keeps them apart:
+    The subject is **the truth layer of THIS workspace** — the set of
+    files that the workspace's own index points at as the source of
+    truth, i.e.:
+
+      * the workspace's identity files (``MEMORY.md`` / ``USER.md`` /
+        ``AGENT.md`` / ``RULE.md``),
+      * its persona layer (``persona/*.md``),
+      * its markdown truth layer under ``memory/``,
+      * **and — by the 2026-11-01 ruling — its ``knowledge/`` layer**
+        (the files its own index actually points at).
+
+    **The ``knowledge/`` ruling (SEED, 2026-11-01).**  The criterion used
+    to borrow ``external_edit.truth_files`` verbatim, and that set lists
+    **0** ``knowledge/`` entries.  Measured on the live workspace:
+
+      * ``truth_files(ROOT)`` = **87** entries, of which **0** are
+        ``knowledge/`` — while the shared tree physically holds **121**
+        markdown files;
+      * the INDEX points at knowledge files: **2794 chunk rows** across
+        the 16 libraries, **all 2794** resolvable to a real file;
+      * the ROOT's change log carries **1018** ``knowledge/`` events,
+        **119** of them with a content witness.
+
+    ⇒ ``knowledge/`` is the truth layer by every operational measure, and
+    the criterion was watching **87 of ~206** truth files.  **The
+    criterion's subject now includes the knowledge layer**, derived from
+    the INDEX (never from a hard-coded path list).
+
+    **The five states (the 2026-11-01 ruling).**  The engineer's
+    measurement (113/113 ``historical`` and 7/7 ``live-leak`` rows
+    closeable by a reconciliation on a log copy) shows that **a witness
+    is a reproduction of NOW against NOW** — it does not reach back to
+    "then".  Therefore:
 
     =======================  ==============================  ==========
     state                    meaning                         verdict
@@ -284,47 +465,77 @@ def judge_external_edit_is_traceable(report, workspace: Path):
     ``witnessed``            the last event carries a witness   OK
                              that REPRODUCES the current
                              content
-    ``historical``           the edit predates the mechanism's   **DEBT**
-                             first run ⇒ the event can never     (reported,
-                             be witnessed retroactively (the     not red)
-                             log is append-only)
-    ``live-leak``            the edit happened AFTER the        **RED**
-                             mechanism was alive and no
-                             witness matches ⇒ the mechanism
-                             let an edit through
+    ``backfillable``         no valid witness, but a real       **DEBT**
+                             reconciliation on a log COPY      (reported,
+                             WOULD close it now                not red)
+    ``unclosable``           no valid witness and the          **RED**
+                             mechanism CANNOT close it ⇒
+                             the mechanism itself is broken
     ``forged``               a witness exists that does NOT     **RED**
                              reproduce the content and the
                              file was not modified after it
                              ⇒ the witness is a lie
     =======================  ==============================  ==========
 
-    **Why "historical" is not red but "live-leak" is.**  The log is
-    append-only: an event written before the mechanism existed carries
-    no witness, and that event can never be witnessed retroactively.
-    Calling that a defect of the mechanism would send the fixer to a
-    hole that cannot be dug (and would make DR-2 and this criterion two
-    mouths for one fact).  A **live-leak**, by contrast, is the
-    mechanism's OWN failure: the file moved, the mechanism was alive,
-    and the move was not recorded.
+    **What changed, and why it is NOT a pardon.**  The old four states
+    had a ``historical`` bucket, and the rule was *"the edit predates
+    the mechanism ⇒ not red"* — an exemption keyed on **when**.  That is
+    the defect the engineer measured (B-1): what decides whether a row
+    can be closed is **whether it can be closed**, not whether it is
+    old.  The new rule keys on **can-it-be-closed**:
 
-    **The historical debt stays visible.**  It is counted, named, and
-    printed — and it is the SAME debt DR-2 reports.  **DR-2 stays red
-    on purpose** (the engineer registered it: 历史不可回填 ⇒ DR-2 是
-    预期红).  This criterion does not pretend it turned green.
+      * a row the mechanism can close ⇒ ``backfillable`` ⇒ **reported,
+        named, and still a debt** — it is not excused, it is a TODO;
+      * a row the mechanism CANNOT close ⇒ ``unclosable`` ⇒ **RED**,
+        whatever its age.
 
-    **The two sub-kinds of a live leak.**  Both are red, but they point
-    at different owners, so the report separates them:
+    ⇒ **"historical" is no longer an exemption; it is a CAUSE LABEL**
+    attached to a row that is still owed a witness.  The label is kept
+    for visibility (it answers "why was this missed?") and it can never
+    pardon anything.
 
-      * **closable** — a reconciliation pass WOULD close it (the
-        mechanism works; the log simply has not caught up yet because
-        the write path does not trigger a sync);
-      * **unclosable** — the mechanism CANNOT close it (the path is
-        outside the candidate set, unreadable, or the mechanism wrote a
-        witness that does not reproduce the content) ⇒ the mechanism
-        itself is broken.
+    **Can the criterion tell "cannot be closed" from "never closed"?**
+    Yes — and this is the substance of the ruling.  The criterion runs a
+    REAL reconciliation **on a copy of the log** and reads what came
+    out.  Three outcomes, each named:
 
-    The mechanism is probed **on a COPY of the log**, never on the live
-    one, so the criterion never modifies what it measures.
+      * the reconciliation produced a witness equal to the current
+        content ⇒ **closable** ⇒ ``backfillable``;
+      * it produced **no event** for the path ⇒ ``NO_EVENT`` — the path
+        is outside the candidate set or was skipped ⇒ the mechanism
+        cannot see it ⇒ **RED**;
+      * it produced an event with **no witness** ⇒ ``EMPTY_WITNESS`` ⇒
+        **RED**;
+      * it produced a witness that does **not** reproduce the content ⇒
+        ``WITNESS_MISMATCH`` ⇒ **RED**.
+
+    So the criterion can say *"this one cannot be closed, because X"*
+    — it never has to say "it is old, so never mind".
+
+    **Why "closable" is not red.**  A reconciliation that WOULD close it
+    proves the **mechanism is sound**; the row is missing because the
+    write path did not trigger a sync, or because the reconciliation
+    has not run over this path yet.  Sending a fixer to a mechanism that
+    the probe has just proven working is the same category of error as
+    reporting a stale projection as a content corruption.  **But the row
+    stays a debt**: it is counted, named, and stays visible until it is
+    actually closed.
+
+    **The mechanism's birth is per workspace, not global (B-2).**  Only
+    **2** of the 16 workspaces have ever had an ``external-edit`` event
+    (measured: ``cow`` 151, ``agent-mvnewfyb`` 22; the other 14 have
+    **zero**).  The old code took the earliest event across ALL of them
+    ⇒ for those 14, the "mechanism was born" timestamp belonged to
+    **another workspace**.  The birth time is now read from **the
+    workspace's own log**, and it is used **only as a cause label**.
+
+    **DR-2 stays red.**  The守门人's DR-2 (historical events have no
+    witness and cannot be back-filled) is a DIFFERENT red — the log is
+    append-only, so the OLD event never gains a witness.  This criterion
+    does not pretend to have turned it green, and it does not duplicate
+    it: the debt it reports is *"this file has no witness NOW"* (which
+    the mechanism CAN close by appending a new event), not *"that old
+    event has no witness"* (which it cannot).
 
     **NOTRUN** when there is no workspace with a change log at all, or
     when no truth-layer file exists to witness.
@@ -339,17 +550,31 @@ def judge_external_edit_is_traceable(report, workspace: Path):
             "本工作区下没有任何带变更记录的工作区，前置条件不成立"
             "（这不是通过）")
 
-    live_from = _mechanism_live_from(workspaces)
-    detail.append("机制首次生效时间（最早的 external-edit 事件）: %s"
-                  % (live_from or "（机制从未运行过）"))
+    detail.append("被测对象：**本工作区的真源层**（身份文件 + persona + "
+                  "memory/ + **knowledge/**〔2026-11-01 裁决纳入〕）")
     detail.append("")
 
-    grand = {"witnessed": 0, "historical": 0, "live-leak": 0,
+    # Which library belongs to which workspace?  (the knowledge layer
+    # is derived from the INDEX, so the criterion needs the library.)
+    libs_by_ws: Dict[str, Any] = {}
+    try:
+        from agent.memory.acceptance.live_libs import enumerate_live
+        for lib in enumerate_live(root):
+            try:
+                libs_by_ws[Path(lib.workspace).resolve().name] = lib
+            except Exception:
+                continue
+    except Exception as e:
+        detail.append("活库枚举失败（%s: %s）—— knowledge 层将无法纳入"
+                      % (type(e).__name__, e))
+
+    grand = {"witnessed": 0, "backfillable": 0, "unclosable": 0,
              "forged": 0, "unreadable": 0}
     closable: List[str] = []
     unclosable: List[str] = []
     forged: List[str] = []
     debt_paths: List[str] = []
+    reason_hist: Dict[str, int] = {}
     measured = 0
     a3_failures: List[str] = []
 
@@ -357,6 +582,14 @@ def judge_external_edit_is_traceable(report, workspace: Path):
         events = _events(ws)
         last = _last_event_per_path(events)
         files = _truth_files(ws)
+        # The knowledge layer (2026-11-01 ruling) — the files THIS
+        # workspace's own index points at and that physically live in
+        # this workspace's tree.
+        lib = libs_by_ws.get(Path(ws).resolve().name)
+        kfiles = _index_knowledge_files(ws, lib)
+        known = {str(r).replace("\\", "/") for r, _f in files}
+        kown = [(r, f) for r, f in kfiles if r not in known]
+        files = files + kown
         if not files:
             detail.append("  %-22s 真源文件集为空 —— 该工作区不可测量" % ws.name)
             continue
@@ -364,11 +597,12 @@ def judge_external_edit_is_traceable(report, workspace: Path):
         # agent workspace owns those files.  Counting them twice would
         # double-count one debt as two.
         own = [(r, f) for r, f in files
-               if not (ws == root and r.startswith("agents/"))]
+               if not (ws == root and str(r).replace("\\", "/").startswith("agents/"))]
         if not own:
             continue
         measured += 1
 
+        born = _mechanism_born_of(ws)
         probe = _probe_reconciliation(ws, own)
         if probe.get("error"):
             detail.append("  %-22s 对账探针出错: %s" % (ws.name, probe["error"]))
@@ -395,83 +629,109 @@ def judge_external_edit_is_traceable(report, workspace: Path):
                 mt = float(real.stat().st_mtime)
             except OSError:
                 mt = 0.0
-            # Is the file's last modification BEFORE the mechanism was
-            # alive?  ⇒ historical debt (not the mechanism's fault).
-            historical = False
-            if live_from:
-                try:
-                    import datetime
-                    born = datetime.datetime.fromisoformat(
-                        live_from[:19]).timestamp()
-                except Exception:
-                    born = 0.0
-                historical = mt < born - 1
-            else:
-                historical = True
-            if historical:
-                bucket["historical"] += 1
-                if len(debt_paths) < 30:
-                    debt_paths.append(
-                        "%s::%s (最后事件 %s, source=%s, 文件 mtime %s)"
-                        % (ws.name, rel, (e or {}).get("at"),
-                           (e or {}).get("source"), _fmt_ts(mt)))
-                continue
-            # The edit happened while the mechanism was alive.
+            # Is there a witness that does not reproduce, and the file
+            # was NOT modified after it?  ⇒ the witness is a lie.
             witness = (e or {}).get(WITNESS_KEY)
             if witness and mt <= _event_ts(e) + 1:
                 bucket["forged"] += 1
                 forged.append("%s::%s (见证事件 %s, 文件 mtime %s)"
                               % (ws.name, rel, e.get("at"), _fmt_ts(mt)))
                 continue
-            bucket["live-leak"] += 1
-            if rel in (probe.get("unclosed") or []):
-                unclosable.append("%s::%s (机制的对账也关不上它)" % (ws.name, rel))
-            else:
-                closable.append("%s::%s (见证事件 %s, 文件 mtime %s)"
-                                % (ws.name, rel, (e or {}).get("at"),
-                                   _fmt_ts(mt)))
+            # No valid witness.  **Can the mechanism close it?**  The
+            # probe answers that on a copy of the log — and the judge
+            # does NOT take the probe's word for it: the answer is
+            # cross-checked against the copy log's final state.
+            reason, why = probe.get("unclosable", {}).get(
+                rel, (None, None))
+            post = probe.get("post_witness") or {}
+            evidence = post.get(rel, None)
+            if reason is None:
+                # The probe claims it is closable.  **Verify the claim.**
+                if evidence != H:
+                    # The claim is FALSE: the copy log holds no witness
+                    # that reproduces the content, yet the probe said
+                    # the mechanism could close it.  A criterion that
+                    # believes such a probe would go GREEN on a broken
+                    # mechanism ⇒ that is the "假守护者" shape.
+                    bucket["unclosable"] += 1
+                    reason_hist["PROBE_CLAIM_FALSE"] = \
+                        reason_hist.get("PROBE_CLAIM_FALSE", 0) + 1
+                    unclosable.append(
+                        "%s::%s [PROBE_CLAIM_FALSE] 探针声称『机制能补』，"
+                        "但副本日志里没有能复现当前内容的见证"
+                        "（探针在说谎，或探针与机制已经脱节）"
+                        % (ws.name, rel))
+                    continue
+                # Verified: the mechanism CAN close it ⇒ a debt, not a
+                # defect.  It stays visible and named.
+                bucket["backfillable"] += 1
+                if len(debt_paths) < 40:
+                    debt_paths.append(
+                        "%s::%s (原因: %s; 最后事件 %s source=%s, 文件 mtime %s)"
+                        % (ws.name, rel, _cause_label(born, mt),
+                           (e or {}).get("at"), (e or {}).get("source"),
+                           _fmt_ts(mt)))
+                continue
+            # The probe claims it CANNOT close it.  **Verify that too.**
+            if evidence == H:
+                # The copy log DOES hold a matching witness ⇒ the
+                # mechanism closed it ⇒ reporting it as "broken" points
+                # the fixer at a mechanism that works.
+                bucket["unclosable"] += 1
+                reason_hist["PROBE_CLAIM_FALSE"] = \
+                    reason_hist.get("PROBE_CLAIM_FALSE", 0) + 1
+                unclosable.append(
+                    "%s::%s [PROBE_CLAIM_FALSE] 探针声称『机制关不上』，"
+                    "但副本日志里有能复现当前内容的见证"
+                    "（把可补的欠账报成机制坏了 ⇒ 修复方向会被指错）"
+                    % (ws.name, rel))
+                continue
+            # The mechanism CANNOT close it ⇒ RED, and we say why.
+            bucket["unclosable"] += 1
+            reason_hist[reason] = reason_hist.get(reason, 0) + 1
+            unclosable.append("%s::%s [%s] %s" % (ws.name, rel, reason, why))
         for k in grand:
             grand[k] += bucket[k]
-        detail.append("  %-22s 见证成立=%-4d 历史欠账=%-4d 现在还在漏=%-4d "
-                      "见证说谎=%-4d 读不到=%d"
-                      % (ws.name, bucket["witnessed"], bucket["historical"],
-                         bucket["live-leak"], bucket["forged"],
-                         bucket["unreadable"]))
+        detail.append("  %-22s 见证成立=%-4d 待回填=%-4d 机制关不上=%-4d "
+                      "见证说谎=%-4d 读不到=%d  (knowledge 层 %d 个)"
+                      % (ws.name, bucket["witnessed"], bucket["backfillable"],
+                         bucket["unclosable"], bucket["forged"],
+                         bucket["unreadable"], len(kown)))
 
     detail.append("")
     detail.append("已测工作区（带变更记录且有真源文件）: %d / %d"
                   % (measured, len(workspaces)))
-    detail.append("合计: 见证成立=%d  历史欠账=%d  现在还在漏=%d  "
-                  "见证说谎=%d  读不到=%d"
-                  % (grand["witnessed"], grand["historical"],
-                     grand["live-leak"], grand["forged"], grand["unreadable"]))
+    detail.append("合计: 见证成立=%d  待回填=%d  机制关不上=%d  见证说谎=%d  读不到=%d"
+                  % (grand["witnessed"], grand["backfillable"],
+                     grand["unclosable"], grand["forged"], grand["unreadable"]))
     detail.append("")
-    detail.append("—— 历史欠账（机制生效前就改了；日志只追加，那条旧事件"
-                  "永远没有见证 ⇒ 不可回填）——")
+    detail.append("—— 待回填（机制**能**补上，补完即见证成立）: %d ——"
+                  % grand["backfillable"])
     if debt_paths:
         for d in debt_paths:
             detail.append("  ~ %s" % d)
-        if grand["historical"] > len(debt_paths):
+        if grand["backfillable"] > len(debt_paths):
             detail.append("  ~ …（其余 %d 条同类）"
-                          % (grand["historical"] - len(debt_paths)))
+                          % (grand["backfillable"] - len(debt_paths)))
     else:
         detail.append("  （无）")
-    detail.append("  ⇒ 这批欠账由 DR-2 继续报红；本判据**不**把它算成"
-                  "『机制坏了』，也**不**假装它已经变绿。")
+    detail.append("  ⇒ 这批欠账**仍然可见**（计数 + 点名到工作区::path + 成因）。"
+                  "『早于机制生效』只是**成因标签**，不是豁免理由 —— "
+                  "欠的是『这个文件现在还没有见证』，它必须被补上。")
+    detail.append("  ⇒ 这一批与 DR-2 **不是同一条红**：DR-2 说的是『那条旧事件"
+                  "永远没有见证』（日志只追加，不可回填）；这里说的是"
+                  "『这个文件现在没有见证』（追加一条新事件即可消除）。")
     detail.append("")
-    detail.append("—— 现在还在漏 · 可回填（机制本身有效，只是日志没追上"
-                  "写路径）: %d ——" % len(closable))
-    for l in closable[:30]:
-        detail.append("  ! %s" % l)
-    if not closable:
-        detail.append("  （无）")
-    detail.append("—— 现在还在漏 · 机制关不上（机制坏了）: %d ——"
-                  % len(unclosable))
+    detail.append("—— 机制关不上（机制坏了）: %d ——" % grand["unclosable"])
+    if reason_hist:
+        detail.append("  原因分布: %s"
+                      % ", ".join("%s=%d" % (k, v)
+                                 for k, v in sorted(reason_hist.items())))
     for l in unclosable[:30]:
         detail.append("  X %s" % l)
     if not unclosable:
         detail.append("  （无）")
-    detail.append("—— 见证说谎: %d ——" % len(forged))
+    detail.append("—— 见证说谎: %d ——" % grand["forged"])
     for l in forged[:30]:
         detail.append("  X %s" % l)
     if not forged:
@@ -483,7 +743,14 @@ def judge_external_edit_is_traceable(report, workspace: Path):
                   "external_edit 写入时用的规范化同源；判据自己重算，不"
                   "借用写入方的算式。")
     detail.append("机制探针在**日志副本**上跑（活日志全程未被修改）："
-                  "「可回填 / 关不上」的区分靠的是副本上的一次真实对账。")
+                  "『能补 / 关不上 + 关不上的原因』靠的是副本上的一次真实对账。")
+    detail.append("**探针的结论被交叉校验**（不轻信探针）：判据拿副本日志"
+                  "的最终见证状态去核对探针的说法 —— 探针说『能补』却拿不"
+                  "出见证、或探针说『关不上』却有见证，都记为原因 "
+                  "PROBE_CLAIM_FALSE 并判红（原因行里它带方括号，"
+                  "以区别于本段对它的提及）。")
+    detail.append("机制首次生效时间**按工作区取**（B-2 修正）：它只作为"
+                  "**成因标签**，不作为豁免条件。")
 
     if measured == 0:
         return report.judge_notrun(
@@ -491,19 +758,19 @@ def judge_external_edit_is_traceable(report, workspace: Path):
             "每个真源文件都有一条带内容见证的变更事件（见证可复现）",
             "\n".join(detail) + "\n没有可测量的工作区（真源文件集为空）——"
             "不可判定，不是通过。")
-    if closable or unclosable or forged or a3_failures:
+    if unclosable or forged or a3_failures:
         detail.append("")
-        detail.append("结论：%d 条现在还在漏（其中 %d 条机制也关不上）+ "
-                      "%d 条见证说谎 + %d 条 A3 破坏 ⇒ 判红。"
-                      % (len(closable) + len(unclosable), len(unclosable),
-                         len(forged), len(a3_failures)))
+        detail.append("结论：%d 条机制关不上 + %d 条见证说谎 + %d 条 A3 破坏 ⇒ 判红。"
+                      % (len(unclosable), len(forged), len(a3_failures)))
         return report.judge(
             "EE-1(REAL)",
             "每个真源文件都有一条带内容见证的变更事件（见证可复现）",
             False, "\n".join(detail))
     detail.append("")
-    detail.append("结论：没有『现在还在漏』/『见证说谎』/A3 破坏 ⇒ "
-                  "机制在已覆盖的路径上是有效的。")
+    detail.append("结论：没有『机制关不上』/『见证说谎』/A3 破坏 ⇒ "
+                  "机制在已覆盖的路径上是有效的。"
+                  "（待回填 %d 条是**欠账**，不是失败：它必须被补上，"
+                  "但补它的动作不需要动机制。）" % grand["backfillable"])
     return report.judge(
         "EE-1(REAL)",
         "每个真源文件都有一条带内容见证的变更事件（见证可复现）",

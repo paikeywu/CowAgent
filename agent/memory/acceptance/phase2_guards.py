@@ -244,6 +244,26 @@ CRITERION_FILES = ("phase2.py", "phase2_s3e.py", "phase2_s3h.py",
 #:   MU-T18  a baselined entry that DECLARES ``[NOTRUN]`` but is RED
 #:            now ⇒ GB-1 must be RED (the state it was allowed to be
 #:            in changed)
+#:
+#: MU-54..MU-60 are the T3e round's seven — the EE-1 five-state split
+#: and the knowledge layer:
+#:   MU-54  the probe LIES about being able to close a path ⇒ EE-1
+#:           must be RED (the judge cross-checks the probe, it does
+#:           not believe it)
+#:   MU-55  the probe LIES about being UNABLE to close a path ⇒ EE-1
+#:           must be RED (a closable debt reported as a broken
+#:           mechanism points the fixer at the wrong thing)
+#:   MU-56  the probe's REASON is collapsed into one constant ⇒ the
+#:           criterion must keep the reasons distinguishable ("because
+#:           X" must mean something)
+#:   MU-57  the ``knowledge/`` layer is dropped from the subject ⇒ the
+#:           largest truth layer must not become invisible
+#:   MU-58  the reconciliation only reaches the ROOT's log ⇒ an
+#:           agent's provenance must not be invisible
+#:   MU-59  the reconciliation swallows its exception ⇒ "I do not
+#:           know" must not be dressed as "I can close it"
+#:   MU-60  DR-2 (an environment item) enters the global baseline ⇒
+#:           GB-1 must be RED (environment reds never enter)
 REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
     "test_p1_stage3e_criteria_mutants.py": (
         "MU-1", "MU-2", "MU-3", "MU-4", "MU-5", "MU-6", "MU-7", "MU-8", "MU-9",
@@ -276,6 +296,9 @@ REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
         "MU-T1", "MU-T2", "MU-T3", "MU-T4", "MU-T5", "MU-T6",
         "MU-T8", "MU-T9", "MU-T10", "MU-T11", "MU-T12",
         "MU-T13", "MU-T14", "MU-T15", "MU-T16", "MU-T17", "MU-T18",
+    ),
+    "test_p1_stage3y_criteria_mutants.py": (
+        "MU-54", "MU-55", "MU-56", "MU-57", "MU-58", "MU-59", "MU-60",
     ),
 }
 
