@@ -38,6 +38,23 @@ SOURCES = frozenset({
     # C-2: the element/release paths.
     "facade-element",
     "facade-release",
+    # T2c (2026-11-01): an edit we did NOT make through our own write
+    # path — a human in an editor, the ``write`` tool, a persona rewrite
+    # script, another process.  It is witnessed by the reconciliation
+    # pass (``agent.memory.external_edit``), which compares the disk
+    # against what the log has already witnessed.
+    #
+    # Before this member existed, the log's shape was EXACTLY "our own
+    # writes": four sources, every one of them a write path.  A file
+    # edited outside those paths was indexed but never logged — so the
+    # log said "the last truth-layer change was 2026-10-30" while the
+    # persona had been rewritten on 2026-11-01.  DR-2 reported "no
+    # source" and was RIGHT: the source did not exist.
+    #
+    # The new member is a MEMBER of the set, not a replacement for the
+    # others: "our write path did this" and "we found this on disk
+    # afterwards" stay distinguishable.
+    "external-edit",
 })
 
 

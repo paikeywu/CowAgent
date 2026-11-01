@@ -1360,6 +1360,43 @@ class MemoryManager:
                     f"entries that are no longer on disk"
                 )
 
+        # T2c (2026-11-01): WITNESS the external edits.
+        #
+        # The scan above decided which files changed on disk, but it
+        # never told the CHANGE LOG about them — the log's only writers
+        # were our own write paths (facade.write / import_human_edit /
+        # rebuild_file).  A file edited outside those paths (a human in
+        # an editor, the ``write`` tool, a persona rewrite script) was
+        # indexed but never logged, so the log said "the last truth-layer
+        # change was 2026-10-30" while the persona had been rewritten on
+        # 2026-11-01.  DR-2 reported "no source" and was right.
+        #
+        # The reconciliation compares each scanned file's CURRENT
+        # canonical content against the hash the log last witnessed for
+        # it, and records the difference.  It is CONTENT-BASED, so a
+        # re-scan of an unchanged tree records nothing (the log does not
+        # grow and ``latest_change_mtime`` does not advance — which is
+        # what keeps the shelf-lag invariant honest).
+        #
+        # It runs AFTER the scan (so the scan's own view is the
+        # authority on which files exist) and never raises into the
+        # sync path (a reconciliation is an observation; an observation
+        # must not take down a sync).
+        try:
+            from agent.memory import external_edit
+            # Re-derive the (rel, real) pairs the SAME way the scan did,
+            # so the witness path is the INDEX KEY and the file is the
+            # FILE — never the other way round.
+            _cands = []
+            for (file_path, _source, _scope, _uid) in files_to_scan:
+                _rel = _index_rel_path(file_path, index_roots)
+                if _rel is not None:
+                    _cands.append((_rel, file_path))
+            external_edit.reconcile_external_edits(workspace_dir_path, _cands)
+        except Exception as e:
+            logger.warning(
+                f"[MemoryManager] external-edit reconciliation skipped: {e}")
+
         if not pending:
             # P0-11 P-2: nothing changed on disk, but the truth layer's
             # RELEASE state may have moved (a release writes a new version
