@@ -168,6 +168,30 @@ CRITERION_FILES = ("phase2.py", "phase2_s3e.py", "phase2_s3h.py",
 #:   MU-46  the drift verdict is DROPPED from the fingerprint-vs-drift
 #:          criterion ⇒ "structure fine, content stale" becomes
 #:          invisible
+#:
+#: MU-47..MU-53 are the S3-W round's seven — the CRITERION-SEMANTICS
+#: round (the yardstick, the diagnostic, and the write's decision):
+#:
+#:   MU-47  the CANONICAL verdict is put back to the BYTE yardstick ⇒
+#:          the main INV-2 must go RED on a fixture whose only
+#:          difference is a trailing newline (SEED 裁决 C7's own guard:
+#:          the口径 change must not be able to slip back)
+#:   MU-48  the DIAGNOSTIC labels a NORMALISATION difference as a
+#:          real drift ⇒ the classifier's own self-check must catch it
+#:   MU-49  the DIAGNOSTIC labels a REAL DRIFT as a normalisation
+#:          difference ⇒ the self-check must catch it too (the
+#:          dangerous direction: it sends the reader to fix the
+#:          normalisation when the projection is what drifted)
+#:   MU-50  the write path's post-write DECISION is disabled ⇒ W-3 must
+#:          go RED on A1 (the rows stay 'unresolved')
+#:   MU-51  every row becomes 'orphan' ⇒ W-3 must go RED, and it must
+#:          be A4 that catches it (A1/A2/A3 all hold for a legal
+#:          'orphan' — the design稿's own admitted blind spot)
+#:   MU-52  'file' is written WITHOUT the pointer ⇒ W-3 must go RED on
+#:          A3 (a 'file' row that cannot say which file)
+#:   MU-53  the writer-generation classifier is blinded ⇒ W-4 must
+#:          notice (the old end's debt must not be relabelled as the
+#:          current code's)
 REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
     "test_p1_stage3e_criteria_mutants.py": (
         "MU-1", "MU-2", "MU-3", "MU-4", "MU-5", "MU-6", "MU-7", "MU-8", "MU-9",
@@ -192,6 +216,9 @@ REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
     ),
     "test_p1_stage3v_criteria_mutants.py": (
         "MU-41", "MU-42", "MU-43", "MU-44", "MU-45", "MU-46",
+    ),
+    "test_p1_stage3w_criteria_mutants.py": (
+        "MU-47", "MU-48", "MU-49", "MU-50", "MU-51", "MU-52", "MU-53",
     ),
 }
 

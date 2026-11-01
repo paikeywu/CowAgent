@@ -86,6 +86,7 @@ from agent.memory.acceptance.live_libs import (
     open_ro,
     table_columns,
 )
+from agent.memory.naming import canonical_text
 
 #: The four legal values of ``chunks.body_origin``.
 ORIGIN_VALUES = ("file", "blob", "orphan", "unresolved")
@@ -597,15 +598,18 @@ def judge_m6_body_origin_mouth(report, workspace: Path):
 # INV-2 · byte equality, asserted independently
 # ---------------------------------------------------------------------------
 
-def judge_inv2_anchor_rebuild_is_byte_equal(report, workspace: Path):
-    """INV-2 (REAL): the rebuilt fragment is BYTE-equal to ``chunks.text``.
+def judge_inv2_anchor_rebuild_is_canonical_equal(report, workspace: Path):
+    """INV-2 (REAL): the rebuilt fragment is CANONICALLY equal to ``chunks.text``.
 
-    The design says "byte-identical" and the fourth round's ruling
-    (Q-A1) settled that ``~N`` must be carried so that the 277
-    C-class rows can be rebuilt byte-for-byte.  S3-E measured the byte
-    count and PRINTED it but did not ASSERT it — which means the
-    invariant was not actually guarded: the criterion would still be
-    green with a rebuild that was canonical-equal but byte-different.
+    **旧口径 → 新口径 → 为什么（SEED 裁决 C7，2026-11-01）**
+
+    | | |
+    |:--|:--|
+    | **旧口径** | **逐字节相等**（``rebuilt == text``）。逐字节计数**就是**判定。 |
+    | **新口径** | **canonical 相等**（``canonical_text(rebuilt) == canonical_text(text)``），与 ``agent/memory/text_inv.py`` 的 ``check_inv2_inv3`` **同一把尺子**。逐字节计数**照旧打印**，但**不再参与判定**。 |
+    | **为什么** | ① 判据守护的不变量是「**投影能按锚点重建回真源内容**」—— 这是**语义相等**，不是**字节形态相同**；换行形态是实现细节，而 ``chunks.text`` 落库前**做过规范化**。② 用字节相等去判「重建是否忠实」，是把**规范化差异**误报成**内容漂移**。③ 门禁的 ``INV-2`` 与 ``text_inv`` 的 ``INV-2/3`` 问的是**同一件事**却用了**两把尺子** ⇒ 实测**恰好 1 行分歧**（``agent-mvnf7fjl`` / ``memory/evolution/2026-10-31.md`` / chunk ``562041935a847889beb92ee2548eaca8`` / anchor ``L1-25``：重建片段尾部多一个 ``\\n``）⇒ **两条判据永远不可能同时绿**。「两个关于同一件事的 map 必须用同一套 tie-break」。 |
+    | **这不是放宽** | 期望值的**来源没有变**：仍然是「从真源文件**独立重建**出来的片段」，仍然是**判据自己解析锚点**（不调用 ``body_pointer.rebuild_from_anchor``），仍然是「投影 vs 真源」而不是「投影 vs 投影」。变的只有**比较的那把尺子**，而这把尺子必须是**系统的规范化定义**（``naming.canonical_text``），因为 ``text_inv`` 用的就是它。canonical 相等**不忽略任何非空白的字符** —— 任何一处实质内容不同（多一个词、少一段、改一个标点）都会让 canonical 不等。 |
+    | **可观测性没丢** | 逐字节相等数**照旧打印**，且「逐字节差异的归类」（只来自规范化 / 真漂移）由**独立的诊断判据** ``INV-2-DIAG``（``phase2_s3w.py``）负责，并点名到 path + chunk + 字节偏移。 |
 
     **The assertion is computed independently.**  This module parses the
     anchor grammar itself (:func:`parse_anchor_grammar`) and rebuilds
@@ -618,13 +622,6 @@ def judge_inv2_anchor_rebuild_is_byte_equal(report, workspace: Path):
     file and this criterion MUST go red.  A criterion that re-ran the
     chunker would compare the projection with itself and could never go
     red — the tautology this stage exists to kill.
-
-    The byte count is PRINTED, never hidden — and the byte count IS the
-    verdict.  There is no canonical fallback here: on a healthy corpus
-    the byte count is 100%, and a criterion that would accept a
-    canonical-only match is a criterion that has been silently downgraded
-    (and a downgraded criterion reports red on a healthy corpus, or —
-    worse — green on a broken one).
     """
     detail: List[str] = []
     libs = enumerate_live(workspace)
@@ -642,11 +639,12 @@ def judge_inv2_anchor_rebuild_is_byte_equal(report, workspace: Path):
     except Exception as e:
         return report.judge_notrun(
             "INV-2(REAL)",
-            "按锚点重建的片段与 chunks.text 逐字节相等，且实现侧读法与判据独立读法逐行一致",
+            "按锚点重建的片段与 chunks.text canonical 相等，且实现侧读法与判据独立读法逐行一致",
             "body_pointer 不可用（%s: %s）—— 判据无法测量" % (type(e).__name__, e))
 
     total_rows = 0
     byte_equal = 0
+    canonical_equal = 0
     canonical_equal_only = 0
     unparsable = 0
     unlocatable = 0
@@ -674,6 +672,7 @@ def judge_inv2_anchor_rebuild_is_byte_equal(report, workspace: Path):
         lib_rows = 0
         lib_byte = 0
         lib_canon = 0
+        lib_canon_only = 0
         lib_unparsable = 0
         lib_unlocatable = 0
         lib_reader_disagree = 0
@@ -694,12 +693,21 @@ def judge_inv2_anchor_rebuild_is_byte_equal(report, workspace: Path):
             if rebuilt is None:
                 lib_unlocatable += 1
                 continue
-            if rebuilt == (text or ""):
+            text = text or ""
+            if rebuilt == text:
                 lib_byte += 1
-            else:
-                from agent.memory.naming import canonical_text
-                if canonical_text(rebuilt) == canonical_text(text or ""):
-                    lib_canon += 1
+            # --- the CANONICAL comparison (SEED 裁决 C7) ------------
+            #
+            # This is the SAME yardstick ``text_inv.check_inv2_inv3``
+            # uses, so the two criteria about the same fact cannot
+            # contradict each other.  ``canonical_text`` is the
+            # system's normalisation (LF + fold blank runs + strip);
+            # it ignores NO non-whitespace character, so a real
+            # content change still goes red.
+            if canonical_text(rebuilt) == canonical_text(text):
+                lib_canon += 1
+                if rebuilt != text:
+                    lib_canon_only += 1
             # --- the CROSS-CHECK -------------------------------------
             # The implementation's reader must produce the SAME
             # fragment as this criterion's independently written one.
@@ -723,25 +731,33 @@ def judge_inv2_anchor_rebuild_is_byte_equal(report, workspace: Path):
                 lib_reader_disagree += 1
         total_rows += lib_rows
         byte_equal += lib_byte
-        canonical_equal_only += lib_canon
+        canonical_equal += lib_canon
+        canonical_equal_only += lib_canon_only
         unparsable += lib_unparsable
         unlocatable += lib_unlocatable
         reader_disagreements += lib_reader_disagree
-        verdict = "OK" if (lib_rows == lib_byte) else "RED"
-        if lib_rows != lib_byte or lib_reader_disagree:
+        verdict = "OK" if (lib_rows == lib_canon) else "RED"
+        if lib_rows != lib_canon or lib_reader_disagree:
             red_libraries.append(lib.name)
         detail.append("  %-22s 路径=%s" % (lib.name, lib.db))
-        detail.append("      可判定行=%-5d 逐字节相等=%-5d 仅 canonical 相等=%-4d "
-                      "锚点不合语法=%-3d 定位不到=%-3d 两份读法不一致=%-3d -> %s"
-                      % (lib_rows, lib_byte, lib_canon, lib_unparsable,
-                         lib_unlocatable, lib_reader_disagree, verdict))
+        detail.append("      可判定行=%-5d canonical 相等=%-5d 逐字节相等=%-5d "
+                      "仅 canonical 相等=%-4d 锚点不合语法=%-3d 定位不到=%-3d "
+                      "两份读法不一致=%-3d -> %s"
+                      % (lib_rows, lib_canon, lib_byte, lib_canon_only,
+                         lib_unparsable, lib_unlocatable,
+                         lib_reader_disagree, verdict))
     detail.append("")
-    detail.append("合计: 可判定行=%d  逐字节相等=%d  仅 canonical 相等=%d  "
-                  "锚点不合语法=%d  定位不到=%d  两份读法不一致=%d"
-                  % (total_rows, byte_equal, canonical_equal_only,
-                     unparsable, unlocatable, reader_disagreements))
-    detail.append("口径：逐字节（容差仅 CRLF/LF 由 canonical_text 覆盖的那一层只在"
-                  "『仅 canonical 相等』这一栏被单独报出，不参与判定）。")
+    detail.append("合计: 可判定行=%d  canonical 相等=%d  逐字节相等=%d  "
+                  "仅 canonical 相等=%d  锚点不合语法=%d  定位不到=%d  "
+                  "两份读法不一致=%d"
+                  % (total_rows, canonical_equal, byte_equal,
+                     canonical_equal_only, unparsable, unlocatable,
+                     reader_disagreements))
+    detail.append("口径（SEED 裁决 C7）：canonical 相等 —— 与 text_inv.check_inv2_inv3 "
+                  "同一把尺子（naming.canonical_text：LF 化 + 折叠连续空行 + strip）。")
+    detail.append("逐字节计数照旧打印，但**不参与判定** —— 逐字节差异的归类"
+                  "（只来自规范化 / 真漂移）由诊断判据 INV-2-DIAG 负责，"
+                  "并点名到 path + chunk + 字节偏移。")
     detail.append("判据自己解析锚点、自己重建，不调用 body_pointer.rebuild_from_anchor —— "
                   "否则就是拿被测对象算期望值（同义反复 = 假绿）。")
     detail.append("『两份读法不一致』是交叉校验：实现侧的读法必须与判据独立写的读法"
@@ -753,17 +769,17 @@ def judge_inv2_anchor_rebuild_is_byte_equal(report, workspace: Path):
     if total_rows == 0:
         return report.judge_notrun(
             "INV-2(REAL)",
-            "按锚点重建的片段与 chunks.text 逐字节相等，且实现侧读法与判据独立读法逐行一致",
+            "按锚点重建的片段与 chunks.text canonical 相等，且实现侧读法与判据独立读法逐行一致",
             "\n".join(detail) + "\n本语料没有可判定的有指针行 —— 不可判定，不是通过。")
     if red_libraries:
         detail.append("  —— 未全等的库: %s" % ", ".join(red_libraries))
         return report.judge(
             "INV-2(REAL)",
-            "按锚点重建的片段与 chunks.text 逐字节相等，且实现侧读法与判据独立读法逐行一致",
+            "按锚点重建的片段与 chunks.text canonical 相等，且实现侧读法与判据独立读法逐行一致",
             False, "\n".join(detail))
     return report.judge(
         "INV-2(REAL)",
-        "按锚点重建的片段与 chunks.text 逐字节相等，且实现侧读法与判据独立读法逐行一致",
+        "按锚点重建的片段与 chunks.text canonical 相等，且实现侧读法与判据独立读法逐行一致",
         True, "\n".join(detail))
 
 

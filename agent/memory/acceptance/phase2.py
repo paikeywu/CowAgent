@@ -855,7 +855,7 @@ _S3E_CRITERIA = [
 # module owns M6 from here on.
 _S3H_CRITERIA = [
     ("C-A3", "judge_ca3_chunker_version_is_consistent"),
-    ("INV-2", "judge_inv2_anchor_rebuild_is_byte_equal"),
+    ("INV-2", "judge_inv2_anchor_rebuild_is_canonical_equal"),
     ("ANCHOR", "judge_anchor_segments_are_self_consistent"),
     ("UPSERT", "judge_upsert_does_not_downgrade_the_body_columns"),
     ("PARSER", "judge_anchor_parser_is_single"),
@@ -1013,6 +1013,29 @@ _S3V_CRITERIA = [
     ("DR-5", "judge_dr5_baseline_conformance"),
     ("DR-6", "judge_dr6_file_changed_not_recut"),
     ("DR-7", "judge_dr7_fingerprint_does_not_substitute_drift"),
+]
+
+
+# ---------------------------------------------------------------------------
+# S3-W · the CRITERION-SEMANTICS round (口径收尾).
+#
+# They live in their own module (``phase2_s3w``) because they judge the
+# CRITERIA's own semantics, not a library's state:
+#
+#   * INV-2-DIAG — the byte/cano canonical split, as a DIAGNOSTIC.  The
+#     main INV-2 now judges on the canonical yardstick (SEED 裁决 C7), so
+#     "is the byte difference only normalisation?" needs its own home —
+#     and that home must NOT be a second yardstick (a diagnostic that
+#     judged red would be a second ruler about the same fact).
+#   * W-3 — a fresh write must not leave a row undecided.  The object
+#     under test is ONE WRITE, not the library's history.
+#   * W-4 — the writer-generation evidence for the undecided rows: who
+#     wrote them (the old desktop build's twelve-column INSERT, or the
+#     current four-column path).
+_S3W_CRITERIA = [
+    ("INV-2-DIAG", "judge_inv2_byte_difference_is_classified"),
+    ("W-3", "judge_new_write_has_decided_origin"),
+    ("W-4", "judge_unresolved_writer_generation_is_reported"),
 ]
 
 
@@ -1248,6 +1271,24 @@ def _load_s3v():
     return out
 
 
+def _load_s3w():
+    """The S3-W criterion functions, bound to the workspace."""
+    from agent.memory.acceptance import phase2_s3w
+
+    ws = Path(resolve_workspace(ARGS.workspace)[0])
+    out = []
+    for group, attr in _S3W_CRITERIA:
+        fn = getattr(phase2_s3w, attr)
+
+        def make(fn=fn, ws=ws):
+            def run(report):
+                return fn(report, ws)
+            return run
+
+        out.append((group, make()))
+    return out
+
+
 def main() -> int:
     workspace, how = resolve_workspace(ARGS.workspace)
 
@@ -1336,6 +1377,14 @@ def main() -> int:
 
     # The S3-V criteria (the runtime census + the drift probes).
     for group, fn in _load_s3v():
+        if ARGS.only and not group.startswith(ARGS.only):
+            continue
+        guarded(fn, report)
+
+    # The S3-W criteria (the CRITERION-SEMANTICS round: the INV-2
+    # canonical yardstick + its byte-difference DIAGNOSTIC, the fresh
+    # write's decided origin, and the writer-generation evidence).
+    for group, fn in _load_s3w():
         if ARGS.only and not group.startswith(ARGS.only):
             continue
         guarded(fn, report)

@@ -372,7 +372,7 @@ def test_mu16_the_gap_count_must_not_take_part_in_the_join(tmp_path):
         conn.close()
 
     report, states = _run(
-        phase2_s3h.judge_inv2_anchor_rebuild_is_byte_equal, ws)
+        phase2_s3h.judge_inv2_anchor_rebuild_is_canonical_equal, ws)
     assert states["INV-2(REAL)"] == STATE_PASS, report.printed
 
     # --- the mutation: the implementation joins with '~N' ---
@@ -402,7 +402,7 @@ def test_mu16_the_gap_count_must_not_take_part_in_the_join(tmp_path):
     bp.rebuild_from_anchor = gap_joined
     try:
         report, states = _run(
-            phase2_s3h.judge_inv2_anchor_rebuild_is_byte_equal, ws)
+            phase2_s3h.judge_inv2_anchor_rebuild_is_canonical_equal, ws)
     finally:
         bp.rebuild_from_anchor = original
     assert states["INV-2(REAL)"] == STATE_FAIL, (
@@ -412,7 +412,7 @@ def test_mu16_the_gap_count_must_not_take_part_in_the_join(tmp_path):
 
     # --- the restore turns it green again ---
     report, states = _run(
-        phase2_s3h.judge_inv2_anchor_rebuild_is_byte_equal, ws)
+        phase2_s3h.judge_inv2_anchor_rebuild_is_canonical_equal, ws)
     assert states["INV-2(REAL)"] == STATE_PASS, report.printed
 
 
@@ -435,7 +435,7 @@ def test_mu16_the_criterion_does_not_call_the_rebuilder(tmp_path):
     from agent.memory.acceptance import phase2_s3h
 
     called = _called_names(
-        phase2_s3h, "judge_inv2_anchor_rebuild_is_byte_equal")
+        phase2_s3h, "judge_inv2_anchor_rebuild_is_canonical_equal")
     # The criterion's own reader IS used.
     assert "rebuild_from_grammar" in called
     assert "parse_anchor_grammar" in called
@@ -443,17 +443,44 @@ def test_mu16_the_criterion_does_not_call_the_rebuilder(tmp_path):
     assert any("rebuild_from_anchor" in name for name in called), (
         "交叉校验必须真的调用实现侧的读法 —— 否则『两份拼写』的漂移就没人看得见")
     # And the verdict is computed from the criterion's own reader:
-    # the byte comparison is against ``rebuilt``, not against
-    # ``theirs``.
+    # the comparison is against ``rebuilt``, not against ``theirs``.
+    #
+    # (SEED 裁决 C7, 2026-11-01: the VERDICT line is now the CANONICAL
+    # comparison — ``lib_canon += 1`` — and the byte counter is a
+    # printed diagnostic that no longer decides.  Both are checked
+    # here, because a verdict that read ``theirs`` would be asking the
+    # object under test what the right answer is.)
     body = _criterion_body(
-        phase2_s3h, "judge_inv2_anchor_rebuild_is_byte_equal")
+        phase2_s3h, "judge_inv2_anchor_rebuild_is_canonical_equal")
     verdict_line = [ln for ln in body.splitlines()
-                    if "lib_byte += 1" in ln or "byte_equal ==" in ln]
-    assert verdict_line, "找不到逐字节判定的代码"
+                    if "lib_byte += 1" in ln or "lib_canon += 1" in ln
+                    or "byte_equal ==" in ln or "canonical_equal ==" in ln]
+    assert verdict_line, "找不到比较的代码"
     for ln in verdict_line:
         assert "theirs" not in ln, (
-            "逐字节判定必须用判据自己的读法（rebuilt），不能用实现侧的（theirs）"
+            "比较必须用判据自己的读法（rebuilt），不能用实现侧的（theirs）"
             " —— 否则就是拿被测对象算期望值")
+    # And the VERDICT itself must be the canonical one, not the byte
+    # one:  ``verdict = "OK" if (lib_rows == lib_canon)````.
+    #
+    # The check is on the UNPARSED body, not on the source text:
+    # ``_criterion_body`` re-formats the function through
+    # ``ast.unparse``, so a literal substring match on the source line
+    # would be a false red for a reason that has nothing to do with
+    # the criterion.
+    verdict_lines = [ln for ln in body.splitlines()
+                     if "lib_canon" in ln and "lib_rows" in ln]
+    assert verdict_lines, (
+        "判定必须用 canonical 计数 —— 逐字节计数只是打印项，不参与判定"
+        "（SEED 裁决 C7）")
+    for ln in verdict_lines:
+        assert "lib_rows == lib_canon" in ln, (
+            "判定行必须比较 lib_rows 与 lib_canon：%r" % ln)
+    # And the BYTE count must NOT decide anything: no verdict line may
+    # compare ``lib_rows`` with ``lib_byte``.
+    for ln in verdict_lines:
+        assert "lib_rows == lib_byte" not in ln, (
+            "逐字节计数不得参与判定：%r" % ln)
 
 
 # ---------------------------------------------------------------------------
