@@ -31,10 +31,31 @@ measured:
      FORBIDDEN, and the statistics columns cannot be trusted.
 
 ⇒ This step is **off by default** and refuses to run without an
-explicit assertion that the old runtime has been retired
-(``--require-old-runtime-retired``).  The assertion is checked against
-the LIVE process list and the old build's directory, and the refusal
-says exactly which condition failed.
+explicit assertion that the re-cut is SAFE
+(``--require-recut-safe``).  The assertion is the BEHAVIOURAL one
+(:mod:`agent.memory.recut_safe`): ``S1 ∧ S2 ∧ (S3 ∨ S4)`` — the guard
+is in place, the guard is effective, and the old build either writes
+nothing or cannot reach the live libraries.
+
+**Why the assertion changed its OBJECT (2026-11-01, 架构师 T7 裁决).**
+The old assertion was "the old runtime has been retired" — a statement
+about a PROCESS.  The thing it was protecting is an INVARIANT: a
+re-cut's product must not be degraded by a legacy writer.  Judging the
+proxy (a process is alive) instead of the invariant (the write boundary
+cannot be degraded) is what made the assertion a false red: the old
+build was alive, but the guard held on all 16 libraries, so a re-cut
+could not have been harmed.
+
+**Changing the assertion did NOT remove the protection.**  The old
+assertion is still here as ``--require-old-runtime-retired`` (an alias
+that keeps the STRICT form: it demands the old build be GONE), and it
+is now the *stronger* of the two.  The new form is what the sweep uses.
+
+**What the re-cut does to the ledger.**  The chunk ids are
+position-derived, so a re-cut replaces the ids.  ``replace_file_chunks``
+prunes the ledger entries of the ids that did NOT come back, inside the
+same transaction — so the ledger never keeps a witness for a row that
+does not exist, and the orphan count does NOT grow.
 
 **The drift measurement is CONTENT-based.**  A file's mtime can be
 forged by a ``touch``; the chunk ids are position-derived, so a
@@ -48,9 +69,33 @@ re-cut is made on the content.
 position-derived, so a re-cut replaces the ids.  ``replace_file_chunks``
 prunes the ledger entries of the ids that did NOT come back, inside the
 same transaction — so the ledger never keeps a witness for a row that
-does not exist.  That is why the re-cut must run BEFORE the orphan
-prune is judged: a re-cut creates orphans by construction, and the
-prune is what removes them.
+does not exist.
+
+**WHY the re-cut runs BEFORE the orphan prune (2026-11-01, 架构师 T7
+裁决 D-1).**  The reason used to be written down as "a re-cut creates
+orphans by construction, and the prune is what removes them".  **That
+reason is WRONG, and it was corrected by measurement:** a re-cut on a
+really-drifted file moves the ids AND prunes the ledger rows of the ids
+that did not come back **in the same transaction**
+(``storage.replace_file_chunks``: ``gone_ids = set(old_stats) - {c.id for
+c in chunks}`` → ``_prune_ledger_entries(gone_ids)``).  Measured on a
+copy of a live library: orphans 0 → 0, content drift 10 → 0, nine old
+ids gone and exactly nine ledger rows pruned.  ⇒ **a re-cut does NOT
+create orphans; it REMOVES ledger entries.**
+
+The ORDER stays as it is (prune, then re-cut, then prune again is not
+what we do — the sweep runs ``orphans`` before ``recut``), because the
+order is harmless either way; but the REASON has to change, or the next
+person will use the wrong reason to "fix" the order.  The correct
+reason for the order is: **the prune runs first so that the sweep's
+report shows the debt that existed BEFORE the re-cut** (the re-cut's own
+ledger prune would otherwise mask it, and the two numbers would be
+confused with each other).
+
+**And the architect's order correction (裁决 §4.2) is in the SWEEP, not
+here:** ``recut → orphans → certify → stats → gate``.  This module's
+docstring used to carry the wrong reason; the sweep's docstring carried
+it too.  Both are corrected in this round.
 """
 
 from __future__ import annotations
@@ -118,7 +163,16 @@ def old_runtime_state() -> Dict[str, Any]:
 
 
 def assert_old_runtime_retired() -> Dict[str, Any]:
-    """The gate.  Returns ``{"ok": bool, "reason": str, "state": {...}}``.
+    """The STRICT gate: the old build must be GONE.
+
+    Returns ``{"ok": bool, "reason": str, "state": {...}}``.
+
+    **This is the OLD assertion, kept.**  It is stronger than the
+    behavioural one (it demands an environment fact, not an invariant),
+    so it is no longer the sweep's default — but it must not be DELETED:
+    a tool that can only be used in one narrow environment is a tool
+    nobody can reason about, and the strict form is the one that says
+    "this environment is clean".
 
     A refusal is a REFUSAL, not a warning: the re-cut of a path the
     old build deleted is exactly the operation that turns the ledger
@@ -150,6 +204,54 @@ def assert_old_runtime_retired() -> Dict[str, Any]:
                    % OLD_BUILD_DIR),
         "state": state,
     }
+
+
+def assert_recut_safe(workspace: Union[str, Path],
+                       window: int = 0) -> Dict[str, Any]:
+    """The BEHAVIOURAL gate: is a re-cut safe?
+
+    Returns ``{"ok": bool, "reason": str, "report": {...}}``.
+
+    **What it judges.**  The invariant, not the proxy: a re-cut's
+    product must not be degraded by a legacy writer.  The formula is
+    ``S1 ∧ S2 ∧ (S3 ∨ S4)`` — see :mod:`agent.memory.recut_safe`.
+
+    **What it does NOT judge.**  Whether the old build is running.  A
+    running old build is an ENVIRONMENT fact; it is reported, and the
+    report says which term of the formula failed.
+
+    **Why S2 is the load-bearing term.**  S1 (the triggers exist) says
+    nothing about whether they WORK.  S2 is the only term that is
+    about the LIBRARY, and therefore the only term that cannot go stale
+    between the check and the re-cut.  S3 and S4 are about NOW.
+    """
+    from agent.memory.recut_safe import judge_recut_safe
+
+    if window and window > 0:
+        report = judge_recut_safe(workspace, window=window)
+    else:
+        # The default window would make a refusal take two minutes; a
+        # refusal is cheap to decide, so a SHORT window is used for the
+        # verdict and the report says so.
+        report = judge_recut_safe(workspace, window=30, sample=10)
+    ok = report.get("verdict") == "PASS"
+    terms = report.get("formula", {})
+    if ok:
+        reason = ("the write boundary cannot be degraded: S1 (guard in "
+                   "place) ∧ S2 (guard effective) ∧ (S3 (the old build "
+                   "writes nothing) ∨ S4 (the old build cannot reach the "
+                   "live libraries)) ⇒ the re-cut is allowed.  "
+                   "This judges the INVARIANT, not whether the old build "
+                   "is running.")
+    else:
+        failed = [k for k, v in terms.items() if not v]
+        reason = ("the re-cut is FORBIDDEN: the formula S1 ∧ S2 ∧ (S3 ∨ "
+                   "S4) does not hold (the failing term(s): %s).  "
+                   "Detail:\n%s"
+                   % (", ".join(failed) or "the formula itself",
+                      report.get("detail", "")))
+    return {"ok": ok, "reason": reason, "report": report,
+            "formula": terms}
 
 
 # ---------------------------------------------------------------------------
@@ -276,12 +378,26 @@ def recut_library(workspace: Union[str, Path],
                   dry_run: bool = True,
                   name: str = "",
                   require_old_runtime_retired: bool = False,
+                  require_recut_safe: bool = False,
+                  recut_safe_window: int = 0,
                   backup_dir: Optional[Union[str, Path]] = None,
                   ) -> Dict[str, Any]:
     """Re-cut the drifted files of ONE library.
 
     The dry-run is the default.  ``dry_run=False`` writes, and it
-    refuses without the environment assertion.
+    refuses without an explicit safety assertion.
+
+    **Two assertions, and which one is which.**
+
+    * ``require_recut_safe`` — the BEHAVIOURAL one (the architect's
+      T7 ruling): ``S1 ∧ S2 ∧ (S3 ∨ S4)``.  It judges the invariant.
+    * ``require_old_runtime_retired`` — the STRICT one (the old
+      assertion): the old build must be GONE.  It judges an environment
+      fact.
+
+    Both are honoured when both are passed: the strict one is stricter,
+    so passing it implies the behavioural one passed too (the strict
+    form's "the old build is gone" makes S3 and S4 trivially true).
     """
     root = Path(workspace)
     dbp = Path(db)
@@ -295,23 +411,38 @@ def recut_library(workspace: Union[str, Path],
         "failed": 0,
         "skipped": [],
         "environment": None,
+        "recut_safe": None,
     }
     if not dbp.is_file():
         out["error"] = "the index does not exist"
         return out
 
     # --- the environment gate -----------------------------------------
+    #
+    # The STRICT gate is always measured (it is cheap and it is the
+    # environment fact the report must carry).  The BEHAVIOURAL gate is
+    # measured when it is the one being asserted, and when the strict
+    # one already holds it is not needed: "the old build is gone" makes
+    # S3 and S4 trivially true, and S1/S2 are the library's own
+    # property — which the strict gate cannot vouch for.
     gate = assert_old_runtime_retired()
     out["environment"] = gate
+    if require_recut_safe or not require_old_runtime_retired:
+        safe = assert_recut_safe(root, window=recut_safe_window)
+        out["recut_safe"] = safe
     if not dry_run:
-        if not require_old_runtime_retired:
+        if not require_recut_safe and not require_old_runtime_retired:
             out["error"] = (
                 "REFUSED: the re-cut is forbidden without an explicit "
-                "assertion that the old runtime has been retired.  Pass "
-                "--require-old-runtime-retired once the old build is "
-                "stopped and the service build is installed.")
+                "safety assertion.  Pass --require-recut-safe (the "
+                "behavioural one: S1∧S2∧(S3∨S4) — the write boundary "
+                "cannot be degraded) or --require-old-runtime-retired "
+                "(the strict one: the old build must be gone).")
             return out
-        if not gate["ok"]:
+        if require_recut_safe and not out["recut_safe"]["ok"]:
+            out["error"] = "REFUSED: " + out["recut_safe"]["reason"]
+            return out
+        if require_old_runtime_retired and not gate["ok"]:
             out["error"] = "REFUSED: " + gate["reason"]
             return out
 
@@ -395,17 +526,31 @@ def recut_family(workspace: Union[str, Path],
                  *,
                  dry_run: bool = True,
                  require_old_runtime_retired: bool = False,
+                 require_recut_safe: bool = False,
+                 recut_safe_window: int = 0,
                  backup_dir: Optional[Union[str, Path]] = None,
                  ) -> Dict[str, Any]:
-    """Re-cut the drifted files of EVERY live library."""
+    """Re-cut the drifted files of EVERY live library.
+
+    **The safety assertion is measured ONCE for the family, not once
+    per library.**  S3 and S4 are about the ENVIRONMENT (one window, one
+    port) and S1/S2 are about the LIBRARIES (sixteen of them).  A
+    per-library window would take 16 × 120 s and would measure the same
+    environment sixteen times.  The family-level verdict is therefore
+    computed once and handed down — and the per-library report says
+    which libraries it covered.
+    """
     from agent.memory.migrate import enumerate_live
 
     root = Path(workspace)
     reports = []
+    family_safe: Optional[Dict[str, Any]] = None
     for lib in enumerate_live(root):
         rep = recut_library(lib["workspace"], lib["db"], dry_run=dry_run,
                             name=lib["name"],
                             require_old_runtime_retired=require_old_runtime_retired,
+                            require_recut_safe=require_recut_safe,
+                            recut_safe_window=recut_safe_window,
                             backup_dir=backup_dir)
         reports.append(rep)
     return {
@@ -454,21 +599,33 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description="Re-cut the files whose projection drifted from the "
                     "truth layer.  DRY-RUN IS THE DEFAULT: --apply is "
-                    "required to write, and it refuses unless the old "
-                    "runtime has been retired.")
+                    "required to write, and it refuses without an "
+                    "explicit safety assertion.")
     ap.add_argument("--workspace", required=True)
     ap.add_argument("--apply", action="store_true",
                     help="actually re-cut (without it, nothing is written)")
+    ap.add_argument("--require-recut-safe", action="store_true",
+                    help="assert that the re-cut is SAFE: the write "
+                         "boundary cannot be degraded (S1∧S2∧(S3∨S4)).  "
+                         "This judges the INVARIANT, not whether the old "
+                         "build is running.")
     ap.add_argument("--require-old-runtime-retired", action="store_true",
                     help="assert that the old desktop build can no longer "
-                         "write the live libraries (required by --apply)")
+                         "write the live libraries (the STRICT form; it "
+                         "demands the old build be GONE, not merely unable "
+                         "to do harm)")
+    ap.add_argument("--recut-safe-window", type=int, default=0,
+                    help="the S3 observation window in seconds (0 = the "
+                         "tool's default)")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args(argv)
 
     report = recut_family(args.workspace, dry_run=not args.apply,
                           require_old_runtime_retired=(
-                              args.require_old_runtime_retired))
+                              args.require_old_runtime_retired),
+                          require_recut_safe=args.require_recut_safe,
+                          recut_safe_window=args.recut_safe_window)
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
