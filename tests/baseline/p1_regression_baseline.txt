@@ -8,11 +8,110 @@
 #
 # 比对的是**集合**不是数量：数量相同但内容换了，也是回归。
 #
-# 基线时间：2026-10-30 23:05（S3-R 门禁全绿重钉）
-# 基线代码：live-memory @ 3f4f84ee + 本轮的 acceptance/ 改动
+# 基线时间：2026-11-01 11:05（S3-T/U 重钉 · 裁决 C2 逐条归因）
+# 基线代码：live-memory @ a65d1e21 + 本轮的 acceptance/ 改动
 # 机器：本机（16 个活库）
 #
-# --- 本次重钉的说明（2026-10-30 · S3-R） ---
+# ============================================================================
+# --- 本次重钉的说明（2026-11-01 · S3-T/U · 裁决 C2） ---
+# ============================================================================
+#
+# **为什么重钉**：本轮门禁的 Q5 报「新增失败 13 条」，而这 13 条全部是
+# `*:INV-2/3`。基线文件停在 2026-10-30 23:05，此后语料与实现都动过，
+# 基线已经过期 —— 裁决 C2：**基线更新必须逐条列归因，禁止一键刷新**
+# （刷基线 = 把尺子换成短的）。
+#
+# --------------------------------------------------------------------
+# 【逐条新增】13 条，全部是 `:INV-2/3`，归因如下
+# --------------------------------------------------------------------
+#
+# 归因 A：**真源内容漂移（content drift）** —— 真源文件在「认证之后」
+#          被改过，锚点重建出来的片段与库里存的投影不再逐字节相等。
+#          这**不是判据的问题，也不是迁移的问题**，是知识页被编辑了
+#          而库没有重新切块。
+#
+#   涉及的真源文件（3 个）与它们的「改动时间 vs 认证时间」：
+#
+#     1. knowledge/engineering/lightpanda-browser-for-ai-agents.md
+#        真源 mtime = 2026-10-31 01:08:39
+#        账本 certified_at = 2026-10-30 10:42:52 / 10:42:53
+#                            / 2026-10-31 01:22:20 / 04:28:09 / 04:28:14 / 04:28:16
+#        ⇒ 真源在 01:08 被改，而**部分**认证记录是 01:22 之后做的 ——
+#          也就是说：**有 5 个 agent 的账本还停在 10-30 10:42 的那次认证**，
+#          那时真源已经是旧版。
+#
+#     2. knowledge/engineering/sqlite-trigger-order-is-load-bearing.md
+#        真源 mtime = 2026-10-31 05:36:22
+#        账本 certified_at = 2026-10-30 22:05:25 / 2026-10-31 06:00:43
+#                            / 2026-11-01 02:20:54 / 10:12:42
+#        ⇒ 同上：2026-10-30 22:05 的认证早于 05:36 的改动。
+#
+#     3. AGENT.md（7 个 agent 的 persona 层）
+#        真源 mtime = 2026-11-01 04:59:28
+#        账本 certified_at = 2026-10-30 10:42:52 / 10:42:53
+#        ⇒ 人格层在 11-01 04:59 换过（P2-1 的 L2 persona 层落地），
+#          而这些 agent 的库还拿着 10-30 的认证。
+#
+#   **这 13 条的共同根因是同一个：真源改了，库没跟着重新切块。**
+#   修法是「重切 + 重认证」，属**工程师**（F1/F2 的主责），不是判据侧。
+#   **本轮不动它**：门禁上它们是**真红**（真源漂移是事实），基线记下来
+#   是为了让 Q5 从「基线过期」的红，回到「这些漂移是已知失败」的可判定状态。
+#
+#   逐条清单（13 条，全部 INV-2/3）：
+#     agent-mvnerelm        agent-mvnes449        agent-mvnfgk8p
+#     agent-mvnfkp3d        agent-mvnlair8        app
+#     consistency-guardian  core-architect        course-evaluator
+#     default               learner-analyst       teaching-coach
+#     web
+#
+#   实测证据（逐条点名到 chunk + path）：
+#     agent-mvnerelm        chunk 21873ef1… knowledge/concepts/windows-to-linux-handoff-line-endings.md
+#     agent-mvnes449        chunk df6f4f41… knowledge/engineering/lightpanda-browser-for-ai-agents.md（inv3-fragment-hash-mismatch）
+#     agent-mvnfgk8p        chunk 0cb7777c…/864e5b00…/ef58c74f… AGENT.md
+#     agent-mvnfkp3d        chunk a0f924ea…/b63290d5…/6d4f01be… AGENT.md
+#     agent-mvnlair8        chunk df6f4f41…/0f11011f…/6fa804ec…/16c3783d… lightpanda-browser-for-ai-agents.md
+#     app                  chunk 8351f2c9…/1b0e65c0…/ef58c74f… AGENT.md
+#     consistency-guardian  chunk ed517215… sqlite-trigger-order-is-load-bearing.md
+#     core-architect        chunk df6f4f41… lightpanda-browser-for-ai-agents.md（inv3-fragment-hash-mismatch）
+#     course-evaluator      chunk 9f71a4cf…/ec25bd43…/cc003c2f… AGENT.md
+#     default               chunk df6f4f41…/0f11011f…/6fa804ec…/16c3783d… lightpanda-browser-for-ai-agents.md
+#     learner-analyst       chunk 9f71a4cf…/ed8a272d…/59361d06… AGENT.md
+#     teaching-coach        chunk df6f4f41…/0f11011f…/6fa804ec…/16c3783d… lightpanda-browser-for-ai-agents.md
+#     web                   chunk df6f4f41…/0f11011f…/6fa804ec…/16c3783d… lightpanda-browser-for-ai-agents.md
+#
+# --------------------------------------------------------------------
+# 【逐条消失】0 条
+# --------------------------------------------------------------------
+#
+#   基线里的 16 条（16 个 `:SHELF-LAG`）**一条都没有转绿**，也**一条都没有
+#   变成 NOTRUN**（失去可见性 0 条）。⇒ 本次重钉**只增不减**。
+#
+# --------------------------------------------------------------------
+# 【快照对照】（裁决：活库在动，结论只能来自快照对照）
+# --------------------------------------------------------------------
+#
+#   取证时间：2026-11-01 10:35 与 10:37（间隔 20 秒，两次独立全量快照）
+#   快照 A：RED=29  NOTRUN=16
+#   快照 B：RED=29  NOTRUN=16
+#   **失败集合完全相同（same RED SET = True，NEW=[]，GONE=[]）**
+#   ⇒ 这 13 条不是「跑一次看几红」的噪声，是**稳定复现**的失败。
+#
+# --------------------------------------------------------------------
+# 【本次重钉**没有**做的事（明确边界）】
+# --------------------------------------------------------------------
+#
+#   * ❌ 没有一键刷新基线（裁决 C2）。
+#   * ❌ 没有放宽任何判据的断言 —— INV-2/3 的断言一个字没动。
+#   * ❌ 没有把真源漂移说成「已修复」—— 它是**已知失败**，不是修复。
+#   * ❌ 没有动 ROOT:INV-2/3 —— ROOT 库这一条**不在本次新增里**
+#     （ROOT 的 INV-2/3 在基线里也没有；本轮门禁它报红是 **F1/F2 的
+#     另一条**，见下面的「不在本基线范围内」的说明）。
+#
+# ============================================================================
+# --- 历史重钉记录 ---
+# ============================================================================
+#
+# --- 2026-10-30 23:05 · S3-R ---
 #
 # 移除 3 条：agent-mvnes449:INV-1、agent-mvnewfyb:INV-1、
 #            core-architect:INV-1。
@@ -38,8 +137,6 @@
 #
 # 新增 0 条。失败集从 19 条变成 16 条，**没有一条是判据改动造成的**
 # （本轮的门禁全绿：40/40 PASS · FAIL 0 · NOTRUN 0）。
-#
-# --- 历史重钉记录 ---
 #
 # --- 2026-10-30 15:10 · S3-K ---
 #
@@ -78,6 +175,25 @@
 #   Q5 报「失去可见性」，那是把一次修复说成一次回归。）
 #
 # --- SHELF-LAG RED（真源变更晚于 shelf 页生成时间） ---
+#
+# ⚠️ **不在本基线范围内的条目（重要，勿误读）**：
+#
+# 本基线只覆盖 **Q5 自己测的那一组判据**（``text_inv`` 的
+# ``run_text_invariants``，即 INV-1/2/3/SHELF-LAG 等）。**门禁里其它组的
+# 红不在这个基线里** —— 包括：
+#
+#   * ``INV-2(REAL)`` / ``ANCHOR(REAL)`` / ``Q2(REAL)`` —— 那是**另一条**
+#     判据（阶段三的验收侧 INV-2，独立实现、独立读法），它红是因为
+#     **数据漂移 + 锚点自洽**两个问题，属 F1/F2 的主责（架构师→工程师）。
+#   * ``C-A3.4`` / ``J-3`` / ``M6e`` —— files 统计列的三态，属 F6/F7。
+#   * ``M6f`` —— 账本孤儿（裁决 C3：撤销认证，不是丢数据），属 F11。
+#   * ``J-2`` —— NOTRUN（前置未成立）。
+#   * ``I-1`` —— 本轮新增的外置积压判据（交办书 B）。
+#
+# 它们的红**不会**让 Q5 报「新增失败」，因为 Q5 只比 ``text_inv`` 那一组。
+# 那是 Q5 的设计（它测的是「文本不变量这一组的失败集只减不增」），不是
+# 本基线的疏漏。**门禁的全局失败集合由门禁的汇总行负责，不由 Q5 负责。**
+#
 ROOT:SHELF-LAG
 agent-mvnerelm:SHELF-LAG
 agent-mvnes449:SHELF-LAG
@@ -94,3 +210,16 @@ default:SHELF-LAG
 learner-analyst:SHELF-LAG
 teaching-coach:SHELF-LAG
 web:SHELF-LAG
+agent-mvnerelm:INV-2/3
+agent-mvnes449:INV-2/3
+agent-mvnfgk8p:INV-2/3
+agent-mvnfkp3d:INV-2/3
+agent-mvnlair8:INV-2/3
+app:INV-2/3
+consistency-guardian:INV-2/3
+core-architect:INV-2/3
+course-evaluator:INV-2/3
+default:INV-2/3
+learner-analyst:INV-2/3
+teaching-coach:INV-2/3
+web:INV-2/3

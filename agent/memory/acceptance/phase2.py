@@ -945,6 +945,50 @@ _S3M_CRITERIA = [
 ]
 
 # ---------------------------------------------------------------------------
+# S3-T · the externalisation COMPLETENESS criteria (I-1..I-4).
+#
+# They live in their own module (``phase2_s3t``) because they judge a
+# DIFFERENT subject from S3-M: S3-M asks "is the part that WAS
+# externalised self-consistent?" (the JSONL chain, the anchor, the
+# counts), and S3-T asks "is the externalisation COMPLETE?" — how many
+# rows are still holding their text in the database, and how old are
+# they.
+#
+# **That difference is the whole point of this group.**  Measured
+# 2026-11-01 03:00: the live ROOT library carried 7,061 inline rows,
+# and the number GREW while the gap was being discussed — and NONE of
+# MSG-INV-1..7 or M-1..M-6 could see it.  MSG-INV-5 counts only
+# ``content_state='external'``; an inline row is in neither the JSONL
+# nor that count.  ⇒ "门禁全绿" and "持续失血" could both be true at
+# the same time.  This group is what closes that blind spot.
+_S3T_CRITERIA = [
+    ("I-1", "judge_i1_inline_backlog_is_bounded"),
+    ("I-2", "judge_i2_write_path_externalises"),
+    ("I-3", "judge_i3_jsonl_and_db_conserve"),
+    ("I-4", "judge_i4_recut_leaves_no_ledger_orphans"),
+]
+
+# ---------------------------------------------------------------------------
+# S3-U · 「既有库迁得动」 (U-1).
+#
+# It lives in its own module (``phase2_s3u``) because it judges a
+# DIFFERENT subject from every other group: not a live library's state,
+# but the MIGRATION'S ABILITY on a library that is in the OLD shape.
+#
+# **Why it is a separate criterion and not a variation on an existing
+# one.**  Measured 2026-11-01: every one of the 21+ existing criteria
+# runs in a FRESH FIXTURE — a library the test built itself, with the
+# schema already in its final shape.  A fresh fixture cannot answer
+# "can an EXISTING library be migrated": an old library has no
+# ``content_state`` column and its ``content`` is NOT NULL, so the
+# externalisation literally cannot run until the schema is lifted.
+# ⇒ 「既有库迁得动」 had NO coverage at all — a collective blind spot
+# of 21 criteria, not one missing test.
+_S3U_CRITERIA = [
+    ("U-1", "judge_u1_existing_library_can_be_migrated"),
+]
+
+# ---------------------------------------------------------------------------
 # P2-1 · the L2 persona layer.
 #
 # They live in their own module (``phase2_p2``) because they judge a
@@ -1122,6 +1166,42 @@ def _load_s3m():
     return out
 
 
+def _load_s3t():
+    """The S3-T criterion functions, bound to the workspace."""
+    from agent.memory.acceptance import phase2_s3t
+
+    ws = Path(resolve_workspace(ARGS.workspace)[0])
+    out = []
+    for group, attr in _S3T_CRITERIA:
+        fn = getattr(phase2_s3t, attr)
+
+        def make(fn=fn, ws=ws):
+            def run(report):
+                return fn(report, ws)
+            return run
+
+        out.append((group, make()))
+    return out
+
+
+def _load_s3u():
+    """The S3-U criterion functions, bound to the workspace."""
+    from agent.memory.acceptance import phase2_s3u
+
+    ws = Path(resolve_workspace(ARGS.workspace)[0])
+    out = []
+    for group, attr in _S3U_CRITERIA:
+        fn = getattr(phase2_s3u, attr)
+
+        def make(fn=fn, ws=ws):
+            def run(report):
+                return fn(report, ws)
+            return run
+
+        out.append((group, make()))
+    return out
+
+
 def main() -> int:
     workspace, how = resolve_workspace(ARGS.workspace)
 
@@ -1192,6 +1272,18 @@ def main() -> int:
 
     # The S3-M criteria (the messages domain: MSG-INV-1..7) — 施工图 阶段 5.
     for group, fn in _load_s3m():
+        if ARGS.only and not group.startswith(ARGS.only):
+            continue
+        guarded(fn, report)
+
+    # The S3-T criteria (the externalisation COMPLETENESS: I-1..I-4).
+    for group, fn in _load_s3t():
+        if ARGS.only and not group.startswith(ARGS.only):
+            continue
+        guarded(fn, report)
+
+    # The S3-U criteria (「既有库迁得动」: U-1).
+    for group, fn in _load_s3u():
         if ARGS.only and not group.startswith(ARGS.only):
             continue
         guarded(fn, report)

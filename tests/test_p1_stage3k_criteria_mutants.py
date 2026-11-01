@@ -263,7 +263,11 @@ def test_mu21_the_keep_table_is_not_the_witness(tmp_path):
     assert states2.get("M6a(REAL)") == STATE_PASS, (
         "变异体应当把『从未认证』的行判成已认证 —— "
         "这正是 MU-21 证明的洞：keep 表记的是『被威胁过』，不是『被认证过』")
-    assert "未认证(not_certified)=0" in report2.printed
+    # 裁决 C1（2026-11-01）：报告里的标签从「未认证(not_certified)」改成
+    # 「认证滞后」+「超阈值未认证」—— 认证滞后是正常中间态，PASS + 自报；
+    # 只有超过阈值（默认 600s）的才 FAIL。这条断言跟着口径走。
+    assert "认证滞后=0" in report2.printed, report2.printed
+    assert "超阈值未认证=0" in report2.printed, report2.printed
 
     # --- AFTER the restore: the keep table is a keep table again
     conn = sqlite3.connect(str(_db_of(ws)))

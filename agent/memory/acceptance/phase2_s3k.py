@@ -51,9 +51,11 @@ The three states, and who owns which
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.memory.acceptance import Report
 from agent.memory.acceptance.live_libs import enumerate_live, open_ro
@@ -61,6 +63,31 @@ from agent.memory.acceptance.live_libs import enumerate_live, open_ro
 
 #: The four legal values of ``chunks.body_origin``.
 ORIGIN_VALUES: Tuple[str, ...] = ("file", "blob", "orphan", "unresolved")
+
+#: The default ceiling on the CERTIFICATION LAG (裁决 C1).
+#: A row that has been waiting for the certifier for longer than this
+#: is not "lagging" any more — it was MISSED.  Configurable through
+#: ``COW_M6A_MAX_LAG_SECONDS``.
+M6A_DEFAULT_MAX_LAG_SECONDS = 600
+
+
+def _m6a_max_lag_seconds() -> int:
+    """The certification-lag ceiling, in seconds.
+
+    A threshold written into the source is a constant that belongs to
+    one machine's tempo; the certification pass's cadence is a property
+    of the deployment, not of the criterion.  A malformed environment
+    value falls back to the default rather than crashing the gate (the
+    harness counts a raising criterion as a failure, and a typo in an
+    environment variable must not be able to take the whole gate down).
+    """
+    raw = os.environ.get("COW_M6A_MAX_LAG_SECONDS")
+    if raw is None or str(raw).strip() == "":
+        return M6A_DEFAULT_MAX_LAG_SECONDS
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return M6A_DEFAULT_MAX_LAG_SECONDS
 
 
 def _tables(conn: sqlite3.Connection) -> set:
@@ -209,16 +236,37 @@ def judge_m6a_certification_coverage(report: Report, workspace: Path):
     measure.  A NOTRUN here would be a silent green on the exact
     question the criterion exists to ask.
 
-    The three counts are reported side by side, because they are three
-    DIFFERENT gaps and a reader who only sees a number cannot tell
-    them apart:
+    ====================================================================
+    裁决 C1 (2026-11-01) · 认证滞后：从「无理由的红」变成「可数的量 + 一个阈值」
+    ====================================================================
 
-      * ``not_certified`` — has a pointer, has a decided origin, but
-        has NO certification record.  **This is M6a's FAIL.**
-      * ``never_decided`` — ``body_origin='unresolved'``: nobody ever
-        decided this row.  A gap of a different kind, reported (and
-        asserted by its own criterion).
-      * ``certified`` — the rest.
+    **旧语义.**  只要存在一行「有指针 + origin=file + 账本里没有它」，
+    M6a 就 FAIL。  判据不看这一行**存在多久**。
+
+    **新语义.**  这件事被拆成两半：
+
+      * **认证滞后（LAG）** —— 一行已经写下来了，但认证器还没轮到它。
+        这是一个**正常的中间态**：写入口和认证 pass 是两件事，认证
+        是按批跑的。  所以滞后本身**不是缺陷**，它是一个**可以数的
+        量**：滞后行数 + 年龄分布。  **PASS + 自报**。
+      * **从未认证（NEVER）** —— 一行「有指针 + origin=file」而账本里
+        完全没有它，且它已经**超过滞后阈值**（默认 600 秒，可配）。
+        到了这个年龄还没有人认证它，那不是滞后，是**漏掉了**。
+        **FAIL**。
+
+    **为什么不用 NOTRUN —— 这是本条判据最重要的一句话.**
+    NOTRUN 的语义是「**没法测量**」。  这里明明测到了：滞后行数是可数
+    的，年龄是可数的。  用 NOTRUN 会在门禁上开一个**永久性的假绿口子**
+    —— 任何一次「认证滞后」都会把这条判据变成 NOTRUN，而 NOTRUN 不
+    是绿、但它是「没测」，于是门禁上就多了一个永远不会被追的洞。
+    （SEED 在 P2-1 的判据里踩过同一个坑：FAIL 分支忘置
+    ``verdict='FAIL'``，结果一份坏掉的层被判成 NOTRUN。）
+
+    **阈值可配.**  ``COW_M6A_MAX_LAG_SECONDS``（默认 600 秒）。
+    写死的阈值是某台机器的节拍，不是判据的财产。
+
+    **注意：M6a 判的是「认证滞后」，不是「内容对不对」** —— 后者是
+    M6b（降级）、M6c（被拒的行）、M6d（开关）的事。这条判据不碰它们。
     """
     detail: List[str] = []
     libs = enumerate_live(workspace)
@@ -233,7 +281,16 @@ def judge_m6a_certification_coverage(report: Report, workspace: Path):
     grand_pending = 0
     grand_never = 0
     grand_certified = 0
+    grand_overdue = 0
     ledgers_absent: List[str] = []
+
+    max_lag = _m6a_max_lag_seconds()
+    now = int(time.time())
+    detail.append("认证滞后阈值: %ds（COW_M6A_MAX_LAG_SECONDS）"
+                  % max_lag)
+    detail.append("判定口径: 有指针且 origin=file 而账本里没有它 ⇒ 认证滞后；"
+                  "滞后年龄 ≤ 阈值 ⇒ 计入自报；> 阈值 ⇒ FAIL（那是漏掉了，不是滞后）。")
+    detail.append("")
 
     for lib in libs:
         conn = open_ro(lib.db)
@@ -255,13 +312,33 @@ def judge_m6a_certification_coverage(report: Report, workspace: Path):
                 red_libs.append(lib.name)
                 continue
 
+            # The age of a pending row: WHEN IT WAS WRITTEN.  The
+            # chunks table's ``created_at`` is the row's own timestamp;
+            # ``updated_at`` is when it was last touched, and the
+            # certification writes to the LEDGER, not to the chunk, so
+            # ``created_at`` is the honest clock here.
             pending = conn.execute(
                 "SELECT c.id, c.path, c.text_state, c.body_origin, "
-                "       c.body_path, c.body_anchor, c.body_hash "
+                "       c.body_path, c.body_anchor, c.body_hash, c.created_at "
                 "FROM chunks c "
                 "WHERE c.text_state<>'mirror' AND c.body_origin='file' "
                 "AND c.body_path IS NOT NULL "
                 "AND c.id NOT IN (SELECT id FROM cert_ledger)").fetchall()
+
+            # **The split: LAG (young) vs NEVER (old).**  The ages are
+            # computed against ``now``; a row with no ``created_at``
+            # cannot be aged, and an un-ageable row is treated as
+            # OVERDUE (an un-ageable pending row is a row nobody can
+            # explain).
+            lag_ages: List[int] = []
+            overdue: List[Tuple[Any, ...]] = []
+            for r in pending:
+                created = r[7]
+                age = (now - int(created)) if created else None
+                if age is None or age > max_lag:
+                    overdue.append((r, age))
+                else:
+                    lag_ages.append(age)
 
             never_decided = conn.execute(
                 "SELECT COUNT(*) FROM chunks WHERE body_origin='unresolved'"
@@ -275,34 +352,53 @@ def judge_m6a_certification_coverage(report: Report, workspace: Path):
 
             detail.append("  %-22s 路径=%s" % (lib.name, lib.db))
             detail.append("      行数=%-6d 账本条目=%-6d 已认证=%-6d "
-                          "未认证(not_certified)=%-4d 无人判定(unresolved)=%-4d"
-                          % (total, ledger_rows, certified, len(pending),
-                             never_decided))
-            if pending:
-                for r in pending[:10]:
-                    detail.append("      ! 未认证: id=%s path=%s state=%s "
-                                  "origin=%s body_path=%s anchor=%s hash=%s"
+                          "认证滞后=%-4d 超阈值未认证=%-4d 无人判定(unresolved)=%-4d"
+                          % (total, ledger_rows, certified, len(lag_ages),
+                             len(overdue), never_decided))
+            if lag_ages:
+                lag_ages.sort()
+                detail.append("      认证滞后的年龄分布: 最老=%ds 中位=%ds 最新=%ds"
+                              "（全部 ≤ 阈值 %ds）"
+                              % (lag_ages[-1], lag_ages[len(lag_ages) // 2],
+                                 lag_ages[0], max_lag))
+                detail.append("      自报: 这些行还没被认证，但都还在正常滞后窗口内"
+                              " —— 认证是按批跑的，不是逐行的")
+            if overdue:
+                for r, age in overdue[:10]:
+                    detail.append("      ! 超阈值未认证: id=%s path=%s state=%s "
+                                  "origin=%s body_path=%s anchor=%s hash=%s "
+                                  "年龄=%s"
                                   % (r[0], r[1], r[2], r[3],
                                      (r[4] or "")[:60], (r[5] or "")[:40],
-                                     (r[6] or "")[:16]))
+                                     (r[6] or "")[:16],
+                                     ("%ds" % age) if age is not None
+                                     else "未知（没有 created_at）"))
                     detail.append("        它缺什么: 有指针、有已判定的 origin，"
-                                  "但 cert_ledger 里没有它 —— 它从未被认证过")
-                if len(pending) > 10:
-                    detail.append("      ! ... 还有 %d 条未列出" % (len(pending) - 10))
+                                  "但 cert_ledger 里没有它 —— 而它已经超过 "
+                                  "%ds 的滞后阈值：这不是滞后，是漏掉了"
+                                  % max_lag)
+                if len(overdue) > 10:
+                    detail.append("      ! ... 还有 %d 条未列出"
+                                  % (len(overdue) - 10))
                 ok = False
                 red_libs.append(lib.name)
             grand_pending += len(pending)
+            grand_overdue += len(overdue)
             grand_never += never_decided
             grand_certified += certified
         finally:
             conn.close()
 
     detail.append("")
-    detail.append("全活库合计: 已认证=%d  未认证(not_certified)=%d  "
-                  "无人判定(unresolved)=%d" % (grand_certified, grand_pending,
-                                        grand_never))
+    detail.append("全活库合计: 已认证=%d  认证滞后=%d（其中超阈值=%d）  "
+                  "无人判定(unresolved)=%d"
+                  % (grand_certified, grand_pending, grand_overdue,
+                     grand_never))
     detail.append("证人: cert_ledger（认证者写）。守卫的 body_keep 不能当证人 —— "
                   "它由触发器写，触发器只在写入被拦截时才跑，新增行天然不在里面。")
+    detail.append("（口径 C1：认证滞后是正常的中间态，PASS + 自报；"
+                  "只有超过 %ds 还没认证的才判 FAIL。**不用 NOTRUN** —— "
+                  "这里明明测到了，NOTRUN 的语义是『没法测量』。）" % max_lag)
     if ledgers_absent:
         detail.append("没有 cert_ledger 的库: %s" % ", ".join(ledgers_absent))
 

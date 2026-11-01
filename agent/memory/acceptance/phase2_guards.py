@@ -128,6 +128,25 @@ CRITERION_FILES = ("phase2.py", "phase2_s3e.py", "phase2_s3h.py",
 #:          its witness (a blanket cascade)
 #:   MU-34  the M6f detector is BLINDED ⇒ the fix at the write boundary
 #:          would have made the detector blind to a foreign DELETE
+#:
+#: MU-35..MU-38 are the S3-T round's four — the externalisation
+#: COMPLETENESS (the blind spot where "门禁全绿" and "持续失血" can
+#: both be true):
+#:   MU-35  I-1's age rule is NEUTERED ⇒ the backlog rule is a comment
+#:   MU-36  the write path's externalisation is REMOVED ⇒ I-2's
+#:          behavioural half must catch it (the static half cannot)
+#:   MU-37  the truth tree and the DB DISAGREE ⇒ I-3 must be red, in
+#:          BOTH directions (and a count comparison would cancel the
+#:          two wrongs out — hence the SET comparison)
+#:   MU-38  the write boundary's ledger prune is REMOVED ⇒ I-4 must be
+#:          red (the mechanism, not the存量)
+#:
+#: MU-39/MU-40 are the S3-U round's two — 「既有库迁得动」:
+#:   MU-39  the migration processes only the DEFAULT agent ⇒ a PARTIAL
+#:          migration that reports success ⇒ U-1 must be red
+#:   MU-40  the migration empties the rows but writes NOTHING to the
+#:          truth tree ⇒ U-1 must be red (that is data loss, not a
+#:          migration)
 REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
     "test_p1_stage3e_criteria_mutants.py": (
         "MU-1", "MU-2", "MU-3", "MU-4", "MU-5", "MU-6", "MU-7", "MU-8", "MU-9",
@@ -143,6 +162,12 @@ REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
     ),
     "test_p1_stage3n_criteria_mutants.py": (
         "MU-27", "MU-28", "MU-29", "MU-30", "MU-31", "MU-32", "MU-33", "MU-34",
+    ),
+    "test_p1_stage3t_criteria_mutants.py": (
+        "MU-35", "MU-36", "MU-37", "MU-38",
+    ),
+    "test_p1_stage3u_criteria_mutants.py": (
+        "MU-39", "MU-40",
     ),
 }
 
