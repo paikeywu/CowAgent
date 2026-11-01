@@ -19,6 +19,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from agent.memory.storage import MemoryStorage
+from agent.memory.file_hash import file_hash_matches
 from agent.memory.embedding.state import detect_chunker_version
 from agent.memory.chunker import TextChunker
 
@@ -226,10 +227,14 @@ class TestSyncStampsVersion(unittest.TestCase):
             # ``as_posix()`` states the product's contract directly and
             # reads the same on every platform.
             expected_path = (Path("knowledge") / "nested" / "index.md").as_posix()
-            expected_hash = MemoryStorage.compute_hash(
-                knowledge_file.read_text(encoding="utf-8")
-            )
-            self.assertEqual(manager.storage.get_file_hash(expected_path), expected_hash)
+            # T2d (2026-11-01): the assertion is about the FINGERPRINT,
+            # not about the shape the stored value happens to have (the
+            # stored shape is a history: bare raw-text digest from the
+            # scan path, prefixed canonical digest from the rebuilder).
+            self.assertTrue(file_hash_matches(
+                manager.storage.get_file_hash(expected_path),
+                knowledge_file.read_text(encoding="utf-8"),
+            ))
             self.assertEqual(manager.storage.get_stats()["files"], 1)
             rows = manager.storage.conn.execute(
                 "SELECT path, source FROM chunks"

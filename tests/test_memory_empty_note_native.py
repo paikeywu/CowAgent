@@ -8,6 +8,7 @@ import pytest
 
 from agent.memory.config import MemoryConfig
 from agent.memory.manager import MemoryManager
+from agent.memory.file_hash import file_hash_matches
 from agent.memory.embedding.provider import OpenAIEmbeddingProvider
 from agent.tools.write.write import Write
 from agent.tools.memory.memory_search import MemorySearchTool
@@ -67,7 +68,13 @@ def test_clearing_a_note_removes_its_searchable_content(make, replacement):
     assert "QUARTZCLEAR8812" in _search(manager, "QUARTZCLEAR8812")
     assert write("memory/owned.md", replacement) == "success"
     assert "old fact" not in _search(manager, "QUARTZCLEAR8812")
-    assert manager.storage.get_file_hash("memory/owned.md") == manager.storage.compute_hash(replacement)
+    # T2d (2026-11-01): ``files.hash`` is compared through the ONE
+    # fingerprint entry point, because the stored shape is a HISTORY
+    # (bare raw-text digest from this path, prefixed canonical digest
+    # from the rebuilder) and the comparison must not depend on it.
+    # The assertion is about the FINGERPRINT, not about its spelling.
+    assert file_hash_matches(manager.storage.get_file_hash("memory/owned.md"),
+                             replacement)
     assert "TOPAZKEEP9913" in _search(manager, "TOPAZKEEP9913")
     assert write("memory/owned.md", "# New\nAMBERNEW5514 new fact\n") == "success"
     assert "AMBERNEW5514" in _search(manager, "AMBERNEW5514")
@@ -99,6 +106,8 @@ def test_failed_embedding_keeps_pending_updates_and_blank_text_is_never_embedded
     assert write("memory/change.md", "") == "success"
     asyncio.run(manager.sync())
     assert len(calls) == count
-    assert storage.get_file_hash("memory/change.md") == storage.compute_hash("")
+    # T2d (2026-11-01): compared through the ONE fingerprint entry point
+    # (the stored shape is a history, not a contract).
+    assert file_hash_matches(storage.get_file_hash("memory/change.md"), "")
     assert storage.conn.execute("SELECT COUNT(*) FROM chunks WHERE path = ?", ("memory/change.md",)).fetchone()[0] == 0
     assert all(text.strip() for call in calls for text in call["input"])

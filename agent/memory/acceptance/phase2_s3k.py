@@ -194,10 +194,22 @@ def _file_changed(workspace: Path, relpath: str, stored_hash: Optional[str],
         if stored_hash:
             import hashlib
             try:
-                digest = hashlib.sha256(truth.read_bytes()).hexdigest()
+                raw = truth.read_bytes()
+                content = truth.read_text(encoding="utf-8")
             except OSError:
                 return True
-            if digest != stored_hash:
+            # T2d (2026-11-01): the comparison goes through the ONE
+            # fingerprint entry point.  ``files.hash`` is stored in TWO
+            # historical shapes (prefixed by the rebuilder, bare by the
+            # manager's scan path) and the two writers disagree on the
+            # digest BASIS as well (canonical vs raw text).  A raw
+            # string comparison read 1109 of 1193 live rows as "the file
+            # changed" — 92.9% false alarms.
+            #
+            # The stored value is NOT rewritten (that would change the
+            # hash chain); the read side carries both shapes.
+            from agent.memory.file_hash import hash_matches
+            if not hash_matches(stored_hash, content, raw_bytes=raw):
                 return True
         if stored_mtime and int(truth.stat().st_mtime) > int(stored_mtime):
             return True

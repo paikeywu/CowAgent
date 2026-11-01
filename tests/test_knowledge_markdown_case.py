@@ -19,6 +19,7 @@ from click.testing import CliRunner
 from agent.knowledge.service import KnowledgeService
 from agent.memory.config import MemoryConfig
 from agent.memory.manager import MemoryManager
+from agent.memory.file_hash import file_hash_matches
 from agent.memory.storage import MemoryStorage
 from cli.commands.knowledge import knowledge
 workspace = Path(sys.argv[1]).resolve()
@@ -68,14 +69,16 @@ try:
         graph = service.dispatch('graph')['payload']
         assert {node['id'] for node in graph['nodes']} == {source, target}
         assert graph['links'] == [{'source': source, 'target': target}]
-        assert manager.storage.get_file_hash('knowledge/' + source) == MemoryStorage.compute_hash(content)
+        assert file_hash_matches(
+            manager.storage.get_file_hash('knowledge/' + source), content)
         assert (workspace / 'knowledge' / source).read_text(encoding='utf-8') == content
         if action != 'rename':
             keyword_paths = {item.path for item in asyncio.run(manager.search('quasarorchid', min_score=0))}
             assert keyword_paths == {'knowledge/' + source}, keyword_paths
         else:
             assert service.dispatch('read', {'path': source})['payload']['content'] == content
-            assert manager.storage.get_file_hash('knowledge/' + target) == MemoryStorage.compute_hash('# Owned target\n')
+            assert file_hash_matches(
+                manager.storage.get_file_hash('knowledge/' + target), '# Owned target\n')
         if action == 'cli':
             stats = CliRunner().invoke(knowledge, [])
             tree = CliRunner().invoke(knowledge, ['list'])

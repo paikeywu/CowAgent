@@ -15,6 +15,7 @@ from datetime import datetime
 from agent.memory.config import MemoryConfig, get_default_memory_config
 from agent.memory.storage import MemoryStorage, MemoryChunk, SearchResult
 from agent.memory.chunker import TextChunker, chunk_for_file
+from agent.memory.file_hash import canonical_file_hash, file_hash_matches
 from agent.memory.embedding import EmbeddingProvider, EmbeddingCache
 from agent.memory.layers import excluded_segments
 from agent.memory.release_state import ReleaseStateCache
@@ -1017,7 +1018,11 @@ class MemoryManager:
         self.storage.save_chunks_batch(memory_chunks)
         
         # Update file metadata
-        file_hash = MemoryStorage.compute_hash(content)
+        # T2d (2026-11-01): new writes use the ONE canonical shape
+        # (prefixed, canonical-text basis) so the historical fork stops
+        # GROWING.  Existing rows keep their original value — the read
+        # side carries both shapes (see agent/memory/file_hash.py).
+        file_hash = canonical_file_hash(content)
         # P1-阶段三 (C-A3): the real chunk count and the chunker version,
         # so the files row states a fact instead of defaulting to 0.
         self.storage.update_file_metadata(
@@ -1248,7 +1253,12 @@ class MemoryManager:
                 # Was silent, which made a half-indexed workspace look healthy.
                 logger.warning(f"[MemoryManager] Skipping {file_path}: cannot read it ({e})")
                 continue
-            file_hash = MemoryStorage.compute_hash(content)
+            # T2d (2026-11-01): the canonical shape for NEW writes (see
+            # agent/memory/file_hash.py).  This path used to write a bare
+            # raw-text digest, which is the other half of the historical
+            # fork; the read side carries both shapes for the rows that
+            # already exist.
+            file_hash = canonical_file_hash(content)
             # P0-11 P-2 / G4-e: a file that IS a release does not belong in
             # the index at all. The release event carries the consent_ref
             # and the release metadata in its body, and a release record is
@@ -1283,7 +1293,19 @@ class MemoryManager:
                 # matched on the axis that was never supposed to carry it.
                 user_id = None
             previous_hash = self.storage.get_file_hash(rel_path)
-            if previous_hash == file_hash:
+            # T2d (2026-11-01): the comparison goes through the ONE
+            # fingerprint entry point.  ``files.hash`` is stored in TWO
+            # historical shapes (prefixed by the rebuilder, bare by this
+            # scan path) and the two writers disagree on the digest
+            # BASIS as well (canonical vs raw text).  A raw string
+            # comparison therefore read 493 of 1193 live rows as "the
+            # file changed" when they had not changed at all — a false
+            # alarm that re-cuts healthy files and, worse, makes the
+            # ANCHOR ``~N`` baseline comparison unsound.
+            #
+            # The stored value is NEVER rewritten (that would change the
+            # hash chain); the read side carries both shapes.
+            if file_hash_matches(previous_hash, content):
                 continue
             # G-3: the chunking DECISION lives in ONE place
             # (chunker.chunk_for_file) — the rebuilder calls the same
