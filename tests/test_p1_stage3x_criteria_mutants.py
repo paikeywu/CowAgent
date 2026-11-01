@@ -935,3 +935,98 @@ def test_muT16_the_unchanged_file_must_pass(tmp_path):
     assert states.get("ANCHOR(REAL)") == STATE_PASS, (
         "文件未变且 ~N 相符 ⇒ 必须绿（否则判据对一切都是红）\n" + printed)
     assert "实测通过=1" in printed, printed
+
+
+# ---------------------------------------------------------------------------
+# MU-T17 / MU-T18 · the baseline's DECLARED STATE
+# ---------------------------------------------------------------------------
+#
+# The baseline entry may open its 归因 with a declared state marker:
+# ``[RED]`` (the default) or ``[NOTRUN]``.
+#
+# **Why it exists.**  Some criteria are red **by ruling**, not by
+# accident — 架构师 T1b made ANCHOR's "the file changed" rows NOTRUN
+# **on purpose**, and that is the CORRECT state.  Without a declared
+# state, GB-1's "lost visibility" rule would report it as a regression
+# **on every single run** — a rule that cries wolf every time is a
+# rule nobody reads.
+#
+# MU-T17  a baselined entry that DECLARES ``[NOTRUN]`` and IS NOTRUN
+#         now ⇒ must be GREEN (not "lost visibility").
+# MU-T18  a baselined entry that DECLARES ``[NOTRUN]`` but is RED now
+#         ⇒ must be RED (the state it was allowed to be in changed).
+
+def _gb1_report_with(states):
+    """A Report carrying the given criterion states."""
+    report = Report()
+    for number, state in states:
+        if state == "FAIL":
+            report.judge(number, "a criterion", False, "detail")
+        elif state == "NOTRUN":
+            report.judge_notrun(number, "a criterion", "detail")
+        else:
+            report.judge(number, "a criterion", True, "detail")
+    return report
+
+
+def test_muT17_a_declared_notrun_entry_must_not_be_a_regression(monkeypatch,
+                                                                tmp_path):
+    """MU-T17: an entry that declares ``[NOTRUN]`` and IS NOTRUN ⇒ GREEN.
+
+    The baseline file is redirected to a temporary one so the real
+    baseline is never touched.
+    """
+    baseline = tmp_path / "baseline.txt"
+    header = "\n".join("# " + name for name, _ in
+                        phase2_s3x.REQUIRED_ATTRIBUTIONS)
+    baseline.write_text(
+        header + "\n"
+        "SOME-NOTRUN | [NOTRUN] 按定案如此 —— 这条就是这样的\n"
+        "SOME-RED | 一条正常的红\n",
+        encoding="utf-8")
+
+    monkeypatch.setattr(phase2_s3x, "_global_baseline_path",
+                        lambda: baseline)
+
+    report = _gb1_report_with([("SOME-NOTRUN", "NOTRUN"),
+                                ("SOME-RED", "FAIL")])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        phase2_s3x.judge_global_failure_set_matches_baseline(report)
+    states = {number: state for number, _n, state in report.rows}
+    printed = buf.getvalue()
+
+    assert states.get("GB-1(unit)") == STATE_PASS, (
+        "声明 [NOTRUN] 且现在正是 NOTRUN ⇒ 这不是回归 ⇒ 必须绿\n" + printed)
+    assert "失去可见性" in printed, printed
+    assert "! SOME-NOTRUN" not in printed, printed
+
+
+def test_muT18_a_declared_notrun_entry_that_turns_red_must_be_red(
+        monkeypatch, tmp_path):
+    """MU-T18: an entry that declares ``[NOTRUN]`` but is RED now ⇒ RED.
+
+    The state it was allowed to be in changed — that IS a regression,
+    and it must not be swallowed by the declared state.
+    """
+    baseline = tmp_path / "baseline.txt"
+    header = "\n".join("# " + name for name, _ in
+                        phase2_s3x.REQUIRED_ATTRIBUTIONS)
+    baseline.write_text(
+        header + "\n"
+        "SOME-NOTRUN | [NOTRUN] 按定案如此 —— 这条就是这样的\n",
+        encoding="utf-8")
+
+    monkeypatch.setattr(phase2_s3x, "_global_baseline_path",
+                        lambda: baseline)
+
+    report = _gb1_report_with([("SOME-NOTRUN", "FAIL")])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        phase2_s3x.judge_global_failure_set_matches_baseline(report)
+    states = {number: state for number, _n, state in report.rows}
+    printed = buf.getvalue()
+
+    assert states.get("GB-1(unit)") == STATE_FAIL, (
+        "声明 [NOTRUN] 却变红了 ⇒ 状态被改变了 ⇒ 必须红\n" + printed)
+    assert "SOME-NOTRUN" in printed, printed

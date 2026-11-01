@@ -1230,7 +1230,30 @@ def _global_baseline_path() -> Path:
 
 
 def _parse_baseline(text: str) -> Tuple[Dict[str, str], List[str]]:
-    """The baseline entries (``判据号 -> 归因``) and the file's comment body."""
+    """The baseline entries (``判据号 -> 归因``) and the file's comment body.
+
+    **The entry format.**  ``判据号 | 归因`` — and the 归因 may open
+    with a **DECLARED STATE** marker:
+
+    ==================  ===========================================
+    marker              meaning
+    ==================  ===========================================
+    ``[RED]``            the entry's expected state is FAIL
+    ``[NOTRUN]``         the entry's expected state is NOTRUN
+    (no marker)          FAIL — the historical default
+    ==================  ===========================================
+
+    **Why a declared state is needed.**  Some criteria are red **by
+    ruling**, not by accident — the architect's T1b ruling made ANCHOR's
+    "the file changed" rows **NOTRUN on purpose**, and that is the
+    CORRECT state, not a regression.  Without a declared state, GB-1's
+    "lost visibility" rule (a baselined RED that is now NOTRUN) would
+    report it as a regression on **every single run** — a rule that
+    cries wolf every time ⇒ a rule nobody reads.
+
+    ⇒ The declared state says what the entry **expects**, so GB-1 can
+    tell "the expected state" from "the state changed".
+    """
     entries: Dict[str, str] = {}
     comments: List[str] = []
     for line in text.splitlines():
@@ -1245,6 +1268,23 @@ def _parse_baseline(text: str) -> Tuple[Dict[str, str], List[str]]:
         why = parts[1].strip() if len(parts) > 1 else ""
         entries[key] = why
     return entries, comments
+
+
+def _declared_state(why: str) -> str:
+    """The state a baseline entry EXPECTS: ``"RED"`` or ``"NOTRUN"``.
+
+    The marker is read from the **归因** (the text after the ``|``), so
+    the entry's format stays ``判据号 | 归因`` and the marker rides
+    along with the attribution it belongs to.
+
+    An entry with no marker expects RED (the historical default).
+    """
+    head = why.lstrip()
+    if head.startswith("[NOTRUN]"):
+        return "NOTRUN"
+    if head.startswith("[RED]"):
+        return "RED"
+    return "RED"
 
 
 def judge_global_failure_set_matches_baseline(report, workspace: Path = None):
@@ -1361,10 +1401,19 @@ def judge_global_failure_set_matches_baseline(report, workspace: Path = None):
     # --- the comparison ---
     new_failures = sorted(red_non_env - set(baseline))
     lost_visibility = sorted(k for k in baseline
-                             if k in current_notrun and k not in env)
+                             if k in current_notrun and k not in env
+                             and _declared_state(baseline[k]) == "RED")
     vanished = sorted(k for k in baseline
                       if k not in current_red and k not in current_notrun
                       and k not in env)
+    # An entry whose DECLARED state is NOTRUN and which IS NOTRUN now
+    # is exactly right — it is not a regression and not a "vanished"
+    # entry.  An entry that declares NOTRUN but is RED now IS a
+    # regression: the state it was allowed to be in changed.
+    declared_notrun_now_red = sorted(
+        k for k in baseline
+        if k in current_red and k not in env
+        and _declared_state(baseline[k]) == "NOTRUN")
 
     detail.append("新增失败（RED 且不在基线里，且非环境项）: %d 条"
                   % len(new_failures))
@@ -1378,6 +1427,16 @@ def judge_global_failure_set_matches_baseline(report, workspace: Path = None):
     for f in vanished:
         detail.append("  v %s（请手工从基线移除 —— 基线记的是『已知的失败』，"
                       "不是『曾经失败过的所有东西』）" % f)
+    notrun_expected = sorted(k for k in baseline
+                              if _declared_state(baseline[k]) == "NOTRUN")
+    detail.append("基线里声明为 [NOTRUN] 的条目（按定案如此，不是回归）: "
+                  "%d 条 —— %s" % (len(notrun_expected),
+                                   ", ".join(notrun_expected) or "（无）"))
+    if declared_notrun_now_red:
+        detail.append("声明 [NOTRUN] 却现在 RED（状态被改变了）: %d 条"
+                      % len(declared_notrun_now_red))
+        for f in declared_notrun_now_red:
+            detail.append("  ! %s" % f)
     detail.append("")
     detail.append("（失败集按『判据号』比对，不比数量；环境项红被排除在外，"
                   "不参与『新增失败』的判定。）")
@@ -1397,6 +1456,8 @@ def judge_global_failure_set_matches_baseline(report, workspace: Path = None):
         problems.append("有新增失败")
     if lost_visibility:
         problems.append("有失去可见性的条目")
+    if declared_notrun_now_red:
+        problems.append("有声明 NOTRUN 却变红的条目")
 
     if problems:
         detail.append("")

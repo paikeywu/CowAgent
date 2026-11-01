@@ -218,6 +218,32 @@ CRITERION_FILES = ("phase2.py", "phase2_s3e.py", "phase2_s3h.py",
 #:            docstring's promise becomes a lie again
 #:   MU-T12  a NEW red criterion appears in the gate's table ⇒ the
 #:            global baseline must notice
+#:
+#: MU-T13..MU-T18 are the S3-Y round's six — the ANCHOR ``~N``
+#: baseline (架构师 T1b 定案) and the baseline's DECLARED STATE:
+#:   MU-T13  the ``files.hash`` baseline comparison is REMOVED ⇒ the
+#:            criterion must go RED (硬要求 ②：去掉基准必须红 ——
+#:            去掉基准就是「把检查改成永远绿」)
+#:   MU-T14  the ``~N`` SYNTAX / non-negativity check is broken ⇒ it
+#:            must STILL be RED (硬要求 ③：降级的是**期望值来源**，
+#:            不是检查的存在性)
+#:   MU-T15  the file is UNCHANGED and the ``~N`` does not match ⇒
+#:            the check must still BITE (a genuinely broken anchor)
+#:   MU-T16  the CONTROL：unchanged file + matching ``~N`` ⇒ PASS
+#:            (without it, MU-T13/14/15 would be satisfied by a
+#:            criterion that is red on everything)
+#:   MU-T17  a baselined entry that DECLARES ``[NOTRUN]`` and IS
+#:            NOTRUN now ⇒ GB-1 must be GREEN (a ruling-driven
+#:            NOTRUN is not a regression)
+#:   MU-T18  a baselined entry that DECLARES ``[NOTRUN]`` but is RED
+#:            now ⇒ GB-1 must be RED (the state it was allowed to be
+#:            in changed)
+#:   MU-T17  a baselined entry that DECLARES ``[NOTRUN]`` and IS
+#:            NOTRUN now ⇒ GB-1 must be GREEN (a ruling-driven
+#:            NOTRUN is not a regression)
+#:   MU-T18  a baselined entry that DECLARES ``[NOTRUN]`` but is RED
+#:            now ⇒ GB-1 must be RED (the state it was allowed to be
+#:            in changed)
 REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
     "test_p1_stage3e_criteria_mutants.py": (
         "MU-1", "MU-2", "MU-3", "MU-4", "MU-5", "MU-6", "MU-7", "MU-8", "MU-9",
@@ -249,7 +275,7 @@ REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
     "test_p1_stage3x_criteria_mutants.py": (
         "MU-T1", "MU-T2", "MU-T3", "MU-T4", "MU-T5", "MU-T6",
         "MU-T8", "MU-T9", "MU-T10", "MU-T11", "MU-T12",
-        "MU-T13", "MU-T14", "MU-T15", "MU-T16",
+        "MU-T13", "MU-T14", "MU-T15", "MU-T16", "MU-T17", "MU-T18",
     ),
 }
 
