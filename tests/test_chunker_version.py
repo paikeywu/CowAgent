@@ -208,7 +208,24 @@ class TestSyncStampsVersion(unittest.TestCase):
                 asyncio.run(manager.sync())
                 asyncio.run(manager.sync())
 
-            expected_path = str(Path("knowledge") / "nested" / "index.md")
+            # G11 (2026-11-01): the index's keys are POSIX-style on EVERY
+            # platform — that is the product's contract, stated in
+            # ``manager._relative_key`` ("Keys are POSIX-style on every
+            # platform, which is also the spelling ``add_memory``
+            # writes"), and it is what keeps the same file from being
+            # indexed twice on Windows (once per separator).
+            #
+            # The expectation used to be ``str(Path("knowledge") / ...)``,
+            # which yields ``knowledge\nested\index.md`` on Windows and
+            # ``knowledge/nested/index.md`` on POSIX.  So the test
+            # asserted a DIFFERENT key on Windows than the one the
+            # product stores ⇒ ``get_file_hash`` found nothing ⇒ the
+            # assertion failed on a correct product.  The defect was in
+            # the TEST, not in the product.
+            #
+            # ``as_posix()`` states the product's contract directly and
+            # reads the same on every platform.
+            expected_path = (Path("knowledge") / "nested" / "index.md").as_posix()
             expected_hash = MemoryStorage.compute_hash(
                 knowledge_file.read_text(encoding="utf-8")
             )

@@ -366,6 +366,75 @@ class MemoryManager:
                 report.get("derived", 0), report.get("db"))
         return report
 
+    def _decide_after_write(self) -> Dict[str, Any]:
+        """Decide the origin of the rows this workspace just wrote.
+
+        **T2b (2026-11-01): the write path's own decision.**
+
+        The current code cannot write ``body_origin='unresolved'`` —
+        ``body_pointer.four_columns_for_chunk`` returns ``'file'`` /
+        ``'orphan'`` / ``'blob'`` and nothing else, and both writers
+        go through it.  But a row can still ARRIVE with
+        ``'unresolved'``: the old desktop build's
+        ``INSERT OR REPLACE INTO chunks`` names twelve columns and
+        does not know the four body columns at all, so it leaves them
+        NULL and the column's DEFAULT fills ``'unresolved'``.
+
+        Measured on a copy of a live library: the old build's SQL
+        produces EXACTLY the live shape (four NULL body columns,
+        ``text_state='projection'``, ``body_origin='unresolved'``).
+
+        ⇒ So the fix is a post-write decision, not a pre-write guard:
+        **whatever wrote the row, this path decides the row's origin
+        immediately afterwards**, by CONTENT (D1/D2), and fills the
+        pointer the decision implies.  Without it, every knowledge
+        page the old build re-indexes lands as a permanent TODO nobody
+        owns — the certifier only reaches rows that carry a pointer, so
+        the row is never certified and never resolves.
+
+        The decision rides on the write (right next to the
+        certification that already rides there) because it reads the
+        TRUTH LAYER, and the truth file must be complete before the
+        comparison means anything.
+
+        **It never raises into the write.**  The write already
+        succeeded; a failure to decide is a LOGGED fact, not a failed
+        write — refusing to report it would hide the debt instead of
+        recording it.
+        """
+        try:
+            from agent.memory.write_decide import decide_after_write
+        except Exception:
+            return {"error": "write_decide module unavailable"}
+        try:
+            workspace = Path(self.config.get_workspace())
+            db = Path(self.storage.db_path) if hasattr(self.storage, "db_path") \
+                else None
+            if db is None:
+                return {"error": "the storage does not expose its path"}
+            report = decide_after_write(workspace, db)
+        except Exception as e:
+            from common.log import logger
+            logger.warning(
+                "[MemoryManager] The decision after the write did not "
+                "complete: %s: %s", type(e).__name__, e)
+            return {"error": "%s: %s" % (type(e).__name__, e)}
+        if report.get("decided"):
+            from common.log import logger
+            logger.info(
+                "[MemoryManager] decided %d undecided row(s) after the "
+                "write in %s (pointer filled=%d)",
+                report.get("decided", 0), report.get("db"),
+                report.get("pointer_filled", 0))
+        elif report.get("unresolved_after"):
+            from common.log import logger
+            logger.warning(
+                "[MemoryManager] %d row(s) are STILL undecided after the "
+                "write in %s — the origin of those rows is still nobody's "
+                "decision.", report.get("unresolved_after", 0),
+                report.get("db"))
+        return report
+
     def _report_guard_discards(self, before: int) -> Dict[str, Any]:
         """Say out loud what the guard dropped during this sync (P0-22).
 
@@ -978,6 +1047,12 @@ class MemoryManager:
         # file, and those must not be left uncertified.
         self._certify_after_write()
 
+        # T2b: the write path's own DECISION.  A row that arrives with
+        # ``body_origin='unresolved'`` (the old build writes that shape)
+        # must not stay undecided: the decision is by CONTENT, and it
+        # rides on the write because it reads the truth layer.
+        self._decide_after_write()
+
     async def sync(self, force: bool = False):
         """
         Synchronize memory from files.
@@ -1484,6 +1559,14 @@ class MemoryManager:
         # 'projection' forever — the 'mirror' state would be a claim
         # about the past, not about the current index.
         self._certify_after_write()
+
+        # T2b: the write path's own DECISION.  A row that arrives with
+        # ``body_origin='unresolved'`` — the old desktop build writes
+        # exactly that shape, because its twelve-column INSERT does not
+        # know the body columns — must not stay undecided.  The decision
+        # is by CONTENT (D1/D2) and it rides on the write because it
+        # reads the truth layer, which is complete by now.
+        self._decide_after_write()
 
         self._dirty = False
 

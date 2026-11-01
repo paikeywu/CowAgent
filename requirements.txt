@@ -45,5 +45,12 @@ discord.py
 # web.py 0.62 is the last release that supports Python < 3.10, and it imports the
 # stdlib cgi module removed in 3.13. 0.76 dropped cgi but requires 3.10+, so ask
 # for it only where it can be installed.
+#
+# G10 (2026-11-01): the >= 3.10 branch had NO upper bound, so on this
+# machine (Python 3.15.1) pip had to be told --ignore-requires-python to
+# install it at all.  The upper bound says what is TRUE: web.py has not
+# declared support for 3.15, so the requirement must not claim it.  A
+# requirement that over-claims its range is a requirement that can only be
+# installed by lying to the installer.
 web.py; python_version < "3.10"
-web.py>=0.76; python_version >= "3.10"
+web.py>=0.76; python_version >= "3.10" and python_version < "3.15"
