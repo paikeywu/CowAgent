@@ -192,6 +192,32 @@ CRITERION_FILES = ("phase2.py", "phase2_s3e.py", "phase2_s3h.py",
 #:   MU-53  the writer-generation classifier is blinded ⇒ W-4 must
 #:          notice (the old end's debt must not be relabelled as the
 #:          current code's)
+#:
+#: MU-T1..MU-T12 are the S3-X round's twelve — the EXTERNAL-EDIT
+#: provenance round and the resident guards:
+#:   MU-T1   the reconciliation records NOTHING ⇒ the witness
+#:            invariant must go red
+#:   MU-T2   the witness hash is a CONSTANT ⇒ 「记了」不等于「记对了」
+#:   MU-T3   the reconciliation records EVERY time ⇒ the log grows on
+#:            a no-op scan (the "every read refreshes" failure)
+#:   MU-T4   the witness uses the RAW BYTES ⇒ a CRLF file's witness
+#:            cannot reproduce the canonical hash
+#:   MU-T5   ``record_change`` NESTS the ``extra`` dict ⇒ the reader
+#:            cannot find the witness (read side and write side must
+#:            agree)
+#:   MU-T6   ``latest_change_mtime`` advances on every READ ⇒ the
+#:            shelf is permanently stale and DR-2 permanently green
+#:   MU-T8   only the ROOT workspace's log is read ⇒ each agent's
+#:            identity file looks unwitnessed
+#:   MU-T9   the reconciliation SWALLOWS the exception ⇒ 「不知道」
+#:            disguised as 「没变化」
+#:   MU-T10  the gate's reader and ``text_inv``'s disagree on ONE row
+#:            ⇒ the symmetric difference must be non-zero (the SET,
+#:            not the count)
+#:   MU-T11  the canonical cross-check is neutered or deleted ⇒ the
+#:            docstring's promise becomes a lie again
+#:   MU-T12  a NEW red criterion appears in the gate's table ⇒ the
+#:            global baseline must notice
 REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
     "test_p1_stage3e_criteria_mutants.py": (
         "MU-1", "MU-2", "MU-3", "MU-4", "MU-5", "MU-6", "MU-7", "MU-8", "MU-9",
@@ -219,6 +245,10 @@ REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
     ),
     "test_p1_stage3w_criteria_mutants.py": (
         "MU-47", "MU-48", "MU-49", "MU-50", "MU-51", "MU-52", "MU-53",
+    ),
+    "test_p1_stage3x_criteria_mutants.py": (
+        "MU-T1", "MU-T2", "MU-T3", "MU-T4", "MU-T5", "MU-T6",
+        "MU-T8", "MU-T9", "MU-T10", "MU-T11", "MU-T12",
     ),
 }
 

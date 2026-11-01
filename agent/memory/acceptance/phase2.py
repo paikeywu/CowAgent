@@ -1040,6 +1040,36 @@ _S3W_CRITERIA = [
 
 
 # ---------------------------------------------------------------------------
+# S3-X · the EXTERNAL-EDIT provenance round + the resident guards.
+#
+# They live in their own module (``phase2_s3x``) because they judge
+# subjects no other group judges:
+#
+#   * EE-1..EE-3 — the change log as a WITNESS.  The mechanism
+#     (``agent.memory.external_edit``) exists; these criteria say whether
+#     it actually witnesses an external edit, and whether it is WIRED.
+#     EE-1 also keeps DR-2's honest red honest: the historical debt (an
+#     event written before the mechanism existed) is NOT the same red as
+#     a live leak (the mechanism let an edit through).
+#   * R3 — the RESIDENT version of the architect's one-shot probe: the
+#     gate's INV-2 RED set and ``text_inv``'s RED set must be the SAME
+#     SET.  A one-shot probe is not a guard.
+#   * GB-1 — the gate's GLOBAL failure-set baseline.  Q5 covers only the
+#     ``text_inv`` group, so DR/I/J/M6/INV-2/ANCHOR reds are invisible to
+#     it; this is the baseline for the WHOLE gate.
+#
+# **GB-1 must run LAST** — it reads the gate's own result table, so every
+# other criterion must already have reported.
+_S3X_CRITERIA = [
+    ("EE-1", "judge_external_edit_is_traceable"),
+    ("EE-2", "judge_external_edit_mechanism_witnesses_edits"),
+    ("EE-3", "judge_external_edit_reconciliation_is_wired"),
+    ("EE-4", "judge_the_canonical_cross_check_is_really_called"),
+    ("R3", "judge_inv2_red_sets_are_the_same_set"),
+]
+
+
+# ---------------------------------------------------------------------------
 # P2-1 · the L2 persona layer.
 #
 # They live in their own module (``phase2_p2``) because they judge a
@@ -1289,6 +1319,24 @@ def _load_s3w():
     return out
 
 
+def _load_s3x():
+    """The S3-X criterion functions, bound to the workspace."""
+    from agent.memory.acceptance import phase2_s3x
+
+    ws = Path(resolve_workspace(ARGS.workspace)[0])
+    out = []
+    for group, attr in _S3X_CRITERIA:
+        fn = getattr(phase2_s3x, attr)
+
+        def make(fn=fn, ws=ws):
+            def run(report):
+                return fn(report, ws)
+            return run
+
+        out.append((group, make()))
+    return out
+
+
 def main() -> int:
     workspace, how = resolve_workspace(ARGS.workspace)
 
@@ -1402,6 +1450,34 @@ def main() -> int:
         if ARGS.only and not group.startswith(ARGS.only):
             continue
         guarded(fn, report)
+
+    # The S3-X criteria (the external-edit provenance + the resident
+    # R3 guard).  They run before GB-1, because GB-1 reads the gate's
+    # OWN result table and therefore needs every other criterion to
+    # have reported already.
+    for group, fn in _load_s3x():
+        if ARGS.only and not group.startswith(ARGS.only):
+            continue
+        guarded(fn, report)
+
+    # GB-1 — the gate's GLOBAL failure-set baseline.  **It runs LAST on
+    # purpose**: it compares the gate's whole failure set against the
+    # baseline file, so every other criterion must already be in the
+    # table.  Running it earlier would compare a partial table against
+    # a complete baseline and cry wolf on every criterion that had not
+    # run yet.
+    #
+    # **It only runs on a FULL gate run** (``--only`` would give it a
+    # partial table, and a partial table compared against a complete
+    # baseline is a guaranteed false red).  So on a filtered run it is
+    # SKIPPED, not judged — and it says so, because a criterion that
+    # silently vanishes is worse than one that reports NOTRUN.
+    if ARGS.only:
+        print("  [SKIP] GB-1: 全局失败集基线只在**完整**门禁运行里判定"
+              "（--only 给出的是部分结果表，拿部分表比完整基线必假红）")
+    else:
+        from agent.memory.acceptance import phase2_s3x
+        guarded(phase2_s3x.judge_global_failure_set_matches_baseline, report)
 
     ok = report.summary()
     return 0 if ok else 1

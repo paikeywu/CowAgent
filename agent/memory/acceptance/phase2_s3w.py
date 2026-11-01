@@ -80,6 +80,25 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent.memory.acceptance import Report
 from agent.memory.acceptance.live_libs import enumerate_live, open_ro
 
+#: The REAL normalisation, imported under an alias so the module-level
+#: name ``canonical_text`` can keep pointing at this module's OWN copy.
+#:
+#: **Why the import exists at all.**  This module deliberately
+#: RE-IMPLEMENTS the normalisation (see :func:`canonical_text` below):
+#: a criterion that imports the thing it is judging is a tautology.  But
+#: a copy that is never compared against the original is a copy that
+#: drifts silently — and this module's docstring PROMISED a cross-check
+#: that did not exist (架构师 §2.2: 「实测：这条交叉校验不存在」).
+#:
+#: ⇒ The promise is now kept: :func:`_canonical_cross_check` compares
+#: this copy against the real one on FIXED fixtures, and W-4 FAILs when
+#: they disagree.  **A criterion that claims to do a check and does not
+#: do it is a back door for false green.**
+try:  # pragma: no cover - the import is the point; its failure is reported
+    from agent.memory.naming import canonical_text as _real_canonical_text
+except Exception:  # pragma: no cover
+    _real_canonical_text = None
+
 
 #: The four legal values of ``chunks.body_origin``.  ``'unresolved'`` is
 #: the DEFAULT of the column and means "nobody has decided".
@@ -103,9 +122,17 @@ def canonical_text(content: str) -> str:
     criterion that imports the thing it is judging is a tautology
     (S3-H's independence rule).  The DEFINITION is duplicated here on
     purpose so that a change to ``naming.canonical_text`` cannot silently
-    change what W-1 asserts; and W-4 below **CROSS-CHECKS** this copy
-    against the real one, so the duplication cannot drift apart silently
-    either.
+    change what W-1 asserts; and :func:`_canonical_cross_check` — called
+    by **W-4** — CROSS-CHECKS this copy against the real one on FIXED
+    fixtures, so the duplication cannot drift apart silently either.
+
+    **⚠️ This sentence used to be a promise the module did not keep.**
+    The architect's review (T1b §2.2) measured it: the import list had
+    no ``agent.memory.naming`` and the whole module mentioned ``naming``
+    only in prose ⇒ the promised cross-check **did not exist**.  It
+    exists now, and a disagreement FAILS W-4 (the criterion is broken,
+    and a criterion that is broken must say so rather than keep
+    reporting green).
 
     The definition (three steps, in this order):
 
@@ -119,6 +146,100 @@ def canonical_text(content: str) -> str:
     text = content.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+#: The FIXED fixtures the cross-check runs on.  They are fixed on
+#: purpose: a cross-check on random inputs would be a fuzz test, and a
+#: fuzz test's failure is not reproducible.  These cover every branch of
+#: the three-step definition:
+#:
+#:   * CRLF and lone CR (step 1),
+#:   * runs of 3+ newlines (step 2),
+#:   * leading/trailing whitespace (step 3),
+#:   * CJK and full-width spaces (nothing special — they must survive),
+#:   * the empty string and whitespace-only (the degenerate cases).
+#:
+#: A fixture list that does not cover a branch is a cross-check that
+#: cannot see that branch drift.
+CANONICAL_CROSS_CHECK_FIXTURES: Tuple[Tuple[str, str], ...] = (
+    ("", ""),
+    ("   \n\t  ", ""),
+    ("a\r\nb", "a\nb"),
+    ("a\rb", "a\nb"),
+    ("a\r\n\r\n\r\n\r\nb", "a\n\nb"),
+    ("\n\n\nleading", "leading"),
+    ("trailing\n\n\n", "trailing"),
+    ("  padded  ", "padded"),
+    ("中文\n\n\n\n正文", "中文\n\n正文"),
+    ("full　width space", "full　width space"),
+    ("a\n\n\nb\n\n\n\nc", "a\n\nb\n\nc"),
+    ("mixed\r\nline\r\nendings", "mixed\nline\nendings"),
+)
+
+
+def _canonical_cross_check() -> List[str]:
+    """Compare this module's ``canonical_text`` against the REAL one.
+
+    **This is the check the docstring promised and did not do.**  The
+    architect's review (T1b §2.2) measured it: the import list had no
+    ``agent.memory.naming``, and the whole module mentioned ``naming``
+    only in prose ⇒ the promised cross-check did not exist.  A criterion
+    that claims to cross-check and does not is a back door for false
+    green, so it is now REAL.
+
+    **What it returns.**  A list of human-readable disagreement
+    descriptions; **empty means the two agree on every fixture**.  An
+    empty list is NOT "the check did not run" — the two failure modes
+    are distinguished:
+
+      * the real function is not importable ⇒ the list says so
+        (the check could not run ⇒ NOTRUN, not PASS);
+      * the two disagree on a fixture ⇒ the list names the fixture and
+        both outputs (the check ran and FAILED).
+
+    **The mutation this catches.**  If someone adds a rule to
+    ``naming.canonical_text`` (say "fold trailing spaces on each line"),
+    this module's copy keeps the OLD behaviour ⇒ the gate's INV-2 and
+    ``text_inv`` would be using two different yardsticks, and **nothing
+    would be red**.  That is the shape
+    ``knowledge/concepts/two-maps-about-the-same-thing-must-break-ties-the-same-way.md``
+    describes: the pointer and the pointer's fingerprint must come from
+    the same choice.
+    """
+    problems: List[str] = []
+    if _real_canonical_text is None:
+        problems.append(
+            "agent.memory.naming.canonical_text 不可导入 —— 交叉校验**跑不了**"
+            "（这是 NOTRUN，不是通过）")
+        return problems
+    for src, expected in CANONICAL_CROSS_CHECK_FIXTURES:
+        try:
+            ours = canonical_text(src)
+        except Exception as e:
+            problems.append("本模块的 canonical_text 在夹具 %r 上抛异常: %s"
+                            % (src, e))
+            continue
+        try:
+            theirs = _real_canonical_text(src)
+        except Exception as e:
+            problems.append("真实现 canonical_text 在夹具 %r 上抛异常: %s"
+                            % (src, e))
+            continue
+        if ours != theirs:
+            problems.append(
+                "夹具 %r 上两份实现不等：本模块=%r 真实现=%r"
+                % (src, ours, theirs))
+        if ours != expected:
+            # The fixture's own expectation is a third, INDEPENDENT
+            # statement of the definition.  If the two copies agree with
+            # each other but both differ from the fixture, then the
+            # FIXTURE is stale — that is worth reporting too, because a
+            # fixture that no longer states the definition is a fixture
+            # that cannot detect a change of the definition.
+            problems.append(
+                "夹具 %r 上两份实现都偏离了夹具自身期望：本模块=%r 真实现=%r "
+                "期望=%r" % (src, ours, theirs, expected))
+    return problems
 
 
 def _norm_class(a: str, b: str) -> Optional[str]:
@@ -980,6 +1101,48 @@ def judge_unresolved_writer_generation_is_reported(report, workspace: Path):
     detail.append("本判据**不判红**（欠账的严重性归 M6 / Q1）；它报出代际证据。")
     detail.append("FAIL 的唯一条件：普查读到了行却无法分类 —— 那是判据自己坏了。")
 
+    # ------------------------------------------------------------------
+    # The CROSS-CHECK the module's docstring promised (and did not do).
+    # ------------------------------------------------------------------
+    #
+    # It is here, in W-4, because W-4 is the criterion the docstring
+    # named: "W-4 below CROSS-CHECKS this copy against the real one".
+    # Keeping the promise is the point — a criterion that CLAIMS a check
+    # and does not do it is a back door for false green.
+    #
+    # The cross-check FAILS W-4 when the two copies disagree, and NOTRUNs
+    # it when the check could not run at all (the real function not
+    # importable) — the two failure modes are NOT the same, and saying
+    # "NOTRUN" for a disagreement would be the "把不知道说成没变化"
+    # failure in its purest form.
+    detail.append("")
+    detail.append("—— canonical 副本交叉校验（本模块的副本 vs naming.canonical_text）——")
+    cross = _canonical_cross_check()
+    detail.append("夹具数: %d   分歧: %d" % (len(CANONICAL_CROSS_CHECK_FIXTURES),
+                                          len(cross)))
+    if cross:
+        for c in cross:
+            detail.append("  ! %s" % c)
+        if any("跑不了" in c for c in cross):
+            detail.append("")
+            detail.append("⇒ 交叉校验**跑不了**（真实现不可导入）⇒ 本判据"
+                          "NOTRUN：不是通过，是没测。")
+            return report.judge_notrun(
+                "W-4(REAL)",
+                "unresolved 行的写者代际证据（旧端十二列 INSERT vs 新代码四列路径），"
+                "逐行点名；且本模块的 canonical 副本与真实现交叉一致",
+                "\n".join(detail))
+        detail.append("")
+        detail.append("⇒ 两份 canonical 不一致 ⇒ **判据自己坏了**"
+                      "（本模块与真实现用了两把尺子，而没有任何东西会红）"
+                      "⇒ 判红。")
+        return report.judge(
+            "W-4(REAL)",
+            "unresolved 行的写者代际证据（旧端十二列 INSERT vs 新代码四列路径），"
+            "逐行点名；且本模块的 canonical 副本与真实现交叉一致",
+            False, "\n".join(detail))
+    detail.append("  两份实现在全部夹具上输出一致 ⇒ 副本没有漂移。")
+
     if total_unresolved == 0:
         # A census that ran and found nothing IS a measurement.  Saying
         # NOTRUN here would be the "0 个匹配 = NOTRUN" rule applied to
@@ -991,12 +1154,12 @@ def judge_unresolved_writer_generation_is_reported(report, workspace: Path):
         return report.judge(
             "W-4(REAL)",
             "unresolved 行的写者代际证据（旧端十二列 INSERT vs 新代码四列路径），"
-            "逐行点名",
+            "逐行点名；且本模块的 canonical 副本与真实现交叉一致",
             True, "\n".join(detail))
     return report.judge(
         "W-4(REAL)",
         "unresolved 行的写者代际证据（旧端十二列 INSERT vs 新代码四列路径），"
-        "逐行点名",
+        "逐行点名；且本模块的 canonical 副本与真实现交叉一致",
         True, "\n".join(detail))
 
 
