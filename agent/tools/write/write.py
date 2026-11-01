@@ -89,7 +89,22 @@ class Write(BaseTool):
 
             write_text_atomic(absolute_path, content)
             note_write(absolute_path)
-            
+
+            # T2e (2026-11-01): this write just landed on disk, so this
+            # is the moment to WITNESS it.  Before this, the change log
+            # only learned about a file when a sync happened to scan it
+            # — so a file written by this tool was unrecorded until the
+            # agent happened to sync, and EE-1 read that as a live
+            # leak ("the mechanism was alive, the file moved, nothing
+            # recorded it").  The witness is computed from the content
+            # ONCE, here, so re-reading does not refresh it (A3).
+            try:
+                from agent.memory.witness_write import witness_write
+                witness_write(absolute_path, actor="write-tool")
+            except Exception:
+                # A bookkeeping failure must not undo a written file.
+                pass
+
             # Get bytes written
             bytes_written = len(content.encode('utf-8'))
             

@@ -50,6 +50,17 @@ def append_session_evolution(
             log_file.write_text(f"# Self-Evolution: {today}\n\n", encoding="utf-8")
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(f"\n{header}\n\n{body}\n")
+        # T2e (2026-11-01): this append moved a truth-layer file, so
+        # witness it NOW.  This path appends to memory/evolution/*.md and
+        # never touches the index — before this, the file was invisible
+        # to the change log until some LATER sync happened to scan it,
+        # and EE-1 read the gap as a live leak.  The witness is computed
+        # once, from the content that just landed.
+        try:
+            from agent.memory.witness_write import witness_write
+            witness_write(log_file, actor="evolution-recorder")
+        except Exception as e:
+            logger.warning(f"[Evolution] Witness skipped for {log_file.name}: {e}")
         logger.info(f"[Evolution] Recorded session evolution to {log_file.name}")
     except Exception as e:
         logger.warning(f"[Evolution] Failed to record session evolution: {e}")

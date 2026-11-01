@@ -218,7 +218,17 @@ class Edit(BaseTool):
             # every '\n' into os.linesep and undo the ending restored above.
             write_text_atomic(absolute_path, final_content, newline='')
             note_write(absolute_path)
-            
+
+            # T2e (2026-11-01): witness the edit at the moment it lands.
+            # See agent/memory/witness_write.py for why the witness
+            # belongs at the WRITE path and not at the sync.
+            try:
+                from agent.memory.witness_write import witness_write
+                witness_write(absolute_path, actor="edit-tool")
+            except Exception:
+                # A bookkeeping failure must not undo an edited file.
+                pass
+
             # Generate diff
             diff_result = generate_diff_string(base_content, new_content)
 
