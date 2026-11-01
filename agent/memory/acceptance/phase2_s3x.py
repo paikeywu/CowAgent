@@ -38,7 +38,9 @@ NOTRUN = **测不了**（前置不成立）。**NOTRUN ≠ PASS。**
 from __future__ import annotations
 
 import ast
+import contextlib
 import hashlib
+import io
 import json
 import os
 import re
@@ -916,27 +918,36 @@ def judge_the_canonical_cross_check_is_really_called(report, workspace: Path = N
         return text.strip()
 
     # --- prove the mutation took effect ---
+    #
+    # **The probe's own output is SUPPRESSED.**  The probe deliberately
+    # makes W-4 FAIL (that is how it proves the cross-check has teeth),
+    # and a printed ``[FAIL] W-4`` row would look to any reader — and
+    # to the global-baseline criterion, which reads the gate's output —
+    # like a real gate result.  A probe that leaves its marks on the
+    # report is a probe that corrupts the thing it measures.
     phase2_s3w.canonical_text = broken_copy
     try:
-        diverged = bool(checker())
-        if not diverged:
-            detail.append("打坏的副本没有被交叉校验发现 ⇒ 校验本身没有牙齿"
-                          "（它比较的不是这两份实现）")
-            return report.judge(
-                "EE-4(unit)",
-                "canonical 交叉校验真的被 W-4 调用（行为证明，不是文本匹配）",
-                False, "\n".join(detail))
-        rep = Report()
-        phase2_s3w.judge_unresolved_writer_generation_is_reported(
-            rep, Path(workspace))
-        mutated_state = rep.rows[-1][2] if rep.rows else "NONE"
+        with contextlib.redirect_stdout(io.StringIO()):
+            diverged = bool(checker())
+            if not diverged:
+                detail.append("打坏的副本没有被交叉校验发现 ⇒ 校验本身没有牙齿"
+                              "（它比较的不是这两份实现）")
+                return report.judge(
+                    "EE-4(unit)",
+                    "canonical 交叉校验真的被 W-4 调用（行为证明，不是文本匹配）",
+                    False, "\n".join(detail))
+            rep = Report()
+            phase2_s3w.judge_unresolved_writer_generation_is_reported(
+                rep, Path(workspace))
+            mutated_state = rep.rows[-1][2] if rep.rows else "NONE"
     finally:
         phase2_s3w.canonical_text = original_copy
 
-    rep2 = Report()
-    phase2_s3w.judge_unresolved_writer_generation_is_reported(
-        rep2, Path(workspace))
-    restored_state = rep2.rows[-1][2] if rep2.rows else "NONE"
+    with contextlib.redirect_stdout(io.StringIO()):
+        rep2 = Report()
+        phase2_s3w.judge_unresolved_writer_generation_is_reported(
+            rep2, Path(workspace))
+        restored_state = rep2.rows[-1][2] if rep2.rows else "NONE"
 
     detail.append("打坏本模块的 canonical 副本后，交叉校验报出分歧: %s"
                   % diverged)
@@ -1288,11 +1299,24 @@ def judge_global_failure_set_matches_baseline(report, workspace: Path = None):
     baseline, comments = _parse_baseline(text)
 
     # --- the current global failure set, from the gate's own table ---
+    #
+    # **GB-1 excludes ITSELF.**  It is the criterion that COMPARES the
+    # failure set; whether it is red is the OUTPUT of that comparison,
+    # not an input to it.  Counting itself would make every red GB-1
+    # report itself as a "new failure" — a self-referential noise that
+    # would have to be baselined away, and baselining a judge's own
+    # redness is exactly the kind of thing that hides a real regression.
+    #
+    # The harness's own PROBE rows (MU-12 exercises the three-state
+    # mechanism with synthetic rows) are excluded for the same reason:
+    # they are not criteria, they are the guard testing the harness.
     current_red: Set[str] = set()
     current_notrun: Set[str] = set()
     current_green: Set[str] = set()
     for number, _name, state in report.rows:
         key = number.replace("(REAL)", "").replace("(unit)", "").strip()
+        if key in ("GB-1",) or key.startswith("PROBE-"):
+            continue
         if state == "FAIL":
             current_red.add(key)
         elif state == "NOTRUN":
@@ -1357,6 +1381,8 @@ def judge_global_failure_set_matches_baseline(report, workspace: Path = None):
     detail.append("")
     detail.append("（失败集按『判据号』比对，不比数量；环境项红被排除在外，"
                   "不参与『新增失败』的判定。）")
+    detail.append("（GB-1 排除**自己**与 harness 的 PROBE 行：它是那个做比较的"
+                  "判据，自己红不红是比较的**输出**而不是输入。）")
     detail.append("本判据**从不写**基线文件：加条目必须手工编辑 + 写归因，"
                   "没有一键刷新。")
 
