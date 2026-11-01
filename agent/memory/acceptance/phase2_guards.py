@@ -147,6 +147,27 @@ CRITERION_FILES = ("phase2.py", "phase2_s3e.py", "phase2_s3h.py",
 #:   MU-40  the migration empties the rows but writes NOTHING to the
 #:          truth tree ⇒ U-1 must be red (that is data loss, not a
 #:          migration)
+#: MU-41..MU-46 are the S3-V round's six — the runtime census and the
+#: drift probes:
+#:
+#:   MU-41  the census CANNOT SEE the project's packaged runtime ⇒
+#:          DR-1 must lose its PACKAGED row (the false green this
+#:          round actually shipped: five read bugs, four of which
+#:          reported "the old runtime is not here")
+#:   MU-42  the shipped executable names are HARD-CODED instead of
+#:          read from the build configuration ⇒ renaming the product
+#:          must break the probe (the probe must follow the rename)
+#:   MU-43  the files-side witness (``files_keep``) is IGNORED ⇒ J-5
+#:          must turn GREEN on a proven downgrade (this is the exact
+#:          hole that let J-5 report PASS while files bled)
+#:   MU-44  the rebuild reader DROPS the first segment of a multi-
+#:          segment anchor ⇒ the drift check must see 129 phantom
+#:          rows instead of 1 (a reader that loses a segment
+#:          manufactures drift)
+#:   MU-45  "0 objects" is read as PASS ⇒ it must be NOTRUN
+#:   MU-46  the drift verdict is DROPPED from the fingerprint-vs-drift
+#:          criterion ⇒ "structure fine, content stale" becomes
+#:          invisible
 REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
     "test_p1_stage3e_criteria_mutants.py": (
         "MU-1", "MU-2", "MU-3", "MU-4", "MU-5", "MU-6", "MU-7", "MU-8", "MU-9",
@@ -168,6 +189,9 @@ REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
     ),
     "test_p1_stage3u_criteria_mutants.py": (
         "MU-39", "MU-40",
+    ),
+    "test_p1_stage3v_criteria_mutants.py": (
+        "MU-41", "MU-42", "MU-43", "MU-44", "MU-45", "MU-46",
     ),
 }
 

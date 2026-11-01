@@ -989,6 +989,34 @@ _S3U_CRITERIA = [
 ]
 
 # ---------------------------------------------------------------------------
+# S3-V · the CROSS-END runtime census + the drift probes.
+#
+# They live in their own module (``phase2_s3v``) because they judge
+# subjects that no other group judges:
+#
+#   * DR-1 — the RUNTIME CENSUS: which runtimes are alive, which one is
+#     older than the repository, and who erased the files-side
+#     statistics (the ``files_keep`` witness).  The gap list said
+#     "an old writer did it" — that was an INFERENCE, because nothing
+#     recorded the writer's identity.
+#   * DR-2..DR-5 — the four drift probes, each one judgeable on its own.
+#   * DR-6 — the dimension the CROSS-END FINGERPRINT cannot see: the
+#     file changed after it was cut, so the projection is stale.  XF
+#     measures the STRUCTURE; DR-6 measures the CONTENT.  They are not
+#     substitutes for each other, and DR-7 is the criterion that says
+#     so with the numbers side by side.
+_S3V_CRITERIA = [
+    ("DR-1", "judge_dr1_dual_runtime_is_detected"),
+    ("DR-2", "judge_dr2_change_provenance"),
+    ("DR-3", "judge_dr3_injection_composition"),
+    ("DR-4", "judge_dr4_emotion_continuity"),
+    ("DR-5", "judge_dr5_baseline_conformance"),
+    ("DR-6", "judge_dr6_file_changed_not_recut"),
+    ("DR-7", "judge_dr7_fingerprint_does_not_substitute_drift"),
+]
+
+
+# ---------------------------------------------------------------------------
 # P2-1 · the L2 persona layer.
 #
 # They live in their own module (``phase2_p2``) because they judge a
@@ -1202,6 +1230,24 @@ def _load_s3u():
     return out
 
 
+def _load_s3v():
+    """The S3-V criterion functions, bound to the workspace."""
+    from agent.memory.acceptance import phase2_s3v
+
+    ws = Path(resolve_workspace(ARGS.workspace)[0])
+    out = []
+    for group, attr in _S3V_CRITERIA:
+        fn = getattr(phase2_s3v, attr)
+
+        def make(fn=fn, ws=ws):
+            def run(report):
+                return fn(report, ws)
+            return run
+
+        out.append((group, make()))
+    return out
+
+
 def main() -> int:
     workspace, how = resolve_workspace(ARGS.workspace)
 
@@ -1284,6 +1330,12 @@ def main() -> int:
 
     # The S3-U criteria (「既有库迁得动」: U-1).
     for group, fn in _load_s3u():
+        if ARGS.only and not group.startswith(ARGS.only):
+            continue
+        guarded(fn, report)
+
+    # The S3-V criteria (the runtime census + the drift probes).
+    for group, fn in _load_s3v():
         if ARGS.only and not group.startswith(ARGS.only):
             continue
         guarded(fn, report)

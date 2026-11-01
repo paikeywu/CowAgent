@@ -141,8 +141,9 @@ different files at once unless the writer is rewriting the library.
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.memory.acceptance.live_libs import (
     enumerate_live,
@@ -945,27 +946,80 @@ def judge_old_writer_erasure_monitor(report, workspace: Path):
          (``guard_state``) shows that the old writer IS hitting the
          guard, which is the smoking gun for "an old writer is running".
 
-    The criterion is a REPORT with a verdict:
-      * **FAIL** when a downgrade is proven (the state was right and
-        something overwrote it);
-      * **PASS** otherwise, with the evidence printed either way.
+    S3-V (2026-11-01) — THE FILES SIDE WAS MISSING, AND IT WAS THE
+    ONE THAT WAS BEING DAMAGED
+    -------------------------------------------------------
+    MEASURED: this criterion read the CHUNKS side only
+    (``body_keep`` vs ``chunks``), and it reported **PASS on all 16
+    libraries** while the gap list reported F6 (22 paths with
+    ``chunker_version=0``) and F7 (statistics erased to NULL) as RED.
+
+    The reason: **the files side has its OWN witness table
+    (``files_keep``), and this criterion never looked at it.**  The
+    chunks side was intact; the files side was being erased.  A
+    monitor that only watches one of two sides reports green while the
+    other one bleeds — the exact "门禁全绿和持续失血可以同时为真" hole
+    the S3-T group was written to close, re-opened on the files side.
+
+    So the files side is now in, with the SAME discriminator:
+
+      * ``files_keep`` holds the statistics as they were BEFORE a
+        DELETE (``files_body_keep_bd``).  A ``files`` row that is
+        GONE but present in ``files_keep`` ⇒ **the row was deleted
+        after it was measured** ⇒ a PROVEN erasure.
+      * A ``files`` row that survives with its statistics overwritten
+        to the "not measured" values (``NULL`` / ``0``) while
+        ``files_keep`` holds non-zero values ⇒ **PROVEN downgrade**.
+
+    A row with NULL/0 statistics and NO ``files_keep`` witness is
+    **never measured**, not an erasure — that distinction is J-3's and
+    it is preserved here (the two criteria must not disagree).
+
+    THE MONITOR PART (this is what makes it CONTINUOUS)
+    ---------------------------------------------------
+    A snapshot says "there is damage".  It cannot say whether the debt
+    is GROWING.  So this criterion also:
+
+      * writes the census to ``memory/.audit/j5_monitor_state.json``
+        (ONE json file in the audit directory — **never** a library:
+        the monitor must not modify the object it measures);
+      * reports the **INCREMENT** since the last run: newly damaged
+        paths, newly cleared paths;
+      * reports the **AGE** of the oldest damage and of the newest
+        damage, in seconds and in human units;
+      * attributes the damage to a **WRITER GENERATION** — the
+        ``chunker_version`` the erased row used to carry (``4``) vs
+        what it carries now (``0``): a row measured by the current
+        chunker and now carrying ``0`` was written by something that
+        does NOT know the current chunker.
+
+    The attribution is deliberately at the GENERATION level, not the
+    pid level: a read-only SQLite probe cannot prove which pid wrote
+    a row.  What it CAN prove is the generation, and it can list the
+    runtimes that were alive at that moment (see S3-V's DR-1 for the
+    full census).  Claiming a pid would be a claim the evidence does
+    not support.
     """
     detail: List[str] = []
     libs = enumerate_live(workspace)
     if not libs:
         return report.judge_notrun(
             "J-5(REAL)",
-            "J-5 持续监测：旧写入者是否又擦过库（降级证据 + 批量重写指纹 + 守卫拦截计数）",
+            "J-5 持续监测：旧写入者是否又擦过库（降级证据 + 增量 + 降级路径 + 时间）",
             "本工作区没有活库，前置条件不成立（这不是通过）")
 
     version, _src = current_chunker_version()
     detail.append("这是可持续重复运行的判据：每次运行都回答「旧写入者是否又来过」。")
     detail.append("证据按强度排序：① 已证明的降级  ② 批量重写指纹（时间）  ③ 守卫拦截计数")
+    detail.append("监测增强（S3-V）: ① files 侧的 files_keep 证人（之前漏了）"
+                  "  ② 增量  ③ 降级路径  ④ 时间与年龄  ⑤ 写者代际归因")
     detail.append("")
 
     ok = True
     proven = 0
     bulks = 0
+    files_damaged = 0
+    census: Dict[str, Any] = {}
     for prof in _profile_all(workspace):
         if prof.error:
             detail.append("  %-22s 前置不成立: %s" % (prof.name, prof.error))
@@ -990,23 +1044,119 @@ def judge_old_writer_erasure_monitor(report, workspace: Path):
             proven += 1
             ok = False
         else:
-            detail.append("      ⇒ 判定: 没有已证明的降级")
+            detail.append("      ⇒ 判定: chunks 侧没有已证明的降级")
+
+        # ---- the FILES side (S3-V) ------------------------------
+        try:
+            from agent.memory.acceptance.phase2_s3v import _files_census
+        except Exception as e:
+            detail.append("      files 侧: 读不了证人表 (%s: %s)" % (type(e).__name__, e))
+            continue
+        lib_obj = next((l for l in libs if l.name == prof.name), None)
+        if lib_obj is None:
+            continue
+        c = _files_census(lib_obj)
+        census[prof.name] = c
+        if c.error:
+            detail.append("      files 侧: %s" % c.error)
+            continue
+        if not c.deleted and not c.downgraded:
+            detail.append("      files 侧: 无已证明的降级（keep 行=%d，"
+                          "仅未测量=%d）" % (c.keep_rows, len(c.never_measured)))
+            continue
+        files_damaged += c.damaged_paths
+        ok = False
+        detail.append("      files 侧: 删除=%d 降级=%d  （仅未测量、无证人的=%d）"
+                      % (len(c.deleted), len(c.downgraded), len(c.never_measured)))
+        for path, kcc, kcv, at in c.deleted:
+            detail.append("        [删除] %-52s 曾有 cc=%s cv=%s  时刻=%s"
+                          % (path, kcc, kcv, _fmt_ts(at)))
+        for path, kcc, kcv, cc, cv, at in c.downgraded:
+            detail.append("        [降级] %-52s cc %s→%s cv %s→%s  时刻=%s"
+                          % (path, kcc, cc, kcv, cv, _fmt_ts(at)))
+        if c.last_damage_at:
+            age = int(time.time()) - c.last_damage_at
+            detail.append("        ⇒ 最近一次降级: %s（距今 %s）"
+                          % (_fmt_ts(c.last_damage_at), _fmt_age(age)))
+            detail.append("        ⇒ 写者代际: files_keep 记着 cv=%s，"
+                          "现在这一行是 cv=%s ⇒ 写它的程序【不认识当前切法 "
+                          "cv=%d】" % (c.downgraded[0][2] if c.downgraded else "?",
+                                     c.downgraded[0][4] if c.downgraded else "?",
+                                     version))
+        if c.oldest_damage_at:
+            oldest = int(time.time()) - c.oldest_damage_at
+            detail.append("        ⇒ 最老一条降级的年龄: %s（%d 秒）"
+                          % (_fmt_age(oldest), oldest))
 
     detail.append("")
-    detail.append("已证明降级的库: %d    有批量重写指纹的库: %d    活库总数: %d"
-                  % (proven, bulks, len(libs)))
-    if proven:
+    detail.append("已证明降级的库(chunks 侧): %d    有批量重写指纹的库: %d    "
+                  "活库总数: %d" % (proven, bulks, len(libs)))
+    detail.append("已证明降级的 path 数(files 侧): %d" % files_damaged)
+
+    # ---- the MONITOR: the increment ------------------------------
+    detail.append("")
+    try:
+        from agent.memory.acceptance.phase2_s3v import record_monitor_state
+        mon = record_monitor_state(workspace, census)
+        if mon["first_run"]:
+            detail.append("监测状态: 第一次运行 —— 已建立基线（%s）。"
+                          "下一次运行起报告增量。"
+                          % "memory/.audit/j5_monitor_state.json")
+        else:
+            detail.append("监测状态: 与上次运行对照（%s）"
+                          % "memory/.audit/j5_monitor_state.json")
+            total_new = total_cleared = 0
+            for name in sorted(mon["increment"]):
+                inc = mon["increment"][name]
+                total_new += inc["new_count"]
+                total_cleared += inc["cleared_count"]
+                if inc["new_count"] or inc["cleared_count"]:
+                    detail.append("  %-22s 新增降级=%d 消除=%d 累计=%d"
+                                  % (name, inc["new_count"],
+                                     inc["cleared_count"], inc["total"]))
+                    for p in inc["new_paths"][:6]:
+                        detail.append("      NEW  %s" % p)
+                    for p in inc["cleared_paths"][:6]:
+                        detail.append("      CLEARED %s" % p)
+            detail.append("  合计: 自上次以来新增=%d 消除=%d" % (total_new, total_cleared))
+            if total_new:
+                detail.append("  ⇒ 欠账在【长】: 旧端还在擦。")
+            elif total_cleared:
+                detail.append("  ⇒ 欠账在【缩】: 有人补上了。")
+            else:
+                detail.append("  ⇒ 欠账没有变化。")
+    except Exception as e:
+        detail.append("监测状态: 写不了（%s: %s）—— 增量无法报告"
+                      % (type(e).__name__, e))
+
+    if not ok:
+        detail.append("")
         detail.append("恢复建议：")
         detail.append("  1. 停掉还在跑旧代码的写入者（实测：桌面打包版 cowagent-backend.exe "
                       "构建于 2026-10-13，早于当前切法）")
         detail.append("  2. 重跑迁移（migrate）回填四列，再跑巡检器（inspector）置位 mirror")
         detail.append("  3. 复跑本判据，确认降级证据归零")
     else:
+        detail.append("")
         detail.append("恢复建议：无需恢复。若之后出现降级证据，按上面的三步处理。")
     return report.judge(
         "J-5(REAL)",
-        "J-5 持续监测：旧写入者是否又擦过库（降级证据 + 批量重写指纹 + 守卫拦截计数）",
+        "J-5 持续监测：旧写入者是否又擦过库（降级证据 + 增量 + 降级路径 + 时间）",
         ok, "\n".join(detail))
+
+
+def _fmt_age(seconds: int) -> str:
+    """A duration in human units — the reader must be able to see
+    "how long ago" without doing arithmetic."""
+    if seconds < 0:
+        return "未来"
+    if seconds < 60:
+        return "%d 秒" % seconds
+    if seconds < 3600:
+        return "%d 分钟 %d 秒" % (seconds // 60, seconds % 60)
+    if seconds < 86400:
+        return "%d 小时 %d 分" % (seconds // 3600, (seconds % 3600) // 60)
+    return "%d 天 %d 小时" % (seconds // 86400, (seconds % 86400) // 3600)
 
 
 def _guard_counter(db: str) -> Optional[str]:
