@@ -335,6 +335,24 @@ def truth_files(workspace: Path | str) -> List[Tuple[str, Path]]:
       * every agent's identity files under ``agents/<id>/``;
       * the persona layer's declared files;
       * the markdown truth layer under ``memory/``.
+
+    T2f (2026-11-01): **the persona layer is IN this set — and it was
+    in the set all along.**  The hole was elsewhere: the *manager's*
+    scan set (the ``files_to_scan`` list) never contained ``persona/``,
+    so the sync-time reconciliation — which walks the manager's scan
+    set — could never see the persona files, no matter how many times
+    it ran.  Measured on the live workspace: ``persona/identity.md``,
+    ``persona/contract.md`` and ``persona/continuity.md`` had **ZERO
+    events in the change log, ever** (1328 events in the root log, not
+    one of them pointing at ``persona/``) ⇒ the entire L2 persona
+    layer sat outside the mechanism.
+
+    The fix belongs in the manager (the scan set), NOT here: this
+    function is the single definition of "what is the truth layer", and
+    the criterion borrows it deliberately (the SET of files that must
+    be witnessed is a product decision, not a criterion's opinion).
+    Changing the set here would silently change what the criterion
+    measures.
     """
     from agent.memory.layers import excluded_segments
 
@@ -392,6 +410,122 @@ def truth_files(workspace: Path | str) -> List[Tuple[str, Path]]:
                 continue
             add(p.relative_to(workspace).as_posix(), p)
 
+    return out
+
+
+def workspace_truth_files(workspace: Path | str) -> List[Tuple[str, Path]]:
+    """The truth-layer files **owned by** this workspace alone.
+
+    T2f (2026-11-01).  :func:`truth_files` returns the ROOT's set,
+    which INCLUDES ``agents/<id>/...`` - because the root index owns
+    those files.  But each agent workspace has its OWN change log
+    (``<agent>/memory/.audit/file_changes.jsonl``), and the root's log
+    is a DIFFERENT file.
+
+    Consequence: reconciling the root's set against the root's log puts
+    the agents' paths into the ROOT's log and leaves the agents' own
+    logs empty.  Measured on a two-workspace fixture: the root log
+    ended up holding ``agents/agent-x/MEMORY.md`` while ``agent-x``'s
+    own log had **zero** events => the agent's history was invisible to
+    every reader of the agent's log (which is where the criterion looks
+    for an agent workspace's provenance).
+
+    **Who owns the ``agents/...`` paths.**  The ROOT index owns them
+    (the root's ``files`` table carries the rows for every agent's
+    identity files - measured: the root's database holds 136 file rows
+    while an agent's own holds 5).  But the ROOT's change log is not
+    the place to record them: the criterion reads an agent workspace's
+    provenance from **that agent's own log**, and the root's log is
+    consulted only for the root's own files.
+
+    => The rule is by LOG, not by index owner: a path belongs to the
+    workspace whose log records it.  The root records its own files
+    (the four identity files, ``persona/``, ``memory/``, ``knowledge/``);
+    an agent workspace records its own (``MEMORY.md``, ``AGENT.md``,
+    ``memory/``, ``knowledge/`` under ``agents/<id>/``).
+
+    The ROOT keeps the ``agents/...`` paths in :func:`truth_files` (that
+    is the set the criterion borrows, and the root index really does
+    carry those rows) - but this function, which drives the
+    RECONCILIATION, splits them to the agent that owns the file.
+    """
+    workspace = Path(workspace)
+    out: List[Tuple[str, Path]] = []
+    for rel, real in truth_files(workspace):
+        rel_posix = str(rel).replace("\\", "/")
+        parts = rel_posix.split("/")
+        if len(parts) >= 3 and parts[0] == "agents":
+            # agents/<id>/<file>  ->  owned by the AGENT workspace.
+            # The root's reconciliation must not claim it, and the
+            # agent's reconciliation must record it under its OWN name
+            # (the agent's log is keyed by paths relative to the
+            # agent's workspace, not to the root).
+            continue
+        out.append((rel, real))
+    return out
+
+
+def agent_truth_files(workspace: Path | str) -> List[Tuple[str, Path]]:
+    """The truth-layer files of an AGENT workspace, keyed for ITS log.
+
+    T2f (2026-11-01).  An agent workspace's change log records paths
+    RELATIVE TO THE AGENT (``MEMORY.md``, ``memory/2026-11-01.md``),
+    not relative to the root (``agents/<id>/MEMORY.md``).  The
+    criterion reads the agent's log with those relative keys - so the
+    reconciliation must write the same keys.
+    """
+    workspace = Path(workspace)
+    out: List[Tuple[str, Path]] = []
+    for rel, real in truth_files(workspace):
+        rel_posix = str(rel).replace("\\", "/")
+        parts = rel_posix.split("/")
+        if len(parts) >= 3 and parts[0] == "agents":
+            # Strip the "agents/<id>/" prefix: the agent's own key.
+            out.append(("/".join(parts[2:]), real))
+            continue
+        out.append((rel_posix, real))
+    return out
+
+
+def _workspaces_with_candidates(workspace: Path | str):
+    """Yield ``(workspace, candidates)`` for EVERY workspace under ``workspace``.
+
+    T2f (2026-11-01).  A workspace tree is the ROOT plus every
+    ``agents/<id>/`` directory, and **each has its own change log**.
+    The reconciliation must run against each workspace's OWN log with
+    that workspace's OWN files — otherwise the root's log swallows the
+    agents' paths and the agents' logs stay empty.
+
+    A workspace is included when it HAS a change log (a workspace
+    without one is not a workspace this mechanism can serve) or when it
+    has files worth witnessing but no log yet — in that case the log is
+    created by the write.
+
+    The candidates are the workspace's own truth files: the root
+    (:func:`workspace_truth_files` - its own files, WITHOUT the
+    ``agents/...`` paths, which belong to the agents' own logs) and each
+    agent workspace (:func:`agent_truth_files` - its own files, keyed
+    RELATIVE TO THE AGENT, which is how its own log is keyed).
+    """
+    workspace = Path(workspace)
+    out = []
+    seen = set()
+
+    def push(ws: Path, is_agent: bool):
+        key = str(ws.resolve()) if ws.exists() else str(ws)
+        if key in seen:
+            return
+        seen.add(key)
+        cands = (agent_truth_files(ws) if is_agent
+                 else workspace_truth_files(ws))
+        out.append((ws, cands))
+
+    push(workspace, False)
+    agents = workspace / "agents"
+    if agents.is_dir():
+        for ad in sorted(agents.iterdir()):
+            if ad.is_dir():
+                push(ad, True)
     return out
 
 
@@ -480,14 +614,31 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print("  ? %s" % p)
         return 0
 
-    cands = truth_files(workspace)
-    rep = reconcile_external_edits(workspace, cands, dry_run=not args.apply)
+    # T2f (2026-11-01): reconcile EVERY workspace against its OWN log.
+    #
+    # The bug this fixes (measured on a two-workspace fixture): the CLI
+    # used to reconcile the ROOT's truth set against the ROOT's log —
+    # which put ``agents/agent-x/MEMORY.md`` into the ROOT's log and
+    # left ``agent-x``'s own log EMPTY.  Every reader of an agent
+    # workspace's provenance (the criterion included) looks at that
+    # agent's own log ⇒ the agent's history was invisible.
+    #
+    # The root keeps its own files; each agent workspace is reconciled
+    # against its own log with its own files.
+    reports = []
+    for ws, ws_cands in _workspaces_with_candidates(workspace):
+        rep = reconcile_external_edits(ws, ws_cands, dry_run=not args.apply)
+        rep["workspace"] = str(ws)
+        reports.append(rep)
     if args.json:
-        print(json.dumps(rep, ensure_ascii=False, indent=2))
+        print(json.dumps(reports, ensure_ascii=False, indent=2))
     else:
-        print(format_report(rep, verbose=True))
-        if not args.apply and rep["recorded"]:
-            print("\n（这是 dry-run。加 --apply 才会真的记录。）")
+        for rep in reports:
+            print(format_report(rep, verbose=True))
+            print("")
+        total = sum(len(r.get("recorded") or []) for r in reports)
+        if total and not args.apply:
+            print("（这是 dry-run。加 --apply 才会真的记录。）")
     return 0
 
 

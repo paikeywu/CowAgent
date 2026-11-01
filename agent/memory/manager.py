@@ -1111,6 +1111,53 @@ class MemoryManager:
             if identity_file.exists():
                 files_to_scan.append((identity_file, "memory", "shared", None))
 
+        # T2f (2026-11-01): the PERSONA layer.
+        #
+        # The L2 persona layer (``<workspace>/persona/*.md``) is the
+        # SOURCE OF TRUTH for every ``AGENT.md`` in the team — and it
+        # was invisible to the change log.  Measured on the live
+        # workspace: the root log holds 1328 events and **not one of
+        # them points at ``persona/``**; ``persona/identity.md``,
+        # ``persona/contract.md`` and ``persona/continuity.md`` had
+        # **zero events, ever**.
+        #
+        # WHY it was invisible: the sync-time reconciliation (the T2c
+        # backstop) walks THIS list (``files_to_scan``), and the
+        # persona directory was not in it — the walk below only covers
+        # ``memory/`` and ``knowledge/``, and the root-identity loop
+        # above only covers four files.  So no matter how often the
+        # reconciliation ran, it could never see the persona layer.
+        #
+        # It IS indexed (``files`` rows with ``persona/...`` paths exist
+        # in every live database) — the index reaches it through the
+        # knowledge/state-dir resolution, not through this walk.  That
+        # is exactly why the hole is invisible: **indexed but never
+        # logged**.
+        #
+        # The persona files are read as a SET (the layer's own
+        # declaration in ``PERSONA.meta.json`` when present, else every
+        # ``*.md`` beside it) — the same rule
+        # ``external_edit.truth_files`` uses, so the scan set and the
+        # witness set agree on WHICH files the persona layer has.
+        persona_dir = Path(workspace_dir) / "persona"
+        if persona_dir.is_dir():
+            _persona_names = None
+            _persona_meta = persona_dir / "PERSONA.meta.json"
+            if _persona_meta.is_file():
+                try:
+                    import json as _json
+                    _persona_names = list(
+                        _json.loads(_persona_meta.read_text(encoding="utf-8"))
+                        .get("files", {}).keys())
+                except Exception:
+                    _persona_names = None
+            if not _persona_names:
+                _persona_names = sorted(p.name for p in persona_dir.glob("*.md"))
+            for _pname in _persona_names:
+                _pfile = persona_dir / _pname
+                if _pfile.is_file():
+                    files_to_scan.append((_pfile, "memory", "shared", None))
+
         if memory_dir.exists():
             from agent.memory.identity_ns import parse_user_dir_name
 
