@@ -249,6 +249,7 @@ REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
     "test_p1_stage3x_criteria_mutants.py": (
         "MU-T1", "MU-T2", "MU-T3", "MU-T4", "MU-T5", "MU-T6",
         "MU-T8", "MU-T9", "MU-T10", "MU-T11", "MU-T12",
+        "MU-T13", "MU-T14", "MU-T15", "MU-T16",
     ),
 }
 

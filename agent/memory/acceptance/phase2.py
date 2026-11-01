@@ -856,7 +856,25 @@ _S3E_CRITERIA = [
 _S3H_CRITERIA = [
     ("C-A3", "judge_ca3_chunker_version_is_consistent"),
     ("INV-2", "judge_inv2_anchor_rebuild_is_canonical_equal"),
-    ("ANCHOR", "judge_anchor_segments_are_self_consistent"),
+    # NOTE: the ANCHOR criterion used to live HERE.  It is **superseded
+    # by 架构师 T1b's ruling** and moved to ``phase2_s3y`` (registered
+    # below, under the same group name "ANCHOR").
+    #
+    # **Why it was moved and not merely edited.**  The old criterion
+    # compared the recorded ``~N`` against the CURRENT file, so every
+    # file edited after its certification read as a broken anchor.  The
+    # architect measured all 102 such rows on the live corpus: **100%
+    # of them were "the file changed after certification", 0% were a
+    # genuinely broken anchor**.  A FAIL there points the engineer at
+    # the ANCHOR — i.e. at re-cutting the projection by hand — which is
+    # the wrong repair for the wrong reason.
+    #
+    # ⇒ The old function is KEPT in ``phase2_s3h`` (it is a documented
+    # measurement, and the mutant suite uses it as the **cross-check**
+    # of the new one — its RED set must equal exactly the new one's
+    # "file changed" set).  But it is no longer a GATE ROW: keeping a
+    # red that the architect has ruled to be a false red is the one
+    # outcome this round exists to prevent.
     ("UPSERT", "judge_upsert_does_not_downgrade_the_body_columns"),
     ("PARSER", "judge_anchor_parser_is_single"),
 ]
@@ -1301,6 +1319,53 @@ def _load_s3v():
     return out
 
 
+# ---------------------------------------------------------------------------
+# S3-Y · the ANCHOR ``~N`` baseline (架构师 T1b 定案 · T3d)
+# ---------------------------------------------------------------------------
+#
+# **Why a NEW module and not a change to ``phase2_s3h``.**  The old
+# ANCHOR criterion compared the recorded ``~N`` against the CURRENT
+# file, which meant that **every file edited after its certification
+# read as a broken anchor** — 102 rows on the live corpus, all of them
+# pointing at the wrong repair (the true cause is a stale projection,
+# which is DR-6's business).
+#
+# The new口径 keeps the SAME check (the ``~N`` syntax, the
+# non-negativity, the segment/span invariant — 硬要求 ③) and changes
+# only **where the expected value comes from**: the certified
+# fingerprint (``files.hash``).  A changed file degrades to NOTRUN
+# **with the path list attached** (硬要求 ① + 交办 ③).
+#
+# The old ANCHOR is KEPT and still runs — it is the **pre-ruling
+# reading**, and its RED set is the honest "these rows are suspect"
+# list.  The two are compared by **R3-style set equality** in the
+# mutant suite, so the new one cannot quietly disagree with the old
+# one.
+_S3Y_CRITERIA = [
+    # The group name stays "ANCHOR" — the criterion NUMBER is stable
+    # across the ruling (the external baselines reference it by name).
+    ("ANCHOR", "judge_anchor_tilde_n_uses_the_certified_baseline"),
+]
+
+
+def _load_s3y():
+    """The S3-Y criterion functions, bound to the workspace."""
+    from agent.memory.acceptance import phase2_s3y
+
+    ws = Path(resolve_workspace(ARGS.workspace)[0])
+    out = []
+    for group, attr in _S3Y_CRITERIA:
+        fn = getattr(phase2_s3y, attr)
+
+        def make(fn=fn, ws=ws):
+            def run(report):
+                return fn(report, ws)
+            return run
+
+        out.append((group, make()))
+    return out
+
+
 def _load_s3w():
     """The S3-W criterion functions, bound to the workspace."""
     from agent.memory.acceptance import phase2_s3w
@@ -1433,6 +1498,12 @@ def main() -> int:
     # canonical yardstick + its byte-difference DIAGNOSTIC, the fresh
     # write's decided origin, and the writer-generation evidence).
     for group, fn in _load_s3w():
+        if ARGS.only and not group.startswith(ARGS.only):
+            continue
+        guarded(fn, report)
+
+    # The S3-Y criteria (the ANCHOR ``~N`` baseline · 架构师 T1b 定案).
+    for group, fn in _load_s3y():
         if ARGS.only and not group.startswith(ARGS.only):
             continue
         guarded(fn, report)

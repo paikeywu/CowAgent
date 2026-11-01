@@ -692,3 +692,246 @@ def test_the_global_baseline_file_must_be_tracked():
     assert out.returncode == 0, (
         "全局基线不在版本库内：换台机器跑不了 —— "
         "这正是阶段二 B2 未闭环的根因")
+
+
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# MU-T13 / MU-T14 / MU-T15 / MU-T16 · the ANCHOR ``~N`` baseline
+# ---------------------------------------------------------------------------
+#
+# **These are 硬要求 ② and ③ of 架构师 T1b's ruling, turned into mutants.**
+#
+# MU-T13  remove the baseline comparison ⇒ the criterion must go RED
+#         (硬要求 ②: 「去掉基准必须红」).  Removing the baseline is the
+#         FORBIDDEN shape — it is "把检查改成永远绿": without it, a
+#         stale ``~N`` gets compared against a changed file, and the
+#         FAIL points at the wrong repair.
+# MU-T14  break the ``~N`` SYNTAX / non-negativity check ⇒ it must
+#         still be RED (硬要求 ③: the degradation is on the expected
+#         value's SOURCE, not on the check's existence).
+# MU-T15  the file is UNCHANGED and the ``~N`` does not match ⇒ the
+#         check must still BITE (a genuinely broken anchor).
+# MU-T16  the CONTROL — unchanged file, matching ``~N`` ⇒ PASS.  The
+#         mutant suite's own rule: **改坏必红 ⇒ 还原必绿**.  Without
+#         this control, MU-T13/14/15 would be satisfied by a criterion
+#         that is red on everything.
+#
+# **Why a fixture and not the live corpus.**  The live libraries are
+# being rebuilt while this suite runs (measured: the judged rows went
+# from 3305 to 810 in five minutes), so a test that reads the live
+# corpus is a test whose result depends on when it ran.
+#
+# **The fixture's arithmetic** (this matters — the span invariant is
+# part of what is being tested):
+#
+#     content = "line one\n\nline two\n\n\n"
+#     content.split("\n") == ["line one", "", "line two", "", "", ""]
+#
+#     segment 1 = lines[0:1] = ["line one"]  ⇒ 0 trailing blanks
+#     segment 2 = lines[1:2] = [""]           ⇒ 1 trailing blank
+#
+#     ⇒ the MATCHING anchor is  "L1-2+S1-1~0,2-2~1"
+#       (the last segment must end at L<end> ⇒ L1-2, not L1-3)
+#     ⇒ the BROKEN   anchor is  "L1-2+S1-1~0,2-2~0"
+
+def _anchor_fixture(root: Path, *, stored_hash: str, content: str,
+                    anchor: str, body_path: str = "doc.md"):
+    """One library, one pointed row, one ``files`` row.
+
+    Returns the workspace root (what ``enumerate_live`` walks) with a
+    live library at the ROOT shape.
+    """
+    import sqlite3
+
+    ws = root
+    (ws / "memory" / "long-term").mkdir(parents=True, exist_ok=True)
+    truth = ws / "doc.md"
+    truth.write_text(content, encoding="utf-8")
+
+    db = ws / "memory" / "long-term" / "index.db"
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(
+            "CREATE TABLE chunks (id TEXT PRIMARY KEY, body_path TEXT, "
+            "body_anchor TEXT, text_state TEXT)")
+        conn.execute(
+            "CREATE TABLE files (path TEXT PRIMARY KEY, source TEXT, "
+            "hash TEXT, mtime INTEGER, size INTEGER, updated_at INTEGER, "
+            "chunk_count INTEGER, chunker_version INTEGER)")
+        conn.execute(
+            "INSERT INTO chunks (id, body_path, body_anchor, text_state) "
+            "VALUES (?,?,?,?)", ("chunk-1", body_path, anchor, "mirror"))
+        conn.execute(
+            "INSERT INTO files (path, source, hash, mtime, size, "
+            "updated_at, chunk_count, chunker_version) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (body_path, "memory", stored_hash, 0, 0, 0, 1, 4))
+        conn.commit()
+    finally:
+        conn.close()
+    return ws
+
+
+def test_muT13_removing_the_baseline_must_be_red(tmp_path):
+    """MU-T13: the ``files.hash`` baseline comparison is REMOVED.
+
+    硬要求 ②: *"必须有 mutant（去掉基准必须红）"*.
+
+    The mutation replaces
+    :func:`phase2_s3y.compare_against_certified_baseline` with one that
+    always says "match" — i.e. **the expectation is used as if it were
+    still valid**.  That is precisely the forbidden shape: the
+    criterion would then compare a stale ``~N`` against a changed file
+    and report a FAIL that points at the ANCHOR instead of at the
+    stale projection.
+
+    ⇒ With the baseline removed, the row the fixture made "changed" is
+    measured ⇒ and it FAILS ⇒ the criterion is RED.
+
+    **The mutant's effect is proved first**: the mutated baseline must
+    actually report "match" for a stored hash that does NOT match the
+    file.  A mutant that did not take effect would "prove" the
+    criterion is red by accident.
+    """
+    import hashlib
+
+    from agent.memory.acceptance import phase2_s3y
+
+    content = "line one\n\nline two\n\n\n"
+    # The stored hash is of a DIFFERENT content ⇒ the file "changed".
+    stored = hashlib.sha256(b"something else").hexdigest()
+    # The anchor's ~N does not match the file ⇒ measuring it ⇒ FAIL.
+    anchor = "L1-2+S1-1~0,2-2~0"
+
+    ws = _anchor_fixture(tmp_path / "ws", stored_hash=stored,
+                         content=content, anchor=anchor)
+
+    # --- prove the mutation took effect ---
+    original = phase2_s3y.compare_against_certified_baseline
+
+    def always_match(stored_hash, truth):
+        return phase2_s3y.BaselineVerdict("match", stored_hash, "mutant")
+
+    assert original is not always_match
+    phase2_s3y.compare_against_certified_baseline = always_match
+    try:
+        mutated = phase2_s3y.compare_against_certified_baseline(
+            stored, ws / "doc.md")
+        assert mutated.state == "match", (
+            "变异没生效（mutant 必须先自证）: %r" % (mutated,))
+        report, states, printed = _run(
+            phase2_s3y.judge_anchor_tilde_n_uses_the_certified_baseline, ws)
+    finally:
+        phase2_s3y.compare_against_certified_baseline = original
+
+    assert states.get("ANCHOR-B(REAL)") == STATE_FAIL, (
+        "去掉基准 ⇒ 拿失效的期望值去比 ⇒ 判红（而不是永远绿）\n" + printed)
+    assert "文件已变(NOTRUN)=0" in printed, (
+        "去掉基准后不应再有任何行被降级为「文件已变」\n" + printed)
+    assert "~N 不符(FAIL)=1" in printed, printed
+
+    # --- and the restore must go back to NOTRUN ---
+    report, states, printed = _run(
+        phase2_s3y.judge_anchor_tilde_n_uses_the_certified_baseline, ws)
+    assert states.get("ANCHOR-B(REAL)") == STATE_NOTRUN, (
+        "还原基准 ⇒ 文件已变 ⇒ NOTRUN（不是 FAIL，也不是绿）\n" + printed)
+    assert "「文件已变」名单" in printed, printed
+
+
+def test_muT14_the_syntax_check_must_survive_the_degradation(tmp_path):
+    """MU-T14: the ``~N`` SYNTAX / non-negativity check is BROKEN.
+
+    硬要求 ③: *"必须保留 ``~N`` 的语法与非负性检查（降级的是**期望值
+    来源**，不是检查的存在性）"*.
+
+    The fixture's file HAS changed (so the baseline comparison would
+    degrade the row to NOTRUN) **and** its anchor has a broken ``~N``
+    syntax.  The criterion must still report **FAIL** — because a
+    broken syntax is a fact about the anchor STRING, and the anchor
+    string does not go stale when the file does.
+
+    ⇒ **the degradation must not swallow the syntax check.**
+    """
+    import hashlib
+
+    from agent.memory.acceptance import phase2_s3y
+
+    content = "line one\n\nline two\n\n\n"
+    stored = hashlib.sha256(b"something else").hexdigest()
+    # ``~x`` is not a number ⇒ the grammar rejects it ⇒ the syntax
+    # check must fire.
+    anchor = "L1-2+S1-1~x,2-2~1"
+
+    ws = _anchor_fixture(tmp_path / "ws", stored_hash=stored,
+                         content=content, anchor=anchor)
+
+    report, states, printed = _run(
+        phase2_s3y.judge_anchor_tilde_n_uses_the_certified_baseline, ws)
+
+    assert states.get("ANCHOR-B(REAL)") == STATE_FAIL, (
+        "语法坏（即使文件已变）⇒ 必须仍然是 FAIL —— 降级的是**期望值来源**，"
+        "不是检查的存在性\n" + printed)
+    assert "语法/跨度坏(FAIL)=1" in printed, printed
+    assert "文件已变(NOTRUN)=0" in printed, (
+        "语法坏的行不该被降级成「文件已变」（降级只针对期望值来源）\n"
+        + printed)
+
+
+def test_muT15_a_broken_anchor_must_still_be_red_with_an_unchanged_file(
+        tmp_path):
+    """MU-T15: the file is UNCHANGED and the ``~N`` does not match.
+
+    The counterpart of MU-T13/MU-T14: **the check must still have
+    teeth.**  A file that has NOT changed since its certification is
+    measured as before — and if the recorded ``~N`` does not match the
+    file, that is a **genuinely broken anchor** and must be FAIL.
+
+    ⇒ This is what makes the NOTRUN not a "green hole": the rows that
+    ARE measurable are still checked, and they still bite.
+    """
+    from agent.memory.acceptance import phase2_s3y
+    from agent.memory.file_hash import canonical_file_hash
+
+    content = "line one\n\nline two\n\n\n"
+    stored = canonical_file_hash(content)     # the file is UNCHANGED
+    # The anchor claims ZERO trailing blanks where the file has one.
+    anchor = "L1-2+S1-1~0,2-2~0"
+
+    ws = _anchor_fixture(tmp_path / "ws", stored_hash=stored,
+                         content=content, anchor=anchor)
+
+    report, states, printed = _run(
+        phase2_s3y.judge_anchor_tilde_n_uses_the_certified_baseline, ws)
+
+    assert states.get("ANCHOR-B(REAL)") == STATE_FAIL, (
+        "文件未变而 ~N 不符 ⇒ 真坏的锚点 ⇒ 必须红\n" + printed)
+    assert "~N 不符(FAIL)=1" in printed, printed
+
+
+def test_muT16_the_unchanged_file_must_pass(tmp_path):
+    """MU-T16: the CONTROL — an unchanged file with a matching ``~N``.
+
+    The mutant suite's own rule: **改坏必红 ⇒ 还原必绿**.  Without
+    this control, MU-T13/MU-T14/MU-T15 would be satisfied by a
+    criterion that is red on everything.
+    """
+    from agent.memory.acceptance import phase2_s3y
+    from agent.memory.file_hash import canonical_file_hash
+
+    content = "line one\n\nline two\n\n\n"
+    stored = canonical_file_hash(content)
+    # The anchor's ~N values match the file: the first segment has no
+    # trailing blank, the second has one.
+    anchor = "L1-2+S1-1~0,2-2~1"
+
+    ws = _anchor_fixture(tmp_path / "ws", stored_hash=stored,
+                         content=content, anchor=anchor)
+
+    report, states, printed = _run(
+        phase2_s3y.judge_anchor_tilde_n_uses_the_certified_baseline, ws)
+
+    assert states.get("ANCHOR-B(REAL)") == STATE_PASS, (
+        "文件未变且 ~N 相符 ⇒ 必须绿（否则判据对一切都是红）\n" + printed)
+    assert "实测通过=1" in printed, printed
