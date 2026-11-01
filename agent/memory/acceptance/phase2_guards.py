@@ -497,7 +497,13 @@ def judge_mutation_replay_is_registered(report, workspace: Path = None):
             tracked = out.returncode == 0
         except Exception as e:
             detail.append("git ls-files 失败: %s" % e)
-        names = sorted(set(re.findall(r"MU-(\d+)", src)))
+        # The name pattern must accept BOTH spellings: the numeric
+        # ones (MU-1 .. MU-53) and the prefixed ones (MU-T1 ..
+        # MU-T12, the S3-X round).  The old pattern (MU-\d+) could not
+        # see a prefixed name at all, so a replay file that named
+        # nothing but MU-T* names was reported as "names nothing" — a
+        # false red on a file that was naming plenty.
+        names = sorted(set(re.findall(r"MU-([A-Za-z]?\d+)", src)))
         seen_names.update("MU-%s" % n for n in names)
         detail.append("  %s  入库=%s  重放的变异=MU-%s"
                       % (path.name, tracked, ", ".join(names) if names else "无"))
