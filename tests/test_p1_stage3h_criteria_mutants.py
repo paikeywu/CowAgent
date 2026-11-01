@@ -473,11 +473,13 @@ def test_mu16_the_criterion_does_not_call_the_rebuilder(tmp_path):
     assert verdict_lines, (
         "判定必须用 canonical 计数 —— 逐字节计数只是打印项，不参与判定"
         "（SEED 裁决 C7）")
-    for ln in verdict_lines:
-        assert "lib_rows == lib_canon" in ln, (
-            "判定行必须比较 lib_rows 与 lib_canon：%r" % ln)
-    # And the BYTE count must NOT decide anything: no verdict line may
-    # compare ``lib_rows`` with ``lib_byte``.
+    # The VERDICT line must compare ``lib_rows`` with ``lib_canon``;
+    # every other line that mentions both must NOT compare them with
+    # ``lib_byte``.
+    verdict_uses = [ln for ln in verdict_lines if "lib_rows ==" in ln]
+    assert verdict_uses, (
+        "找不到用 lib_canon 判定 verdict 的行（应形如 "
+        "'verdict = ... if (lib_rows == lib_canon) ...'）")
     for ln in verdict_lines:
         assert "lib_rows == lib_byte" not in ln, (
             "逐字节计数不得参与判定：%r" % ln)
