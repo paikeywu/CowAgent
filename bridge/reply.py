@@ -3,6 +3,20 @@
 from enum import Enum
 
 
+# The stand-in a cancelled turn carries when it produced nothing at all.
+#
+# It is NOT an answer: the run was aborted mid-flight, so there is nothing to
+# report. A cancelled turn that DID produce partial output keeps that output
+# and never reaches this string (agent/protocol/agent_stream.py only falls
+# back to it when the response is empty).
+#
+# It lives here because both the producer (agent_stream) and the consumers
+# (agent/tools/agent_delegate) need to agree on what "nothing" looks like -
+# a duplicated literal would let the two drift apart and turn "the teammate
+# was cut off" into "the teammate answered".
+CANCELLED_PLACEHOLDER = "_(Cancelled)_"
+
+
 class ReplyType(Enum):
     TEXT = 1  # 文本
     VOICE = 2  # 音频文件

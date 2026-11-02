@@ -12,6 +12,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import List, Dict, Any, Optional, Callable, Tuple
 
 from agent.protocol.cancel import AgentCancelledError
+from bridge.reply import CANCELLED_PLACEHOLDER
 from agent.protocol.models import LLMRequest, LLMModel
 from agent.protocol.message_utils import (
     sanitize_claude_messages,
@@ -1341,7 +1342,7 @@ class AgentStreamExecutor:
             logger.info(f"[Agent] 🛑 Cancelled by user (turn {turn})")
             self._handle_cancelled(final_response)
             if not final_response or not final_response.strip():
-                final_response = "_(Cancelled)_"
+                final_response = CANCELLED_PLACEHOLDER
 
         except Exception as e:
             logger.error(f"❌ Agent execution error: {e}")

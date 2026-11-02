@@ -1,23 +1,37 @@
 """The delegation budget must not throw away work that actually happened.
 
-The deadline in ``_local_run_deadline`` only SETS the cancel event - it does
-not kill the teammate's run. Measured 2026-11-03: a teammate whose budget ran
-out kept working and finished its answer afterwards, and the bridge handed that
-answer back as an ordinary reply. The old code dropped that reply on the floor
-and returned a bare "exceeded its time budget", so the caller could not tell
-"the teammate produced nothing" from "the teammate finished, but the budget
-expired first".
+The deadline in ``_local_run_deadline`` only SETS the cancel event. What the
+executor does with that is abort the turn - and it answers with whatever the
+turn had produced so far. Measured 2026-11-03 against the real bridge
+(``agents/agent-mvnewfyb/deliverables/evidence/2026-11-03-delegate-fix/
+mechanism_probe.txt`` and a direct capture of the real fixture):
 
-Same defect 4e5266d2 fixed on the sub-agent side.
+  * cut off with NOTHING produced  -> the executor hands back the
+    cancellation placeholder ``_(Cancelled)_`` - a stand-in, not an answer
+  * cut off after producing text   -> that text comes back, and it is real
+    but INCOMPLETE
+  * finished inside its budget     -> the complete answer
 
-These tests pin the invariant: an answer that exists is handed back, and the
-caller can tell over-budget-with-output from over-budget-without-output.
+The old code dropped the reply on the floor in every one of those cases and
+returned a bare "exceeded its time budget", so the caller could not tell "the
+teammate did nothing" from "the teammate did most of it". Same defect
+4e5266d2 fixed on the sub-agent side.
+
+These tests pin the invariant: work that happened is handed back, and the
+caller can tell all three outcomes apart.
+
+THE FAKES HERE MUST REPRODUCE THE REAL MECHANISM. An earlier version of
+this file used a fake that returned a finished answer after the deadline,
+which the real executor never does - that fake made the test pass while
+testing nothing but itself. The fixture in
+``tests/test_agent_delegation_timeout.py`` drives the real bridge and the
+real cancel registry; these tests borrow its shape.
 """
 import time
 
 import pytest
 
-from bridge.reply import Reply, ReplyType
+from bridge.reply import CANCELLED_PLACEHOLDER, Reply, ReplyType
 
 from tests.test_agent_delegation import FakeBridge, _context, _tool
 
@@ -41,26 +55,8 @@ def _team_members(monkeypatch):
     return roster
 
 
-class _SlowBridge(FakeBridge):
-    """Finishes AFTER the budget expires, with a real answer.
-
-    ``delay`` must exceed the policy's ``timeout_seconds`` for the expiry to
-    fire while the teammate is still running.
-    """
-
-    def __init__(self, delay=0.4, answer="结论：队友在预算到点后完成了", registry=None):
-        super().__init__(registry)
-        self.delay = delay
-        self.answer = answer
-
-    def agent_reply(self, query, context=None, on_event=None):
-        self.calls.append((query, context, on_event))
-        time.sleep(self.delay)
-        return Reply(ReplyType.TEXT, self.answer)
-
-
-class _EmptyBridge(FakeBridge):
-    """Finishes after the budget expires, with nothing to say."""
+class _CancelledWithNothing(FakeBridge):
+    """The real executor's answer when the turn was cut off with no output."""
 
     def __init__(self, delay=0.4, registry=None):
         super().__init__(registry)
@@ -69,7 +65,26 @@ class _EmptyBridge(FakeBridge):
     def agent_reply(self, query, context=None, on_event=None):
         self.calls.append((query, context, on_event))
         time.sleep(self.delay)
-        return Reply(ReplyType.TEXT, "")
+        return Reply(ReplyType.TEXT, CANCELLED_PLACEHOLDER)
+
+
+class _CancelledWithPartialOutput(FakeBridge):
+    """The real executor's answer when the turn was cut off after some text.
+
+    ``agent/protocol/agent_stream.py`` keeps the partial response and only
+    falls back to the placeholder when the response is empty - so a cut-off
+    turn CAN carry real (incomplete) text.
+    """
+
+    def __init__(self, delay=0.4, partial="已核对到第 3 项，第 4 项还没查完", registry=None):
+        super().__init__(registry)
+        self.delay = delay
+        self.partial = partial
+
+    def agent_reply(self, query, context=None, on_event=None):
+        self.calls.append((query, context, on_event))
+        time.sleep(self.delay)
+        return Reply(ReplyType.TEXT, self.partial)
 
 
 def _policy(seconds):
@@ -79,33 +94,38 @@ def _policy(seconds):
     return {"timeout_seconds": seconds}
 
 
-def test_over_budget_with_output_hands_the_answer_back():
-    """K-1: the answer exists, so it must survive the budget expiry."""
-    bridge = _SlowBridge(delay=0.4, answer="结论：队友在预算到点后完成了")
+def test_over_budget_with_partial_output_hands_it_back():
+    """K-1: the text exists, so it must survive the budget expiry."""
+    bridge = _CancelledWithPartialOutput(delay=0.4)
     tool = _tool(bridge=bridge, config=_policy(0.05))
 
     result = tool.execute({"agent_id": "research", "task": "Check"})
 
-    # Not a bare failure any more: the work happened, so the answer rides
-    # along with it.
+    # Not a bare failure: the work happened, so the text rides along.
     assert result.status == "success"
     assert result.result["status"] == "budget_expired"
     assert result.result["budget_expired"] is True
-    assert result.result["content"] == "结论：队友在预算到点后完成了"
-    # The caller can still tell this apart from a run that finished in time.
-    assert result.result["status"] != "done"
+    # ...and the caller is told it is partial, so it is not read as a
+    # finished answer.
+    assert result.result["partial"] is True
+    assert result.result["content"] == "已核对到第 3 项，第 4 项还没查完"
 
 
-def test_over_budget_without_output_says_so_explicitly():
-    """K-2: no answer came back, and the caller must be able to tell."""
-    tool = _tool(bridge=_EmptyBridge(delay=0.4), config=_policy(0.05))
+def test_over_budget_with_no_output_is_a_failure():
+    """K-2: the cancellation placeholder is NOT an answer.
+
+    The executor hands back ``_(Cancelled)_`` when the turn was cut off
+    without producing anything. Reporting that as a successful answer would
+    tell the caller "the teammate answered" when it answered nothing.
+    """
+    tool = _tool(bridge=_CancelledWithNothing(delay=0.4), config=_policy(0.05))
 
     result = tool.execute({"agent_id": "research", "task": "Check"})
 
     assert result.status == "error"
     assert "exceeded its" in str(result.result)
-    # The two over-budget outcomes must NOT look the same to the caller.
-    assert result.result != "budget_expired"
+    # The placeholder must never be presented as an answer.
+    assert CANCELLED_PLACEHOLDER not in str(result.result)
 
 
 def test_a_run_that_fits_its_budget_is_untouched():
@@ -120,25 +140,34 @@ def test_a_run_that_fits_its_budget_is_untouched():
     assert "budget_expired" not in result.result
 
 
-def test_the_two_over_budget_outcomes_are_distinguishable():
+def test_the_three_outcomes_are_distinguishable():
     """K-4: the negative control.
 
-    If the over-budget case returned the same shape as a normal completion,
-    the caller could not tell them apart and the "output survives" claim
-    would be worthless. This is the check that keeps K-1 honest.
+    If the over-budget-with-output case returned the same shape as a normal
+    completion, the caller could not tell them apart and the "output
+    survives" claim would be worthless. This is the check that keeps K-1
+    honest.
     """
-    over = _tool(bridge=_SlowBridge(delay=0.4), config=_policy(0.05))
+    over = _tool(bridge=_CancelledWithPartialOutput(delay=0.4), config=_policy(0.05))
     over_result = over.execute({"agent_id": "research", "task": "Check"})
+
+    nothing = _tool(bridge=_CancelledWithNothing(delay=0.4), config=_policy(0.05))
+    nothing_result = nothing.execute({"agent_id": "research", "task": "Check"})
 
     normal = _tool(bridge=FakeBridge(), config=_policy(30))
     normal_result = normal.execute({"agent_id": "research", "task": "Check"})
 
+    # Three distinct outcomes.
     assert over_result.status == "success"
+    assert nothing_result.status == "error"
     assert normal_result.status == "success"
-    # Same overall verdict (both produced an answer)...
-    assert over_result.status == normal_result.status
-    # ...but different provenance, and the caller can act on it.
+
+    # The two successes are still told apart.
     assert over_result.result["status"] == "budget_expired"
     assert normal_result.result["status"] == "done"
-    assert over_result.result["budget_expired"] is True
+    assert over_result.result["partial"] is True
     assert "budget_expired" not in normal_result.result
+
+    # And the failure says why, with no placeholder masquerading as an answer.
+    assert "exceeded its" in str(nothing_result.result)
+    assert CANCELLED_PLACEHOLDER not in str(nothing_result.result)

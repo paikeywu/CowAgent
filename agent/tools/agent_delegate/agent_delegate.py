@@ -12,7 +12,7 @@ from typing import Mapping, Optional, Tuple
 
 from agent.tools.base_tool import BaseTool, ToolResult
 from bridge.context import Context, ContextType
-from bridge.reply import ReplyType
+from bridge.reply import CANCELLED_PLACEHOLDER, ReplyType
 from common.log import logger
 
 # Marks delegated runs so they can be told apart from turns a user started.
@@ -624,12 +624,15 @@ class AgentDelegateTool(BaseTool):
             finally:
                 # Whatever happened, the teammate is done speaking. Over budget
                 # is not the same as failed: the teammate may well have
-                # produced an answer (measured 2026-11-03 - the deadline only
-                # sets the cancel event, it does not kill the run), and the
-                # card must not claim "failed" for work that happened.
+                # produced something before the cut-off (measured 2026-11-03 -
+                # the deadline only sets the cancel event), and the card must
+                # not claim "failed" for work that happened, nor claim an
+                # answer for a run that produced none.
                 if timed_out.is_set():
-                    view.close("budget expired" if produced_text
-                               else "budget expired, no output")
+                    if produced_text and produced_text.strip() != CANCELLED_PLACEHOLDER:
+                        view.close("budget expired, partial output")
+                    else:
+                        view.close("budget expired, no output")
                 else:
                     view.close("done")
                 lock.release()
@@ -637,22 +640,30 @@ class AgentDelegateTool(BaseTool):
 
         if timed_out.is_set():
             # The deadline only SETS the cancel event - it does not kill the
-            # teammate's run. Measured 2026-11-03 (see
+            # teammate's run outright. What it does is ask the executor to
+            # abort, and the executor answers with whatever the turn had
+            # produced so far (measured 2026-11-03 - see
             # agents/agent-mvnewfyb/deliverables/evidence/2026-11-03-delegate-fix/
-            # mechanism_probe.txt): the teammate kept working and finished its
-            # answer AFTER the budget ran out, and the bridge handed that
-            # answer back as a normal reply. Dropping it here - which is what
-            # this branch used to do - threw away work that actually
-            # happened, and left the caller unable to tell "the teammate
-            # produced nothing" from "the teammate finished but the budget
-            # expired first". Same defect 4e5266d2 fixed on the sub-agent
-            # side.
+            # mechanism_probe.txt).
+            #
+            # Three outcomes, and the caller must be able to tell them apart:
+            #   1. the turn was cut off with NOTHING produced - the executor
+            #      hands back the cancellation placeholder, which is not an
+            #      answer. This is a plain failure.
+            #   2. the turn was cut off but had produced something - that
+            #      content is real but INCOMPLETE. It must not be dropped:
+            #      the teammate's files and memory are already on disk, and
+            #      throwing the text away left the caller unable to tell
+            #      "the teammate did nothing" from "the teammate did most of
+            #      it". This is the same defect 4e5266d2 fixed on the
+            #      sub-agent side.
+            #   3. the turn finished inside its budget - untouched ("done").
             produced = produced_text
+            has_real_output = bool(produced) and produced.strip() != CANCELLED_PLACEHOLDER
             message = f"Delegation to '{target.id}' exceeded its {policy.timeout_seconds:g}s time budget"
-            if produced:
-                # The answer exists: hand it back, marked as over-budget so
-                # the caller can still tell it apart from a run that
-                # completed inside its budget.
+            if has_real_output:
+                # Partial but real: hand it back, marked so the caller knows
+                # it was cut off and must not be read as a complete answer.
                 return ToolResult.success(
                     {
                         "run_id": run_id,
@@ -663,15 +674,17 @@ class AgentDelegateTool(BaseTool):
                         "session_id": session_id,
                         "status": "budget_expired",
                         "budget_expired": True,
+                        "partial": True,
                         "content": produced,
                     },
                     display=format_delegate_result(
                         source.name, target.name, produced,
-                        status="budget expired", duration_seconds=duration,
+                        status="budget expired, partial output", duration_seconds=duration,
                     ),
                 )
-            # Nothing came back: say so explicitly instead of implying a
-            # failure that hides whether work happened.
+            # Nothing came back (or only the cancellation placeholder): say so
+            # explicitly instead of implying a failure that hides whether work
+            # happened.
             return ToolResult.fail(
                 message,
                 display=format_delegate_result(
