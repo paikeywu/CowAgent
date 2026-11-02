@@ -606,12 +606,14 @@ class AgentDelegateTool(BaseTool):
                 display=display,
             )
         started_at = time.monotonic()
+        produced_text = ""
         with _local_run_deadline(self.agent_bridge, target.id, request_id,
                                  session_id, policy.timeout_seconds) as timed_out:
             try:
                 reply = self.agent_bridge.agent_reply(
                     prompt, context=delegated_context, on_event=view.relay
                 )
+                produced_text = delegated_result_text(reply)
             except Exception as exc:
                 display = format_delegate_result(
                     source.name, target.name, str(exc), status="failed"
@@ -620,16 +622,63 @@ class AgentDelegateTool(BaseTool):
                     f"Delegation to '{target.id}' failed: {exc}", display=display
                 )
             finally:
-                # Whatever happened, the teammate is done speaking.
-                view.close("failed" if timed_out.is_set() else "done")
+                # Whatever happened, the teammate is done speaking. Over budget
+                # is not the same as failed: the teammate may well have
+                # produced an answer (measured 2026-11-03 - the deadline only
+                # sets the cancel event, it does not kill the run), and the
+                # card must not claim "failed" for work that happened.
+                if timed_out.is_set():
+                    view.close("budget expired" if produced_text
+                               else "budget expired, no output")
+                else:
+                    view.close("done")
                 lock.release()
         duration = time.monotonic() - started_at
 
         if timed_out.is_set():
+            # The deadline only SETS the cancel event - it does not kill the
+            # teammate's run. Measured 2026-11-03 (see
+            # agents/agent-mvnewfyb/deliverables/evidence/2026-11-03-delegate-fix/
+            # mechanism_probe.txt): the teammate kept working and finished its
+            # answer AFTER the budget ran out, and the bridge handed that
+            # answer back as a normal reply. Dropping it here - which is what
+            # this branch used to do - threw away work that actually
+            # happened, and left the caller unable to tell "the teammate
+            # produced nothing" from "the teammate finished but the budget
+            # expired first". Same defect 4e5266d2 fixed on the sub-agent
+            # side.
+            produced = produced_text
             message = f"Delegation to '{target.id}' exceeded its {policy.timeout_seconds:g}s time budget"
-            return ToolResult.fail(message, display=format_delegate_result(
-                source.name, target.name, message, status="failed", duration_seconds=duration,
-            ))
+            if produced:
+                # The answer exists: hand it back, marked as over-budget so
+                # the caller can still tell it apart from a run that
+                # completed inside its budget.
+                return ToolResult.success(
+                    {
+                        "run_id": run_id,
+                        "agent_id": target.id,
+                        "agent_name": target.name,
+                        "delegated_by": source.id,
+                        "depth": depth,
+                        "session_id": session_id,
+                        "status": "budget_expired",
+                        "budget_expired": True,
+                        "content": produced,
+                    },
+                    display=format_delegate_result(
+                        source.name, target.name, produced,
+                        status="budget expired", duration_seconds=duration,
+                    ),
+                )
+            # Nothing came back: say so explicitly instead of implying a
+            # failure that hides whether work happened.
+            return ToolResult.fail(
+                message,
+                display=format_delegate_result(
+                    source.name, target.name, message,
+                    status="budget expired, no output", duration_seconds=duration,
+                ),
+            )
         if reply is not None and reply.type == ReplyType.ERROR:
             display = format_delegate_result(
                 source.name, target.name, str(reply.content), status="failed",
