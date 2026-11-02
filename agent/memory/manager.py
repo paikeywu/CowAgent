@@ -813,7 +813,7 @@ class MemoryManager:
         # per-deployment override (a deployment may raise or lower it);
         # the class attribute is the product's answer to "what is the
         # default".
-        min_score = self.MIN_SCORE if min_score is None else min_score
+        min_score = self._default_min_score() if min_score is None else min_score
 
         # An explicit user_id wins; otherwise follow the ambient runtime
         # identity, so CLI / scheduler / sub-agent paths that never thread a
@@ -2576,6 +2576,42 @@ class MemoryManager:
         if scope != SCOPE_SEALED and (current_user or "") != (user_id or ""):
             return True
         return False
+
+    def _default_min_score(self) -> float:
+        """The relevance floor to use when the caller gave none.
+
+        P1-阶段三 (2026-11-02, G-2/Q2): the product's answer to "what is
+        the default floor" is the CLASS attribute ``MIN_SCORE`` (0.85),
+        and the criterion reads that.
+
+        A DEPLOYMENT may still override it through
+        ``MemoryConfig.min_score`` — that is the config's documented
+        purpose ("the per-deployment override"), and a caller that
+        configured a different floor must get the floor it configured.
+        So the config WINS when it differs from the class default, and
+        the class default is what a config that never touched the value
+        gets.
+
+        The two are the SAME number in the shipped configuration (the
+        config's default IS 0.85), so this resolution cannot change the
+        product's behaviour — it only restores the override that a
+        deployment (or a test that builds its own config) has always
+        been able to make.
+        """
+        try:
+            configured = getattr(self.config, "min_score", None)
+        except Exception:
+            configured = None
+        if configured is None:
+            return self.MIN_SCORE
+        try:
+            configured = float(configured)
+        except (TypeError, ValueError):
+            return self.MIN_SCORE
+        if configured == self.MIN_SCORE:
+            return self.MIN_SCORE
+        # The deployment asked for something else: honour it.
+        return configured
 
     def _gate_by_absolute_quality(
         self,
