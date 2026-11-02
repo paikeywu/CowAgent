@@ -332,7 +332,10 @@ available_setting = {
         "enabled": True,
         "max_depth": 1,          # 1 = only the main Agent may spawn (range 1-5)
         "max_concurrent": 3,     # parallel sub agents per spawn call (range 1-10)
-        "timeout_seconds": 300,  # budget for one spawn call (range 10-3600)
+        # Budget for ONE task, not for the spawn as a whole: each task gets
+        # its own clock, so a slow task no longer decides its siblings'
+        # fate (range 1-3600).
+        "timeout_seconds": 300,
     },
     # Delegation between configured agents. Unlike a sub agent, the target is a
     # standing peer that answers in its own workspace. The call is synchronous:

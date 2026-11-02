@@ -65,7 +65,11 @@ class SubagentSettings:
             enabled=bool(raw.get("enabled", True)),
             max_depth=_bounded("max_depth", 1, 1, 5, int),
             max_concurrent=_bounded("max_concurrent", 3, 1, 10, int),
-            timeout_seconds=_bounded("timeout_seconds", 300.0, 10.0, 3600.0, float),
+            # The floor is 1s, not 10s: a caller that wants to try a task
+            # against a short budget (a probe, a smoke test) must be able to
+            # say so. Raising the floor only ever rejected the user's
+            # explicit instruction and silently used the default instead.
+            timeout_seconds=_bounded("timeout_seconds", 300.0, 1.0, 3600.0, float),
         )
 
 
@@ -212,6 +216,45 @@ _WRAP_UP_INSTRUCTION = (
 )
 
 
+class _TaskBudget:
+    """One task's own clock.
+
+    A spawn used to measure every task against a single deadline, taken when
+    the spawn was called. One task running long then decided the fate of all
+    the others: a sibling still queued behind it was cancelled before it had
+    started, and a sibling that had already finished had its result
+    overwritten by the timeout marker. Each task now carries its own budget,
+    and the clock starts when that task starts running -- a task that has not
+    begun has not spent anything yet.
+    """
+
+    def __init__(self, timeout_seconds: float):
+        self.timeout_seconds = float(timeout_seconds)
+        self.started_at: Optional[float] = None
+        self.deadline: Optional[float] = None
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        with self._lock:
+            self.started_at = time.time()
+            self.deadline = self.started_at + self.timeout_seconds
+
+    def remaining(self) -> Optional[float]:
+        """Seconds left on this task's budget, or None while it has not started."""
+        with self._lock:
+            if self.deadline is None:
+                return None
+            return self.deadline - time.time()
+
+    def wrap_up_at(self) -> Optional[float]:
+        """When to ask this task to wrap up, or None while it has not started."""
+        with self._lock:
+            if self.deadline is None:
+                return None
+            return self.deadline - min(_WRAP_UP_MAX_SECONDS,
+                                       self.timeout_seconds * _WRAP_UP_FRACTION)
+
+
 def _unfinished(index: int, template, status: str, error: str, on_state=None) -> Dict[str, Any]:
     """Result for a task that was stopped or timed out instead of finishing."""
     result = {"task_index": index, "subagent_type": template.name,
@@ -221,9 +264,14 @@ def _unfinished(index: int, template, status: str, error: str, on_state=None) ->
 
 
 def _run_one(parent, template, task: SubagentTask, index: int, cancel_event,
-             on_state=None, on_event=None, steer_inbox=None) -> Dict[str, Any]:
+             on_state=None, on_event=None, steer_inbox=None,
+             budget: Optional["_TaskBudget"] = None) -> Dict[str, Any]:
     if cancel_event.is_set():
         return _unfinished(index, template, "cancelled", _PARENT_CANCELLED, on_state)
+    # The clock starts here, not when the spawn was called: a task queued
+    # behind a slower sibling has not spent any of its budget yet.
+    if budget is not None:
+        budget.start()
     started = time.time()
     run_id = uuid.uuid4().hex[:12]
     # Before identity_scope below, so the parent's run id is still ambient.
@@ -311,6 +359,11 @@ def run_tasks(
         thread_name_prefix="subagent",
     )
     try:
+        # Each task gets its own budget. A shared deadline made one slow task
+        # decide the fate of its siblings: a task still queued behind it was
+        # cancelled before it started, and a task that had already finished
+        # had its result overwritten by the timeout marker.
+        budgets = [_TaskBudget(settings.timeout_seconds) for _ in tasks]
         futures = []
         for index, (task, template) in enumerate(zip(tasks, resolved)):
             # copy_context carries both the runtime identity and the depth
@@ -321,37 +374,63 @@ def run_tasks(
                 pool.submit(
                     ctx.run, _run_one, parent, template, task, index,
                     cancel_events[index], on_state, on_event, steer_inboxes[index],
+                    budgets[index],
                 )
             )
 
-        deadline = time.time() + settings.timeout_seconds
-        wrap_up_at = deadline - min(_WRAP_UP_MAX_SECONDS,
-                                    settings.timeout_seconds * _WRAP_UP_FRACTION)
-        wrapped_up = False
+        wrapped_up = set()
         results: List[Optional[Dict[str, Any]]] = [None] * len(tasks)
         pending = dict(enumerate(futures))
         while True:
+            # Collect first: a task that has finished holds a real result, and
+            # the timeout marker must never be written over it.
             for index in [i for i, f in pending.items() if f.done()]:
                 results[index] = pending.pop(index).result()
             if not pending:
                 break
             stopped = cancel_event is not None and cancel_event.is_set()
-            if not wrapped_up and not stopped and time.time() >= wrap_up_at:
-                wrapped_up = True
-                for index in pending:
+            now = time.time()
+
+            # A task is judged on its own budget alone. One task's overrun
+            # says nothing about another's.
+            remaining_by_index = {i: budgets[i].remaining() for i in pending}
+            expired = [i for i, left in remaining_by_index.items()
+                       if left is not None and left <= 0]
+
+            # Ask a task that is close to its own deadline to wrap up, so it
+            # can report what it has instead of being cut off with nothing.
+            for index in list(pending):
+                if index in wrapped_up or index in expired or stopped:
+                    continue
+                wrap_at = budgets[index].wrap_up_at()
+                if wrap_at is not None and now >= wrap_at:
+                    wrapped_up.add(index)
                     steer_inboxes[index].submit(_WRAP_UP_INSTRUCTION)
-                logger.info(f"[SubAgent] Asked {len(pending)} task(s) to wrap up before the time budget runs out")
-            remaining = deadline - time.time()
-            if stopped or remaining <= 0:
+                    logger.info(
+                        f"[SubAgent] Asked task {index} to wrap up before its "
+                        f"own time budget runs out"
+                    )
+
+            if stopped or expired:
                 timeout_error = (
                     f"Exceeded the {settings.timeout_seconds:g}s sub agent budget. "
                     f"Split the task or raise subagent.timeout_seconds."
                 )
-                for index, future in pending.items():
-                    # Tell the run to stop and close it out here: the worker winds
-                    # down at its next checkpoint, which may be a whole LLM
-                    # response away, and will not report this itself.
-                    future.cancel()
+                for index in list(pending):
+                    if not (stopped or index in expired):
+                        continue
+                    # A task that finished between the last sweep and this
+                    # moment has a real result. Writing a timeout marker over
+                    # it would throw away work that was actually done, which
+                    # is the defect this whole change is about.
+                    if pending[index].done():
+                        results[index] = pending.pop(index).result()
+                        continue
+                    # Tell the run to stop and close it out here: the
+                    # worker winds down at its next checkpoint, which may
+                    # be a whole LLM response away, and will not report
+                    # this itself.
+                    pending[index].cancel()
                     cancel_events[index].set()
                     results[index] = _unfinished(
                         index, resolved[index],
@@ -359,9 +438,15 @@ def run_tasks(
                         _PARENT_CANCELLED if stopped else timeout_error,
                         on_state,
                     )
-                break
-            # Bounded so a user Stop reaches the children while they still run.
-            wait(list(pending.values()), timeout=min(remaining, _POLL_SECONDS),
+                    pending.pop(index)
+                if not pending:
+                    break
+                continue
+
+            # Bounded so a user Stop reaches the children while they still
+            # run. The wait is short: budgets are per task, and each one is
+            # checked on every turn around this loop.
+            wait(list(pending.values()), timeout=_POLL_SECONDS,
                  return_when=FIRST_COMPLETED)
     finally:
         # Deliberately not waiting: a `with` block would join the very threads
