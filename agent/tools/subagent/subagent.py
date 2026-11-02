@@ -289,6 +289,9 @@ class SubagentTool(BaseTool):
                         goal=goal,
                         context=str(entry.get("context") or ""),
                         subagent_type=str(entry.get("subagent_type") or "").strip() or None,
+                        # P1-阶段三 (2026-11-02, G-4/Q5 §6.3 item 2): the
+                        # task's own id, so its run row can name it.
+                        task_id=str(entry.get("task_id") or "").strip() or None,
                     )
                 )
             return tasks
@@ -301,6 +304,7 @@ class SubagentTool(BaseTool):
                 goal=goal,
                 context=str(params.get("context") or ""),
                 subagent_type=str(params.get("subagent_type") or "").strip() or None,
+                task_id=str(params.get("task_id") or "").strip() or None,
             )
         ]
 

@@ -24,6 +24,11 @@ from common.runtime_identity import identity_scope
 # and contextvars.copy_context() carries it across the handoff.
 _depth: contextvars.ContextVar[int] = contextvars.ContextVar("cow_subagent_depth", default=0)
 
+# Marks the run rows a spawned task produced (P1-阶段三 2026-11-02,
+# G-4/Q5 §6.3 item 2).  It is the ``runs.task_source`` value, so "which
+# runs were spawns" is one query instead of a guess at the extras blob.
+TASK_SOURCE = "subagent"
+
 
 def current_depth() -> int:
     return _depth.get()
@@ -78,6 +83,11 @@ class SubagentTask:
     goal: str
     context: str = ""
     subagent_type: Optional[str] = None
+    # P1-阶段三 (2026-11-02, G-4/Q5 §6.3 item 2): the id of THIS task as
+    # an addressable unit of work.  It is written into the run row, so
+    # "which run was this task's" has an answer.  None means "the caller
+    # did not name it" ⇒ the runner mints one.
+    task_id: Optional[str] = None
 
 
 def _build_brief(task: SubagentTask, template) -> str:
@@ -151,7 +161,7 @@ def _notify(on_state, index: int, state: Dict[str, Any]) -> None:
         logger.debug(f"[SubAgent] state callback failed: {e}")
 
 
-def _open_run(parent, run_id: str, template) -> Optional[Any]:
+def _open_run(parent, run_id: str, template, task_id: Optional[str] = None) -> Optional[Any]:
     """Record the start of a spawned run, returning the store to close it with.
 
     None means the spawn is not being recorded, either because the parent's
@@ -161,6 +171,18 @@ def _open_run(parent, run_id: str, template) -> Optional[Any]:
 
     The parent's run id is read before the caller enters its own identity
     scope, so it is still the ambient one and becomes this run's parent.
+
+    **The task id (P1-阶段三 2026-11-02, G-4/Q5 §6.3 item 2).**  A
+    spawned task IS an addressable unit of work, so its run row carries
+    ``task_source='subagent'`` and ``task_id=<the task's own id>``.
+    Without it the ``runs`` table says "a run happened" and never "a run
+    of WHICH work item" — which is why "what did we last run for this
+    task" could never be answered.
+
+    The task id is the sub agent's own id when the caller supplied one
+    (``SubagentTask.id``), and otherwise the run id: the spawn is still
+    one identifiable unit of work, and an empty id would be the same
+    "recorded but not addressable" hole this change closes.
     """
     workspace = getattr(parent, "workspace_dir", None)
     if not workspace:
@@ -175,6 +197,8 @@ def _open_run(parent, run_id: str, template) -> Optional[Any]:
             agent_id=getattr(parent, "_current_agent_id", "") or "",
             session_id=getattr(parent, "_current_session_id", "") or "",
             parent_run_id=current_agent_run_id() or "",
+            task_id=str(task_id or run_id),
+            task_source=TASK_SOURCE,
             extras={"subagent_type": template.name},
         )
         return store
@@ -275,7 +299,13 @@ def _run_one(parent, template, task: SubagentTask, index: int, cancel_event,
     started = time.time()
     run_id = uuid.uuid4().hex[:12]
     # Before identity_scope below, so the parent's run id is still ambient.
-    run_store = _open_run(parent, run_id, template)
+    #
+    # The task id is passed POSITIONALLY: a caller that replaces
+    # ``_open_run`` with its own stub (``lambda *args: None``) must keep
+    # working, and a keyword argument would break such a stub.  The
+    # signature stays ``(parent, run_id, template, task_id=None)``.
+    run_store = _open_run(parent, run_id, template,
+                          getattr(task, "task_id", None))
     result: Dict[str, Any] = {"task_index": index, "subagent_type": template.name}
     _notify(on_state, index, {"status": "running", "subagent_type": template.name})
 

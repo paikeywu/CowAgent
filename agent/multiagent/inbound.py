@@ -172,6 +172,12 @@ def serve_invoke(payload: dict, agent_bridge, send_chunk: Callable[[dict], None]
     context["run_id"] = run_id
     context["parent_run_id"] = current_agent_run_id() or ""
     context["task_source"] = TASK_SOURCE
+    # P1-阶段三 (2026-11-02, G-4/Q5 §6.3 item 1): the same task id the
+    # local hand-off carries.  A hand-off that arrives from another
+    # process opens its run row through the same bridge, so without this
+    # line the REMOTE half of a delegation would be recorded as a
+    # delegation with no task id — the same hole the local path had.
+    context["task_id"] = context["request_id"]
     # The caller's mode travels with the hand-off, but a remote caller can only
     # narrow this instance's mode, never widen it.
     inherited_mode = str(payload.get("permission_mode") or "").strip()

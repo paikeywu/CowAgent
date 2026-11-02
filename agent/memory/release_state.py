@@ -114,6 +114,49 @@ class ReleaseState:
         return (1 if self.element_released(path) else 0,
                 1 if self.file_sealed(path) else 0)
 
+    def with_extra_sealed(
+            self,
+            entries: Iterable[Tuple[str, Optional[str]]],
+    ) -> "ReleaseState":
+        """A copy of this state with MORE sealed paths.
+
+        P1-阶段三 (2026-11-02, G-3/Q3): the state is resolved from the
+        truth layer's own front-matter, but a path can be sealed by a
+        decision that is NOT in a front-matter — a teammate's identity
+        file is sealed under that agent's owner token by the SCAN's
+        decision.
+
+        The ``file_sealed`` flag matters beyond the row: the index
+        guard's UPDATE trigger fires on a row that is NOT marked sealed
+        and corrects ``sealed_owner`` to NULL.  So a scan-sealed path
+        that is not in the state would have its owner erased on the next
+        sync, and the row would be sealed and visible to NOBODY — indexed
+        and unreachable, which is the false green the ruling named.
+
+        The copy is IMMUTABLE: the cached state is not modified, so two
+        scans in a row cannot see each other's additions.
+        """
+        extra_paths = set()
+        extra_owners: Dict[str, str] = {}
+        for path, owner in entries:
+            if not path:
+                continue
+            extra_paths.add(path)
+            if owner:
+                extra_owners[path] = owner
+        if not extra_paths:
+            return self
+        sealed_paths = frozenset(self.sealed_paths | extra_paths)
+        sealed_owner = dict(self.sealed_owner or {})
+        sealed_owner.update(extra_owners)
+        return ReleaseState(
+            released_paths=self.released_paths,
+            sealed_paths=sealed_paths,
+            sealed_owner=sealed_owner,
+            released_fact_ids=self.released_fact_ids,
+            signature=self.signature,
+        )
+
     def decide(self, path: str, tokens) -> Tuple[str, str, FrozenSet[str]]:
         """``(decision, reason, released_fact_ids)`` for a read exit.
 

@@ -572,6 +572,21 @@ class AgentDelegateTool(BaseTool):
         delegated_context["run_id"] = run_id
         delegated_context["parent_run_id"] = parent_run_id
         delegated_context["task_source"] = TASK_SOURCE
+        # P1-阶段三 (2026-11-02, G-4/Q5 §6.3 item 1): the delegation IS an
+        # addressable unit of work, so the run row it produces must name
+        # WHICH work item it was.
+        #
+        # The run row is opened by the bridge (``_begin_run``), which reads
+        # ``task_id`` and ``task_source`` off the context.  ``task_source``
+        # was already carried; ``task_id`` was not, so every delegated run
+        # was recorded as "a delegation" and never as "a delegation OF
+        # WHAT" — measured 2026-11-02 on the live ROOT library: 191 rows
+        # with ``task_source='delegation'`` and **0** with a task id.
+        #
+        # The id is the request id: it is minted per delegation, it is
+        # already the handle the run's own result carries back, and it is
+        # stable across the hand-off.
+        delegated_context["task_id"] = request_id
         inherited_mode = self._inherited_permission_mode(source.id)
         if inherited_mode:
             delegated_context["delegated_permission_mode"] = inherited_mode

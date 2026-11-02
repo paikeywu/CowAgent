@@ -53,6 +53,38 @@ def chunk_for_file(text: str, path: str) -> List[TextChunk]:
     rebuilder (``rebuilder.rebuild_file``) call THIS function. A second
     copy of the decision is how the two drifted apart in the first
     place.
+
+    **THE LINE-NUMBERING CONTRACT (P1-阶段三 2026-11-02, G-4/Q4 §5.3
+    item 4).**  ``start_line`` / ``end_line`` are 1-based, INCLUSIVE,
+    and counted over ``text.split("\\n")`` — the EXACT splitter
+    :meth:`TextChunker.chunk_text` uses, NOT ``str.splitlines()``.
+    The two disagree on every file that ends with a newline:
+
+      * ``"a\\nb\\n".split("\\n")`` -> ``['a', 'b', '']`` -> **3** lines;
+      * ``"a\\nb\\n".splitlines()``  -> ``['a', 'b']``    -> **2** lines.
+
+    So a file whose text ends with a newline has one MORE line under
+    this contract than under ``splitlines()``, and every line number
+    computed the other way is off by one.
+
+    **Does the trailing newline count as a line?**  YES — the empty
+    string after the final ``"\\n"`` IS a line, and it is line ``N`` of
+    an N-newline-terminated file.  A file "a\\nb\\n" has three lines:
+    line 1 is "a", line 2 is "b", line 3 is the empty string after the
+    last newline.
+
+    **Why this has to be written down.**  The same fact measured two
+    ways is two numbers: on the live ROOT library, ALL 172 indexed files
+    ended with a newline, so a drift probe that recomputed the line
+    count with ``splitlines()`` reported "172 files with a line number
+    out of range" — while the product's own pointer-rebuild criterion
+    reported 0 drift out of 490 rows.  The 172 was an artefact of the
+    probe's口径, not a defect: with this contract (split on "\\n") every
+    one of the 172 came back into range.
+
+    **Anything that recomputes a line range MUST use this contract.**
+    Line numbers are allowed as a FALLBACK for a pointer that cannot be
+    rebuilt, and never as a drift measure on their own.
     """
     chunker = TextChunker()
     name = (path or "").replace("\\", "/").rsplit("/", 1)[-1].lower()

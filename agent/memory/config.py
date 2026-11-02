@@ -40,7 +40,24 @@ class MemoryConfig:
     
     # Search config
     max_results: int = 10
-    min_score: float = 0.1
+    # P1-阶段三 (2026-11-02, G-2/Q2): the DEFAULT relevance floor.
+    #
+    # It was 0.1, and at 0.1 the floor was indistinguishable from "no
+    # floor": the top hit of every channel is rank-normalized to 1.0 BY
+    # CONSTRUCTION, so a completely irrelevant query still came back with
+    # hits scoring 1.0 — measured 2026-11-02 on the live ROOT library,
+    # "意图不存在的一串怪词" returned 10 hits with scores 1.0 … 0.1.
+    #
+    # 0.85 keeps the top 15% of a channel's hits (the rank-normalized
+    # score (n-i)/n is >= 0.85 for the first 15%) and drops the rest.
+    # It is the value the architecture ruling (2026-11-02 G1-G4 裁决 §3.1)
+    # fixed, and it MUST stay equal to ``MemoryManager.MIN_SCORE`` — the
+    # two are the same constant, exposed in two places, so a criterion
+    # can read either.
+    #
+    # ``min_score=0`` is still a legal explicit value ("no threshold") and
+    # is NOT replaced by this default.
+    min_score: float = 0.85
     
     # Hybrid search weights
     vector_weight: float = 0.7

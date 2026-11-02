@@ -17,7 +17,12 @@ from agent.memory.storage import MemoryStorage, MemoryChunk, SearchResult
 from agent.memory.chunker import TextChunker, chunk_for_file
 from agent.memory.file_hash import canonical_file_hash, file_hash_matches
 from agent.memory.embedding import EmbeddingProvider, EmbeddingCache
-from agent.memory.layers import excluded_segments
+from agent.memory.layers import (
+    AGENT_DELIVERABLES_DIRNAME,
+    AGENT_IDENTITY_FILENAME,
+    agent_index_allowed,
+    excluded_segments,
+)
 from agent.memory.release_state import ReleaseStateCache
 from agent.memory.reranker import Reranker
 from agent.memory.summarizer import MemoryFlushManager, create_memory_files_if_needed
@@ -27,6 +32,7 @@ from agent.memory.visibility import (
     VIS_OPEN,
     VIS_RELEASED,
     VIS_SEALED,
+    agent_owner_token,
     ambient_end_user_ids,
     ambient_owner_tokens,
     classify_frontmatter,
@@ -95,6 +101,48 @@ def _index_rel_path(file_path: Path, roots: Sequence[Tuple[Path, str]]) -> Optio
 # workspace's own documents, not a user's private memory.
 _ROOT_IDENTITY_FILES = ("MEMORY.md", "USER.md", "AGENT.md", "RULE.md")
 
+# P1-阶段三 (2026-11-02, G-3/Q3): the TEAM's documents under ``agents/``.
+#
+# Measured before this change (live ROOT library, 2026-11-02): 484 markdown
+# files under ``agents/`` and **0** of them indexed.  The team had 242
+# delivered decisions (``deliverables/``) that no retrieval could reach —
+# "我们之前拍过什么" had no answer, because the answer was on disk and not
+# in the index.
+#
+# Two file classes, two strategies (the architecture ruling §4.1):
+#
+#   agents/<id>/AGENT.md            identity   -> source='agent',
+#                                               scope='sealed',
+#                                               sealed_owner='agent--<id>'
+#   agents/<id>/deliverables/**/*.md knowledge  -> source='agent',
+#                                               scope='shared', user_id=NULL
+#
+# **Why an identity file is SEALED and not shared.**  An identity file
+# says "who this agent is and what it is responsible for".  It is a
+# DEFINITION, not a memory, and it changes often (every persona rewrite
+# re-cuts it) — indexing it in the public layer would put 15 churning
+# documents into everybody's result set.  ``sealed`` + the agent's own
+# owner token makes it visible inside the team and invisible outside.
+#
+# **Why NOT ``scope='user'`` + ``user_id='agent--<id>'``.**  Measured: the
+# live library's ``chunks.scope`` distribution is shared 486 / sealed 4, and
+# ``chunks.user_id`` is NULL on every row.  ``identity_tokens()`` is the
+# END USER axis ONLY (``visibility.py``): an agent's owner token is not in
+# that set, so a row indexed under ``scope='user'`` with an agent's id
+# would match NO caller — indexed but unreachable, which is a FALSE GREEN
+# (the file is in the index and no one can find it).  The sealed branch
+# reads ``sealed_owner``, which is the axis that actually carries the
+# agent namespace.
+#
+# ``agents/<id>/memory/**`` is NOT indexed: each role's own memory belongs
+# to that role's own library, and indexing it here would create a second
+# authority for the same content.
+# The ``source`` value the team's documents carry in the index.  It is a
+# NEW value on an EXISTING column: the column already said "which layer
+# does this file come from" ("knowledge" / "memory"), and "agent" says
+# the third thing — "it is a teammate's document".
+_AGENT_SOURCE = "agent"
+
 
 class MemoryManager:
     """
@@ -102,6 +150,48 @@ class MemoryManager:
     
     Provides long-term memory for agents with vector and keyword search
     """
+
+    # P1-阶段三 (2026-11-02, G-2/Q2): the DEFAULT relevance floor, exposed
+    # as a CLASS attribute.
+    #
+    # It lives here so a criterion can read the product's own constant
+    # instead of guessing where the product keeps it: the previous
+    # default (0.1) only existed on ``MemoryConfig``, and a criterion
+    # that probed ``MemoryManager`` for it found nothing and had to
+    # report NOTRUN — "the product does not expose a default floor" —
+    # which was wrong (the product had one).
+    #
+    # ``MemoryConfig.min_score`` and this attribute are THE SAME constant
+    # and MUST stay equal: the config carries the per-deployment
+    # override, this carries the product's own answer to "what is the
+    # default".  ``search()`` reads THIS one when the caller passes no
+    # explicit floor.
+    MIN_SCORE = 0.85
+
+    # P1-阶段三 (2026-11-02, G-2/Q2 §3.2): the ABSOLUTE quality gate.
+    #
+    # The rank-normalized score cannot carry this gate: normalization
+    # makes the top hit of a channel score 1.0 by construction, so a
+    # threshold on that scale says "how many hits are near the top",
+    # not "how relevant is this hit".  The gate therefore runs on the
+    # ABSOLUTE quality, BEFORE the normalization.
+    #
+    # 0.5 is the value the architecture ruling fixed, and the measured
+    # calibration (2026-11-02, live ROOT library) confirms it does not
+    # cut true hits: the true-word quality distribution's 5th percentile
+    # is 0.4333 (the discounted value of a verbatim mention) and its
+    # median is 0.8667, so a 0.5 floor on the absolute scale keeps every
+    # genuine hit.  Evidence:
+    # deliverables/evidence/2026-11-02-G1-G4/probe-impl-calib-BEFORE.txt
+    MIN_ABSOLUTE_QUALITY = 0.5
+
+    # P1-阶段三 (2026-11-02, G-3/Q3): the paths the SCAN sealed itself
+    # (a teammate's identity file), as (path, class, owner_token).
+    #
+    # The class-level default is empty, and a scan fills it.  It is read
+    # by the release projection, which runs on the RETRIEVAL path (outside
+    # a sync), so it must survive past the sync that filled it.
+    _scan_sealed = ()
 
     # P1 阶段二-B T2-B1: the read-path freshness probe's CLASS-level default.
     # ``search()`` and ``get_status()`` read ``self._freshness``; an instance
@@ -474,7 +564,9 @@ class MemoryManager:
             pass
         return {"dropped": dropped, "paths": paths, "events": events}
 
-    def _record_guard_paths(self, release_state) -> int:
+    def _record_guard_paths(self, release_state,
+                             extra: Optional[Sequence[Tuple[str, str,
+                                                                Optional[str]]]] = None) -> int:
         """Tell the write-side guard what the truth layer says (P0-21).
 
         The guard is a database trigger: it keeps a row that must not be
@@ -491,6 +583,14 @@ class MemoryManager:
         owner is unknown is invisible to everybody, and the next sync
         fills the owner in.
 
+        ``extra`` carries the paths the SCAN sealed itself — P1-阶段三
+        (2026-11-02, G-3/Q3): a teammate's identity file is sealed under
+        that agent's owner token, and the guard's trigger can only derive
+        an owner from a front-matter, which an identity file does not
+        have.  Without this the trigger would correct the row to
+        ``sealed_owner = NULL`` — sealed and visible to NOBODY, i.e.
+        indexed and unreachable (the false green the ruling named).
+
         Returns the number of paths recorded.
         """
         from agent.memory.index_guard import (
@@ -505,6 +605,7 @@ class MemoryManager:
             entries.append((path, CLASS_SEALED, owners.get(path)))
         for path in release_state.released_paths:
             entries.append((path, CLASS_RELEASED, None))
+        entries.extend(extra or ())
         if not entries:
             return 0
         try:
@@ -558,8 +659,28 @@ class MemoryManager:
         # The state is known again — the retrieval is no longer degraded,
         # so the marker goes away even when nothing had to be re-stamped.
         self._clear_projection_failure()
-        if state.signature == self._release_signature:
+        # P1-阶段三 (2026-11-02, G-3/Q3): the scan-sealed paths are part
+        # of what the projection must honour, so they are part of the
+        # "has anything moved?" question.  Without them in the
+        # comparison, a manager whose truth-layer signature has not
+        # changed would skip the refresh and leave the rows as they
+        # were — which is how a freshly indexed identity file keeps an
+        # owner for one sync and loses it on the next.
+        extra = self._scan_sealed_paths()
+        extra_key = tuple(sorted((p, o or "") for (p, _k, o) in extra))
+        if (state.signature == self._release_signature
+                and extra_key == getattr(self, "_scan_sealed_key", ())):
             return
+        # The state is resolved from the truth layer's front-matter, and
+        # an identity file has none — so without this the projection
+        # would re-flag the row as NOT sealed and re-own it as nobody,
+        # undoing the owner the scan supplied.  The row would then be
+        # sealed and visible to NOBODY: indexed and unreachable, which is
+        # the false green the ruling named.
+        if extra:
+            state = state.with_extra_sealed(
+                [(p, o) for (p, _klass, o) in extra])
+        self._scan_sealed_key = extra_key
         try:
             changed = self.storage.apply_release_projection(
                 set(state.released_paths), set(state.sealed_paths),
@@ -683,7 +804,16 @@ class MemoryManager:
         """
         max_results = max_results or self.config.max_results
         # min_score=0 means "no threshold", so only None takes the default.
-        min_score = self.config.min_score if min_score is None else min_score
+        #
+        # P1-阶段三 (2026-11-02, G-2/Q2): the default comes from the
+        # CLASS attribute ``MIN_SCORE``, so the product's own constant is
+        # the single source of truth and a criterion reading either
+        # ``MemoryManager.MIN_SCORE`` or ``MemoryConfig().min_score``
+        # sees the same number.  The config keeps its value as the
+        # per-deployment override (a deployment may raise or lower it);
+        # the class attribute is the product's answer to "what is the
+        # default".
+        min_score = self.MIN_SCORE if min_score is None else min_score
 
         # An explicit user_id wins; otherwise follow the ambient runtime
         # identity, so CLI / scheduler / sub-agent paths that never thread a
@@ -1099,7 +1229,19 @@ class MemoryManager:
         except Exception:
             files_before = -1  # unknown -> do not stamp
 
-        files_to_scan: List[tuple] = []  # (file_path, source, scope, user_id)
+        files_to_scan: List[tuple] = []
+        # (file_path, source, scope, user_id, sealed_owner)
+        #
+        # ``sealed_owner`` is the AGENT owner token for a file the scan
+        # itself decided to seal (the team identity files, §G-3/Q3).  It is
+        # separate from the file's own front-matter owner: an identity file
+        # does not declare itself sealed, so the scan has to supply the
+        # owner, and the front-matter (when it declares one) still wins.
+        #
+        # ``scan_sealed`` collects those paths for the index guard, which
+        # is what keeps the row's scope and owner in step with the truth
+        # layer.
+        scan_sealed: List[Tuple[str, str, Optional[str]]] = []
 
         # The workspace root holds the identity documents (USER.md says who
         # the user is, AGENT.md who the Agent is, RULE.md how it behaves).
@@ -1109,7 +1251,7 @@ class MemoryManager:
         for name in _ROOT_IDENTITY_FILES:
             identity_file = Path(workspace_dir) / name
             if identity_file.exists():
-                files_to_scan.append((identity_file, "memory", "shared", None))
+                files_to_scan.append((identity_file, "memory", "shared", None, None))
 
         # T2f (2026-11-01): the PERSONA layer.
         #
@@ -1156,7 +1298,7 @@ class MemoryManager:
             for _pname in _persona_names:
                 _pfile = persona_dir / _pname
                 if _pfile.is_file():
-                    files_to_scan.append((_pfile, "memory", "shared", None))
+                    files_to_scan.append((_pfile, "memory", "shared", None, None))
 
         if memory_dir.exists():
             from agent.memory.identity_ns import parse_user_dir_name
@@ -1237,7 +1379,7 @@ class MemoryManager:
                         f"directory does not resolve ({e})"
                     )
                     continue
-                files_to_scan.append((file_path, "memory", scope, user_id))
+                files_to_scan.append((file_path, "memory", scope, user_id, None))
 
         from common import state_dir
         from config import conf
@@ -1253,7 +1395,60 @@ class MemoryManager:
                     # the whole file each time.
                     if file_path.parent == knowledge_dir and file_path.name in ("index.md", "log.md"):
                         continue
-                    files_to_scan.append((file_path, "knowledge", "shared", None))
+                    files_to_scan.append((file_path, "knowledge", "shared", None, None))
+
+        # P1-阶段三 (2026-11-02, G-3/Q3): the TEAM's own documents.
+        #
+        # Two classes, two scopes (see ``_AGENT_SOURCE`` above for why):
+        # the identity file is SEALED under its own agent's owner token,
+        # the deliverables are SHARED knowledge.
+        #
+        # The scan is deliberately narrow — ``agents/*/AGENT.md`` and
+        # ``agents/*/deliverables/**/*.md`` and nothing else.  In
+        # particular ``agents/*/memory/**`` is skipped: each role's memory
+        # belongs to that role's own library, and a second copy here would
+        # be a second authority for the same content.
+        agents_dir = Path(workspace_dir) / "agents"
+        if agents_dir.is_dir():
+            for agent_dir in sorted(p for p in agents_dir.iterdir() if p.is_dir()):
+                agent_id = agent_dir.name
+                identity_file = agent_dir / AGENT_IDENTITY_FILENAME
+                if identity_file.is_file():
+                    # The whitelist is checked for BOTH classes, so the
+                    # rule is one rule and not two.
+                    rel = (Path("agents") / agent_id
+                           / AGENT_IDENTITY_FILENAME).as_posix()
+                    if not agent_index_allowed(rel):
+                        continue
+                    files_to_scan.append(
+                        (identity_file, _AGENT_SOURCE, SCOPE_SEALED, None,
+                         agent_owner_token(agent_id)))
+                    # The guard table is how the INDEX learns that this
+                    # path is sealed and who owns it (the guard's trigger
+                    # can only derive an owner from a front-matter, and an
+                    # identity file has none).  The registration happens
+                    # with the rest of the guard's verdict, in the write
+                    # phase — recording it here would write to the index
+                    # during the SCAN, which is a read phase.
+                    scan_sealed.append(
+                        (rel, "sealed", agent_owner_token(agent_id)))
+                deliverables_dir = agent_dir / AGENT_DELIVERABLES_DIRNAME
+                if deliverables_dir.is_dir():
+                    for file_path in sorted(deliverables_dir.rglob("*.[mM][dD]")):
+                        # The whitelist is the ONE rule (``layers.py``), so
+                        # the scan and the inspector cannot disagree about
+                        # which of a teammate's files belong here.
+                        #
+                        # The path handed to the whitelist is relative to
+                        # the TEAM root (``agents/<id>/...``), which is the
+                        # shape the rule is written against and the shape
+                        # the index key takes.
+                        rel = Path("agents") / agent_dir.name / file_path.relative_to(
+                            agent_dir).as_posix()
+                        if not agent_index_allowed(rel.as_posix()):
+                            continue
+                        files_to_scan.append(
+                            (file_path, _AGENT_SOURCE, "shared", None, None))
 
         # Pass 1: inline chunking + change detection. Inlined (instead of
         # calling self._prepare_file_for_sync) so this method does not depend
@@ -1270,6 +1465,16 @@ class MemoryManager:
         index_roots: List[Tuple[Path, str]] = []
         if knowledge_dir is not None:
             index_roots.append((knowledge_dir, "knowledge"))
+        # P1-阶段三 (2026-11-02, G-3/Q3 §4.3 item 2): the ``agents/`` root
+        # is EXPLICIT.  Without it the team's documents are keyed off
+        # whichever root happens to contain them, which differs per
+        # scanning Agent (the ROOT Agent's workspace IS the team root; a
+        # role Agent's workspace is its own directory under ``agents/``) —
+        # and a file whose key depends on WHO indexed it is not an
+        # addressable file.  With the root explicit, the key is
+        # ``agents/<id>/...`` in every library that indexes it.
+        if agents_dir.is_dir():
+            index_roots.append((agents_dir, "agents"))
         index_roots.append((Path(workspace_dir_path), ""))
         try:
             index_roots.append((state_dir.shared_root(), ""))
@@ -1280,7 +1485,14 @@ class MemoryManager:
 
         scanned: Dict[str, set] = {}
 
-        for file_path, source, scope, user_id in files_to_scan:
+        # P1-阶段三 (2026-11-02, G-3/Q3): the paths the scan sealed itself
+        # are recorded on the INSTANCE, right after the scan, so they are
+        # known even when nothing is pending — the release projection runs
+        # on the retrieval path, outside a sync, and it must not undo the
+        # owner the scan supplied.
+        self._scan_sealed = list(scan_sealed)
+
+        for file_path, source, scope, user_id, scan_owner in files_to_scan:
             rel_path = _index_rel_path(file_path, index_roots)
             if rel_path is None:
                 # Defensive: every scan target above resolves under one of the
@@ -1339,6 +1551,17 @@ class MemoryManager:
                 # shaped like an owner token read a dark page — the row
                 # matched on the axis that was never supposed to carry it.
                 user_id = None
+            elif scan_owner:
+                # P1-阶段三 (2026-11-02, G-3/Q3): the scan decided this
+                # file is SEALED under a given agent (a teammate's identity
+                # file).  The file's own front-matter does not declare it
+                # sealed, so the owner has to come from the scan.
+                #
+                # The front-matter's own owner (when the file declares one)
+                # wins — it is the more specific statement about the file.
+                scope = SCOPE_SEALED
+                sealed_owner = sealed_owner or scan_owner
+                user_id = None
             previous_hash = self.storage.get_file_hash(rel_path)
             # T2d (2026-11-01): the comparison goes through the ONE
             # fingerprint entry point.  ``files.hash`` is stored in TWO
@@ -1353,7 +1576,20 @@ class MemoryManager:
             # The stored value is NEVER rewritten (that would change the
             # hash chain); the read side carries both shapes.
             if file_hash_matches(previous_hash, content):
-                continue
+                # The CONTENT did not change — but the file's SCOPE or
+                # OWNER may have.  P1-阶段三 (2026-11-02, G-3/Q3): the
+                # scan decides the scope for a teammate's identity file
+                # (sealed + the agent's owner token), and that decision is
+                # not part of the content fingerprint.  Without this check
+                # a file whose scope or owner changed would keep its old
+                # rows forever — a row that is SEALED but ownerless is
+                # visible to NOBODY, i.e. indexed and unreachable.
+                #
+                # So the fingerprint is compared TOGETHER WITH the scope
+                # and the owner the index currently holds.
+                if not self._index_scope_owner_changed(rel_path, scope, user_id,
+                                                       sealed_owner):
+                    continue
             # G-3: the chunking DECISION lives in ONE place
             # (chunker.chunk_for_file) — the rebuilder calls the same
             # function, so a rebuild refreshes the projection instead of
@@ -1373,7 +1609,18 @@ class MemoryManager:
                 # the sealed branch of the predicate reads ONLY
                 # `sealed_owner` — so an end-user id that happens to look
                 # like an owner token cannot reach a dark page.
-                "sealed_owner": sealed_owner if visibility == VIS_SEALED else None,
+                #
+                # P1-阶段三 (2026-11-02, G-3/Q3): the owner travels
+                # whenever the row IS sealed — not only when the file
+                # DECLARED itself sealed.  A file the SCAN sealed (a
+                # teammate's identity file) is a dark page whose owner
+                # the scan supplied; writing the owner only for
+                # self-declared dark pages would leave the scan-owned ones
+                # sealed AND ownerless, i.e. visible to NOBODY (which is
+                # the false green the ruling warned about: "indexed but
+                # unreachable").
+                "sealed_owner": (sealed_owner
+                                 if scope == SCOPE_SEALED else None),
                 "file_hash": file_hash,
                 "chunks": chunks,
                 "texts": [c.text for c in chunks],
@@ -1408,6 +1655,11 @@ class MemoryManager:
             reconcilable.append("memory")
         if knowledge_dir is not None and knowledge_dir.exists():
             reconcilable.append("knowledge")
+        # P1-阶段三 (2026-11-02, G-3/Q3): the team's documents are
+        # reconciled too, or a deleted deliverable would stay searchable
+        # forever — the same hole the other two sources closed.
+        if agents_dir.is_dir():
+            reconcilable.append(_AGENT_SOURCE)
         for source in reconcilable:
             try:
                 indexed = set(self.storage.list_paths(source))
@@ -1457,7 +1709,7 @@ class MemoryManager:
             # so the witness path is the INDEX KEY and the file is the
             # FILE — never the other way round.
             _cands = []
-            for (file_path, _source, _scope, _uid) in files_to_scan:
+            for (file_path, _source, _scope, _uid, _owner) in files_to_scan:
                 _rel = _index_rel_path(file_path, index_roots)
                 if _rel is not None:
                     _cands.append((_rel, file_path))
@@ -1528,8 +1780,33 @@ class MemoryManager:
         # the rows go in. The guard is what the old desktop build's writes
         # go through, and the owner token is known here — the guard's
         # front-matter fallback deliberately does not guess one.
+        # P1-阶段三 (2026-11-02, G-3/Q3): the paths the SCAN sealed itself
+        # (a teammate's identity file) travel with the truth layer's
+        # verdict.  The guard's trigger can only derive an owner from a
+        # front-matter, and an identity file has none — so without this
+        # the row would be corrected to ``sealed_owner = NULL``: sealed,
+        # and visible to nobody.
+        self._scan_sealed = list(scan_sealed)
         if release_state is not None:
-            self._record_guard_paths(release_state)
+            self._record_guard_paths(
+                release_state, extra=self._scan_sealed_paths())
+
+        # P1-阶段三 (2026-11-02, G-3/Q3): the release state is resolved
+        # from the truth layer's OWN front-matter, and a teammate's
+        # identity file has none — so the state says "not sealed" for it
+        # and the ``file_sealed`` flag would be written as 0.
+        #
+        # That flag matters: the index guard's UPDATE trigger fires on a
+        # row that is NOT marked sealed and corrects ``sealed_owner`` to
+        # NULL — so the owner the scan supplied would be erased on the
+        # NEXT sync, and the row would be sealed and visible to nobody
+        # (indexed and unreachable: the false green the ruling named).
+        #
+        # So the scan's own sealed paths are MERGED into the state before
+        # it is used for the flags.
+        if release_state is not None and scan_sealed:
+            release_state = release_state.with_extra_sealed(
+                [(p, o) for (p, _klass, o) in scan_sealed])
 
         for entry in pending:
             n = len(entry["texts"])
@@ -2207,6 +2484,123 @@ class MemoryManager:
         return self._compute_temporal_decay(
             path, half_life_days=half_life_days, occurred_at=occurred_at)
 
+    def _scan_sealed_paths(self) -> List[Tuple[str, str, Optional[str]]]:
+        """The paths THIS scan sealed, as (path, class, owner_token).
+
+        P1-阶段三 (2026-11-02, G-3/Q3): a teammate's identity file is
+        sealed under that agent's owner token by the SCAN's decision, not
+        by the file's front-matter.  The index guard needs to know that
+        — it is what keeps the row's scope and owner in step with the
+        truth layer, and its trigger can only derive an owner from a
+        front-matter, which an identity file does not have.
+
+        The list is kept on the instance, so the release projection (which
+        runs OUTSIDE a sync, on the retrieval path) knows about them too.
+
+        **It is DISCOVERED, not remembered.**  A fresh manager (one that
+        has never synced) must still know which paths are sealed under
+        an agent's owner token — otherwise the projection would un-seal
+        them on the very first retrieval, and the rows would go from
+        "reachable by the owner" to "reachable by nobody" without any
+        content having changed.  So the list is rebuilt from the DISK
+        when the instance does not carry one.
+        """
+        cached = getattr(self, "_scan_sealed", None)
+        if cached:
+            return list(cached)
+        return self._discover_scan_sealed_paths()
+
+    def _discover_scan_sealed_paths(self) -> List[Tuple[str, str, Optional[str]]]:
+        """The scan-sealed paths, read from the disk.
+
+        The rule is the whitelist in ``layers.py`` — the SAME rule the
+        scan uses — so the two cannot disagree about which of a
+        teammate's files are sealed.
+        """
+        try:
+            workspace = Path(self.config.get_workspace())
+            agents_dir = workspace / "agents"
+            if not agents_dir.is_dir():
+                return []
+            out = []
+            for agent_dir in sorted(p for p in agents_dir.iterdir()
+                                    if p.is_dir()):
+                rel = (Path("agents") / agent_dir.name
+                       / AGENT_IDENTITY_FILENAME).as_posix()
+                if not agent_index_allowed(rel):
+                    continue
+                if not (agent_dir / AGENT_IDENTITY_FILENAME).is_file():
+                    continue
+                out.append((rel, "sealed",
+                            agent_owner_token(agent_dir.name)))
+            return out
+        except Exception:
+            return []
+
+    def _index_scope_owner_changed(self, rel_path: str, scope: str,
+                                   user_id: Optional[str],
+                                   sealed_owner: Optional[str]) -> bool:
+        """Does the index's OWNERSHIP of this file differ from the scan's?
+
+        The content fingerprint says nothing about who may read a file.
+        A file that becomes sealed (or changes its owner) keeps its
+        content, so the fingerprint matches and the file is skipped —
+        and the rows in the index keep the OLD scope and the OLD owner.
+        That is how a row ends up sealed-but-ownerless: indexed, and
+        visible to nobody.
+
+        This asks the index what it currently holds, and compares it with
+        what the scan decided.  It is only consulted when the CONTENT
+        already matched, so it costs nothing on the common path.
+        """
+        try:
+            rows = self.storage.conn.execute(
+                "SELECT scope, user_id, sealed_owner FROM chunks "
+                "WHERE path = ? LIMIT 1", (rel_path,)
+            ).fetchone()
+        except Exception:
+            # An unreadable index is not evidence of a change; the
+            # write path below will surface the real problem.
+            return False
+        if rows is None:
+            # No rows for this path: nothing to compare against.
+            return False
+        current_scope, current_user, current_owner = rows[0], rows[1], rows[2]
+        want_owner = sealed_owner or ""
+        if (current_scope or "") != (scope or ""):
+            return True
+        if (current_owner or "") != want_owner:
+            return True
+        # The end-user axis: a file that moved from a user scope to the
+        # shared scope (or the other way round) must be re-written too.
+        if scope != SCOPE_SEALED and (current_user or "") != (user_id or ""):
+            return True
+        return False
+
+    def _gate_by_absolute_quality(
+        self,
+        results: List[SearchResult],
+    ) -> List[SearchResult]:
+        """Drop the results whose ABSOLUTE quality is below the gate.
+
+        The absolute quality is "how much of the query this chunk really
+        holds", measured on its own scale — not on the rank-normalized
+        one, where the top hit of a channel is 1.0 by construction.
+
+        A result that carries no absolute measure at all is KEPT: the
+        gate exists to reject evidence of irrelevance, and a missing
+        measurement is not evidence of irrelevance.  (The keyword channel
+        always carries one; the vector channel never does, and it is not
+        gated here.)
+        """
+        threshold = self.MIN_ABSOLUTE_QUALITY
+        kept = []
+        for result in results:
+            quality = result.absolute_quality
+            if quality is None or quality >= threshold:
+                kept.append(result)
+        return kept
+
     def _merge_results(
         self,
         vector_results: List[SearchResult],
@@ -2241,6 +2635,22 @@ class MemoryManager:
         the retrieval signal on the same scale (see ``_rerank``).
         """
         vector_weight, keyword_weight = self._normalize_weights(vector_weight, keyword_weight)
+        # P1-阶段三 (2026-11-02, G-2/Q2 §3.2): the ABSOLUTE quality gate
+        # runs BEFORE the rank normalization, on the raw channel results.
+        #
+        # This is the only place where it CAN run: after the normalization
+        # the top hit of a channel scores 1.0 by construction, so a
+        # threshold there says "how many hits are near the top" and not
+        # "how relevant is this hit".  That is exactly how a completely
+        # irrelevant string ("意图不存在的一串怪词") came back with hits
+        # scoring 1.0: it was the top of its channel.
+        #
+        # A result with no absolute measure (the vector channel has no
+        # such measure) is NOT dropped here — the gate is a statement
+        # about the keyword channel's evidence, and dropping a vector hit
+        # for a missing measurement would be dropping it for a lack of
+        # evidence rather than for evidence of irrelevance.
+        keyword_results = self._gate_by_absolute_quality(keyword_results)
         vector_norm = self._rank_normalize(vector_results)
         keyword_norm = self._rank_normalize(keyword_results)
 
@@ -2276,6 +2686,9 @@ class MemoryManager:
                 snippet=result.snippet,
                 source=result.source,
                 user_id=result.user_id,
+                # The ABSOLUTE quality travels on, so a caller can see WHY
+                # a hit is relevant rather than only how it ranked.
+                absolute_quality=result.absolute_quality,
                 # P1-阶段三 (D-C): the decay FACTOR travels with the score;
                 # it is applied once, at the end of the ranking chain.
                 # P1-阶段三 (D-A): the factor is looked up per PATH, so the

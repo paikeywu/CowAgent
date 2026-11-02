@@ -86,6 +86,80 @@ _CJK_WINDOW_SIZES = (3, 2)
 # shorter than three characters is a single word and must be matched whole.
 _MIN_MATCHED_CHARS = 3
 
+# The FRAGMENT rule, restated so it can be applied to a chunk instead of to
+# the group's own character positions.
+#
+# The old rule asked "how many DISTINCT characters of the group are covered,
+# counting the group's own positions". That number is small for exactly the
+# case the rule exists to reject, and large for exactly the case it must let
+# through:
+#
+#   * the fragment case   "强化学习进阶" vs "深度学习入门": the only matching
+#     window is "学习" (2 chars) => covered = 2 of 6 => rejected.  Correct.
+#   * the combination case "不是必须" vs a chunk holding only "不是":
+#     the only matching window is "不是" (2 chars) => covered = 2 of 4
+#     => rejected.  WRONG: the chunk really does carry half of the query,
+#     and rejecting it makes a COMBINATION query return fewer hits than
+#     either of its parts (measured 2026-11-02 on the live ROOT library:
+#     "不是"=370 candidates, "一个"=331, "不是一个"=281 -- the combination
+#     is NARROWER than its parts, which is the G-1 defect).
+#
+# The rule is therefore re-expressed in CHUNK space: how much of the query
+# does the chunk hold as ONE CONTIGUOUS RUN?
+#
+# **THE THRESHOLD IS COUNTED IN WORDS, NOT IN CHARACTERS.**  A Chinese
+# query is a sequence of 2-character WORDS ("不是" "必须"), and the rule
+# asks for all but ONE of them:
+#
+#     required run = 2 * (number_of_words - 1)
+#
+# Why "all but one" and not "half":
+#
+#   * "all but one" is what makes the rule STRUCTURALLY true for the
+#     combination case.  A two-character word A is a SUBSTRING of the
+#     combined group A+B, so a chunk holding A holds a contiguous run of
+#     2 inside A+B -- and 2 is exactly the requirement for A+B's first
+#     word.  ⇒ pool(A+B) CONTAINS pool(A) and pool(B), for every
+#     threshold, without any tuning.  Monotonicity (R-2') is therefore a
+#     property of the rule, not a coincidence of a threshold.
+#   * "half" (50%) does NOT have that property: for an 8-character query
+#     the requirement drops to 4, and a chunk holding the first four
+#     characters of a nonsense phrase ("记忆系统" out of "记忆系统文件索引")
+#     is admitted — measured 2026-11-02: 18 rows survive and 3 hits reach
+#     the caller.  The "all but one" rule admits 0 rows for the same
+#     phrase.
+#
+# MEASURED 2026-11-02 on the live ROOT library (evidence:
+# deliverables/evidence/2026-11-02-G1-G4/probe-threshold-calib.txt):
+#
+#   mode           R-2'   adversarial pool   adversarial hits   fragment
+#   half            OK    144                3                  rejected
+#   all-but-one     OK    0                  0                  rejected
+#
+#   and the true-hit cost is small: the true PHRASE pools measured on the
+#   live corpus differ by 0-24 rows out of 23-362, and the ABSOLUTE
+#   quality of every surviving true hit is 1.0 in both modes (so the
+#   absolute-quality gate keeps all of them).
+#
+# The threshold is expressed in WORDS so it scales with the query: a
+# 4-character query needs a run of 2, a 6-character query needs 4, an
+# 8-character query needs 6.
+_FRAGMENT_MAX_MISSING_WORDS = 1
+
+# How many times the caller's limit the candidate SQL fetches before the
+# quality gate filters the rows.
+#
+# The gate throws away the rows that are only fragments of the query, so
+# applying the limit to the CANDIDATES truncates before the filter runs:
+# a query whose first N candidates are all fragments comes back with
+# fewer hits than the same query's parts.  The over-fetch is what keeps
+# the limit a statement about ANSWERS rather than about candidates.
+#
+# The factor is bounded (it is a multiple of the caller's own limit, and
+# the caller passes ``max_results * 2``), so the extra rows are a
+# constant multiple of what the caller already asked for.
+_CANDIDATE_OVERFETCH = 20
+
 
 def _cjk_windows(run: str) -> List[str]:
     """Sliding windows over one CJK run, deduplicated, longest first.
@@ -139,6 +213,100 @@ def _query_groups(query: str) -> List[QueryGroup]:
     return groups
 
 
+def _contiguous_run(group: QueryGroup, text: str) -> int:
+    """The length of the longest CONTIGUOUS stretch of the group that the
+    text holds as one unbroken run.
+
+    This is the chunk-space counterpart of the group's own character
+    positions: it asks "how much of the query is here, in one piece",
+    not "how many of the query's characters are here, wherever they are".
+
+    A chunk holding "不是" inside the group "不是必须" scores 2 — the
+    group really is half-present in it.  A chunk holding "记忆", "系统",
+    "文件" and "索引" scattered through the group "记忆系统文件索引"
+    scores 2 as well, because the words are not adjacent.  That is the
+    difference the fragment rule needs: a real part of a query is
+    contiguous, a coincidence of common words is not.
+
+    The group is scanned by its own substrings, longest first, so the
+    answer is the longest substring of the group that occurs in the text.
+    """
+    n = len(group.text)
+    for length in range(n, 0, -1):
+        for start in range(0, n - length + 1):
+            if group.text[start:start + length] in text:
+                return length
+    return 0
+
+
+def _absolute_quality(groups: List[QueryGroup], text: str) -> float:
+    """The ABSOLUTE relevance of a chunk for a query, in [0, 1].
+
+    ``_query_quality`` is a RANKING score: it carries the verbatim-mention
+    discount, so a chunk that quotes the query scores 0.4333 where a chunk
+    that talks about the query scores 0.8667 — and, worse, it is not on an
+    absolute scale at all, because the fusion stage replaces every channel's
+    raw score with a RANK-NORMALIZED one (the top hit of every channel
+    becomes 1.0 by construction).
+
+    That is why a completely irrelevant string could return hits scoring
+    1.0: it was the TOP hit of a channel, so normalization crowned it.
+
+    This function is the absolute measure the fusion stage must consult
+    BEFORE the normalization, so that "the top of a channel" cannot by
+    itself make a result relevant.  It is deliberately plain:
+
+      * a group is covered to the extent that the chunk holds it as one
+        CONTIGUOUS RUN (the same measure the fragment rule uses);
+      * the groups are averaged, weighted by their length, so a long
+        question is not satisfied by one short word.
+
+    It carries NO verbatim discount: the discount is a ranking preference,
+    and applying it here would make a genuine mention of the query look
+    irrelevant.
+    """
+    if not groups:
+        return 0.0
+    total = 0.0
+    weight_sum = 0.0
+    for group in groups:
+        weight = group.weight
+        if group.kind == "word":
+            covered = 1.0 if group.text.lower() in text.lower() else 0.0
+        else:
+            run = _contiguous_run(group, text)
+            covered = 0.0 if run == 0 else min(1.0, run / len(group.text))
+        total += covered * weight
+        weight_sum += weight
+    if weight_sum <= 0:
+        return 0.0
+    return min(1.0, total / weight_sum)
+
+
+def _fragment_min_run(group: QueryGroup) -> int:
+    """The shortest contiguous run a chunk must hold to count as a match.
+
+    The requirement is counted in WORDS: a Chinese query is a sequence
+    of 2-character words, and the chunk must hold all but one of them
+    (see the module comment on ``_FRAGMENT_MAX_MISSING_WORDS``).
+
+      * a 4-character query ("不是必须") needs a run of 2 — one word;
+      * a 6-character query ("强化学习进阶") needs a run of 4 — two words;
+      * an 8-character query ("记忆系统文件索引") needs a run of 6 — three
+        words.
+
+    A one- or two-character query has no fragment to worry about (it is a
+    single word, matched whole), so it needs nothing.
+    """
+    if group.kind == "word":
+        return 0
+    words = (len(group.text) + 1) // 2
+    if words <= 1:
+        return 0
+    missing = min(_FRAGMENT_MAX_MISSING_WORDS, words - 1)
+    return 2 * (words - missing)
+
+
 def _group_quality(group: QueryGroup, text: str) -> float:
     """How well one group is covered by a piece of text, in [0, 1].
 
@@ -148,10 +316,16 @@ def _group_quality(group: QueryGroup, text: str) -> float:
     deserves more than a page holding a two-character fragment of it.
 
     A run shorter than three characters is matched WHOLE — a two-character
-    Chinese word ("事件") is a word, not a fragment of a longer one. A longer
-    run needs at least three matched characters, so a chunk that shares only
-    a common two-character fragment with the query ("学习" in "深度学习入门"
-    and "强化学习进阶") is not a match at all.
+    Chinese word ("事件") is a word, not a fragment of a longer one.
+
+    A LONGER run needs the chunk to hold all but ONE of the run's WORDS
+    as one CONTIGUOUS RUN (``_fragment_min_run``).  See the module comment
+    on ``_FRAGMENT_MAX_MISSING_WORDS`` for the measurement that fixed the
+    threshold: the rule used to count the group's DISTINCT covered
+    characters, which rejected a chunk holding "不是" for the group
+    "不是必须" (2 of 4) and thereby made every COMBINATION query return
+    fewer hits than its parts — the G-1 defect, measured at 281
+    candidates against 370 / 331 for the parts.
     """
     if group.kind == "word":
         return 1.0 if group.text.lower() in text.lower() else 0.0
@@ -168,9 +342,16 @@ def _group_quality(group: QueryGroup, text: str) -> float:
         while start != -1:
             covered.update(range(start, start + len(window)))
             start = group.text.find(window, start + 1)
-    if len(group.text) > _MIN_MATCHED_CHARS and len(covered) < _MIN_MATCHED_CHARS:
-        # Only a fragment in common — not a match.
-        return 0.0
+    if len(group.text) > _MIN_MATCHED_CHARS:
+        # The FRAGMENT rule, in chunk space: the chunk must hold all but
+        # one of the query's WORDS, as one unbroken run.  A stray shared
+        # fragment ("学习" out of "深度学习入门") is one word out of three
+        # and is rejected; a genuine part ("不是" out of "不是必须") is
+        # one word out of two and is kept.
+        run = _contiguous_run(group, text)
+        if run < _fragment_min_run(group):
+            # Only a fragment in common — not a match.
+            return 0.0
     coverage = min(1.0, len(covered) / len(group.text))
     longest = max(len(w) for w in matched)
     return coverage * (0.6 + 0.4 * min(1.0, longest / 3.0))
@@ -395,6 +576,19 @@ class SearchResult:
     # None means "no decay applies" (1.0) — which is what a result that
     # never went through the fusion carries.
     decay: Optional[float] = None
+    # P1-阶段三 (2026-11-02, G-2/Q2): the ABSOLUTE quality of this result —
+    # how much of the query the chunk really holds, on its own scale.
+    #
+    # It exists because the fusion stage rank-normalizes every channel
+    # (``_rank_normalize``), which makes the top hit of a channel score
+    # 1.0 BY CONSTRUCTION.  A completely irrelevant string therefore
+    # returned hits scoring 1.0: it was the top of its channel.  A
+    # threshold applied AFTER the normalization cannot see that, so the
+    # absolute measure has to travel with the result and be consulted
+    # BEFORE the normalization.
+    #
+    # None means "not measured" (the vector channel has no such measure).
+    absolute_quality: Optional[float] = None
 
 
 class MemorySchemaError(RuntimeError):
@@ -1782,6 +1976,26 @@ class MemoryStorage:
         # Step 2: Trigram FTS5 — CJK/mixed queries, plus fallback when unicode61
         # returned nothing (trigram indexes all scripts with 3-char sliding windows,
         # so it can catch terms that unicode61 tokenisation misses).
+        #
+        # P1-阶段三 (2026-11-02, G-1/Q1): the trigram stage and the LIKE
+        # stage are now MERGED, not chained.  They used to be exclusive
+        # ("if the trigram stage found anything, return it and never run
+        # the LIKE stage"), and that made a COMBINATION query worse than
+        # either of its parts:
+        #
+        #   measured 2026-11-02 on the live ROOT library:
+        #     "不是"      trigram 0   LIKE 370
+        #     "一个"      trigram 0   LIKE 331
+        #     "不是一个"  trigram 46  LIKE 281   <- end-to-end returned 46
+        #
+        # The trigram tokenizer cannot index a 2-character window, so a
+        # two-character query is invisible to that stage; but a COMBINED
+        # query builds 3-character windows out of its parts, so the
+        # combined query IS visible to the trigram stage and the LIKE
+        # stage — which carries the two-character parts — never ran.  The
+        # merge is what makes the combination at least as good as its
+        # parts.
+        trigram_results: List[SearchResult] = []
         if self.trigram_fts5_available and (
             MemoryStorage._contains_cjk(query) or fts1_attempted
         ):
@@ -1790,12 +2004,11 @@ class MemoryStorage:
                     query, user_id, scopes, limit, identities, owner_tokens)
             except MemorySchemaError as e:
                 first_failure = first_failure or e
-            else:
-                if trigram_results:
-                    return trigram_results
 
-        # Step 3: LIKE fallback — last resort (FTS5 unavailable, CJK queries
-        # trigram cannot match, or an FTS5 stage that found nothing).
+        # Step 3: LIKE fallback — the second half of the merge (FTS5
+        # unavailable, CJK queries the trigram tokenizer cannot match, or
+        # the two-character parts of a longer query).
+        like_results: List[SearchResult] = []
         if (not self.fts5_available
                 or MemoryStorage._contains_cjk(query)
                 or fts1_attempted):
@@ -1804,10 +2017,9 @@ class MemoryStorage:
                                                  identities, owner_tokens)
             except MemorySchemaError as e:
                 first_failure = first_failure or e
-            else:
-                # A stage that RAN and found nothing is a genuine empty
-                # result: the caller gets [].
-                return like_results
+
+        if trigram_results or like_results:
+            return self._merge_keyword_stages(trigram_results, like_results)
 
         # Every stage failed: the query never ran. That is an error, not an
         # absence of matches, and saying otherwise is the silent lie this
@@ -1815,6 +2027,34 @@ class MemoryStorage:
         if first_failure is not None:
             raise first_failure
         return []
+
+    @staticmethod
+    def _merge_keyword_stages(
+        trigram_results: List[SearchResult],
+        like_results: List[SearchResult],
+    ) -> List[SearchResult]:
+        """Merge the trigram stage's hits with the LIKE stage's hits.
+
+        Both stages match the SAME chunk with different machinery, so the
+        merge is a UNION keyed on the chunk's identity, not a blend of
+        two scores: a chunk found by both stages is ONE hit, and it keeps
+        the better of the two scores (the LIKE stage's score is the
+        quality-based one; the trigram stage's is BM25-derived).
+
+        De-duplication is by (path, start_line, end_line) — the chunk's
+        identity in the index.  Two stages that disagree about the score
+        of the same chunk must not produce two hits, or the result count
+        would measure the machinery rather than the content.
+        """
+        merged: Dict[tuple, SearchResult] = {}
+        for result in list(trigram_results) + list(like_results):
+            key = (result.path, result.start_line, result.end_line)
+            existing = merged.get(key)
+            if existing is None or result.score > existing.score:
+                merged[key] = result
+        out = list(merged.values())
+        out.sort(key=lambda r: r.score, reverse=True)
+        return out
     
     def _search_fts5(
         self,
@@ -1970,7 +2210,15 @@ class MemoryStorage:
                                                 owner_token_list=owner_tokens,
                                                 sealed_owner_col="chunks.sealed_owner")
         params.extend(vis_params)
-        params.append(limit)
+        # P1-阶段三 (2026-11-02, G-1/Q1 §2.3 item 3): the candidate rows
+        # are fetched OVER the limit and filtered afterwards.  The limit
+        # used to be applied by SQL BEFORE the quality gate, so a query
+        # whose first N candidates were all fragments lost them and
+        # returned fewer hits than the same query's parts — the very
+        # defect the fragment rule change was meant to remove.  The
+        # over-fetch is bounded: a chunk that is not a candidate at all
+        # never reaches the loop.
+        params.append(limit * _CANDIDATE_OVERFETCH)
         sql_query = f"""
             SELECT * FROM chunks
             WHERE ({where_clause})
@@ -2000,7 +2248,12 @@ class MemoryStorage:
                     score=score,
                     snippet=self._snippet_around(row['text'], query, 500),
                     source=row['source'],
-                    user_id=row['user_id']
+                    user_id=row['user_id'],
+                    # The ABSOLUTE measure travels with the result so the
+                    # fusion stage can gate on it BEFORE the rank
+                    # normalization (which would crown the top hit of a
+                    # channel with 1.0 no matter how irrelevant it is).
+                    absolute_quality=_absolute_quality(groups, text_lower),
                 ))
 
             if not results and len(groups) > 1:
@@ -2032,7 +2285,9 @@ class MemoryStorage:
                 )
 
             results.sort(key=lambda r: r.score, reverse=True)
-            return results
+            # The limit is applied to the ANSWERS, after the gate — the
+            # over-fetch above only widened the candidate set.
+            return results[:limit]
         except sqlite3.Error as e:
             # P0-17 B-2: same rule as the FTS5 path — a structural failure
             # raises instead of masquerading as "no matches".
@@ -2098,7 +2353,9 @@ class MemoryStorage:
             """
             params.extend(scopes)
             params.extend(vis_params)
-            params.append(limit)
+            # Same over-fetch as the strict path (§2.3 item 4): the limit
+            # is applied after the gate, not before it.
+            params.append(limit * _CANDIDATE_OVERFETCH)
             try:
                 rows = self.conn.execute(sql, params).fetchall()
             except sqlite3.Error as e:
@@ -2131,9 +2388,39 @@ class MemoryStorage:
                     score=0.3 + 0.55 * quality,
                     snippet=self._snippet_around(row['text'], query, 500),
                     source=row['source'],
-                    user_id=row['user_id']
+                    user_id=row['user_id'],
+                    absolute_quality=_absolute_quality(groups, text_lower),
                 ))
-        return results
+        # The limit is applied to the ANSWERS, after the gate.
+        results.sort(key=lambda r: r.score, reverse=True)
+        return results[:limit]
+
+    @staticmethod
+    def _passes_fragment_rule(groups: List[QueryGroup], text: str) -> bool:
+        """Does this chunk hold enough of EVERY group to be a hit?
+
+        The fragment rule is a property of the GROUP, not of one stage:
+        a chunk that holds only a fragment of the query is not a match,
+        whichever machinery found it.  Both keyword stages ask this
+        question, so the two stages agree on what a hit IS (the merge
+        would otherwise keep whichever stage is more generous).
+
+        A group of at most three characters is matched WHOLE (a
+        two-character Chinese word is a word, not a fragment), so it only
+        has to occur at all.
+        """
+        for group in groups:
+            if group.kind == "word":
+                if group.text.lower() not in text.lower():
+                    return False
+                continue
+            if len(group.text) <= _MIN_MATCHED_CHARS:
+                if not any(w in text for w in group.windows):
+                    return False
+                continue
+            if _contiguous_run(group, text) < _fragment_min_run(group):
+                return False
+        return True
 
     @staticmethod
     def _query_quality(groups: List[QueryGroup], text: str) -> float:
@@ -2722,12 +3009,29 @@ class MemoryStorage:
             results = []
             groups = _query_groups(query)
             for row in rows:
+                text = row['text'] or ''
+                # P1-阶段三 (2026-11-02, G-1/Q1): the trigram stage applies
+                # the SAME fragment rule the LIKE stage applies.
+                #
+                # It used not to, and the merge made that visible: the
+                # trigram tokenizer matches on any 3-character window, so
+                # it admitted a chunk holding "记忆系统" for the query
+                # "记忆系统文件索引" — a chunk the LIKE stage had already
+                # rejected as a fragment.  Merging the two stages then
+                # brought the fragment back, and the whole point of the
+                # fragment rule was lost on the merged path.
+                #
+                # The two stages must agree on what a hit IS, or the merge
+                # keeps whichever stage is more generous.
+                if not groups:
+                    continue
+                if not self._passes_fragment_rule(groups, text.lower()):
+                    continue
                 score = self._bm25_rank_to_score(row['rank'])
                 # The same discount the LIKE path applies: a chunk that
                 # contains the query string verbatim matched it as an example
                 # of itself, not as subject matter. Applied here so the two
                 # keyword paths agree on the order.
-                text = row['text'] or ''
                 factor = _verbatim_mention_factor(groups, text)
                 results.append(SearchResult(
                     path=row['path'],
@@ -2736,7 +3040,13 @@ class MemoryStorage:
                     score=score * factor,
                     snippet=self._snippet_around(text, query, 500),
                     source=row['source'],
-                    user_id=row['user_id']
+                    user_id=row['user_id'],
+                    # The ABSOLUTE measure, on this path too: the trigram
+                    # stage and the LIKE stage must agree about what an
+                    # irrelevant hit looks like, or the merge would keep
+                    # whichever stage flatters the nonsense.
+                    absolute_quality=_absolute_quality(
+                        groups, text.lower()),
                 ))
             results.sort(key=lambda r: r.score, reverse=True)
             return results
