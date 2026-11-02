@@ -264,6 +264,18 @@ CRITERION_FILES = ("phase2.py", "phase2_s3e.py", "phase2_s3h.py",
 #:           know" must not be dressed as "I can close it"
 #:   MU-60  DR-2 (an environment item) enters the global baseline ⇒
 #:           GB-1 must be RED (environment reds never enter)
+#: MU-AA1..MU-AA5 are the S3-AA round's five — the sub agent's budget
+#: (L2 · 交办 S3-AA):
+#:   MU-AA1  the spawn goes back to ONE shared deadline for every task ⇒
+#:            J1 must be RED (the queued task never got to run)
+#:   MU-AA2  the timeout marker is written over a result that already
+#:            exists ⇒ J1 must be RED (the finished output is thrown away)
+#:   MU-AA3  the tool reports the whole spawn as failed ⇒ J2 must be RED
+#:            (a blanket failure covers the task that worked)
+#:   MU-AA4  the configured budget is silently rewritten ⇒ J3 must be RED
+#:            (the value that was asked for is not the value that applied)
+#:   MU-AA5  the criterion's OWN diagnosis is a rubber stamp ⇒ J4 must
+#:            be RED (the negative control has no teeth)
 REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
     "test_p1_stage3e_criteria_mutants.py": (
         "MU-1", "MU-2", "MU-3", "MU-4", "MU-5", "MU-6", "MU-7", "MU-8", "MU-9",
@@ -299,6 +311,9 @@ REQUIRED_MUTANT_NAMES: Dict[str, Tuple[str, ...]] = {
     ),
     "test_p1_stage3y_criteria_mutants.py": (
         "MU-54", "MU-55", "MU-56", "MU-57", "MU-58", "MU-59", "MU-60",
+    ),
+    "test_p1_stage3aa_criteria_mutants.py": (
+        "MU-AA1", "MU-AA2", "MU-AA3", "MU-AA4", "MU-AA5",
     ),
 }
 
@@ -549,11 +564,17 @@ def judge_mutation_replay_is_registered(report, workspace: Path = None):
             detail.append("git ls-files 失败: %s" % e)
         # The name pattern must accept BOTH spellings: the numeric
         # ones (MU-1 .. MU-53) and the prefixed ones (MU-T1 ..
-        # MU-T12, the S3-X round).  The old pattern (MU-\d+) could not
-        # see a prefixed name at all, so a replay file that named
-        # nothing but MU-T* names was reported as "names nothing" — a
-        # false red on a file that was naming plenty.
-        names = sorted(set(re.findall(r"MU-([A-Za-z]?\d+)", src)))
+        # MU-T12, the S3-X round; MU-AA1 .. MU-AA5, the S3-AA
+        # round).  The old pattern (MU-\d+) could not see a prefixed
+        # name at all, so a replay file that named nothing but MU-T*
+        # names was reported as "names nothing" — a false red on a
+        # file that was naming plenty.  The prefix is now
+        # ``[A-Za-z]*`` rather than ``[A-Za-z]?`` for the same
+        # reason one round later: a TWO-letter prefix (MU-AA*) was
+        # invisible to the pattern, and the S3-AA replay file would
+        # have been reported as "names nothing" — a false red on a
+        # file that was naming five mutants.
+        names = sorted(set(re.findall(r"MU-([A-Za-z]*\d+)", src)))
         seen_names.update("MU-%s" % n for n in names)
         detail.append("  %s  入库=%s  重放的变异=MU-%s"
                       % (path.name, tracked, ", ".join(names) if names else "无"))

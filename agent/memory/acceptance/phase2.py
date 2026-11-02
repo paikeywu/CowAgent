@@ -1366,6 +1366,48 @@ def _load_s3y():
     return out
 
 
+# ---------------------------------------------------------------------------
+# S3-AA · the sub agent's budget (L2 · 交办 S3-AA)
+# ---------------------------------------------------------------------------
+#
+# **Why a NEW module and not a change to an existing one.**  The sub agent's
+# budget is not a property of the memory corpus — it is a property of the
+# SPAWN machinery — so it does not belong to any of the corpus groups
+# (DR / I / U / J / M6 / ANCHOR …).  Its home is a module of its own, and
+# its criteria are about the machine's behaviour under a budget, not about
+# what is in a database.
+#
+# **Why these criteria are the group's own.**  J1..J4 each defend ONE
+# invariant, and each has a registered mutant (MU-AA1..MU-AA5) that must
+# turn it red.  They are NOT part of the global failure-set baseline:
+# a sub agent budget regression is a code regression, not an environment
+# truth, and the baseline is for the latter.
+_S3AA_CRITERIA = [
+    ("J1", "judge_completed_output_survives_timeout"),
+    ("J2", "judge_completed_output_is_not_polluted"),
+    ("J3", "judge_configured_budget_is_honoured"),
+    ("J4", "judge_criterion_has_teeth"),
+]
+
+
+def _load_s3aa():
+    """The S3-AA criterion functions, bound to the workspace."""
+    from agent.memory.acceptance import phase2_s3aa
+
+    ws = Path(resolve_workspace(ARGS.workspace)[0])
+    out = []
+    for group, attr in _S3AA_CRITERIA:
+        fn = getattr(phase2_s3aa, attr)
+
+        def make(fn=fn, ws=ws):
+            def run(report):
+                return fn(report, ws)
+            return run
+
+        out.append((group, make()))
+    return out
+
+
 def _load_s3w():
     """The S3-W criterion functions, bound to the workspace."""
     from agent.memory.acceptance import phase2_s3w
@@ -1504,6 +1546,14 @@ def main() -> int:
 
     # The S3-Y criteria (the ANCHOR ``~N`` baseline · 架构师 T1b 定案).
     for group, fn in _load_s3y():
+        if ARGS.only and not group.startswith(ARGS.only):
+            continue
+        guarded(fn, report)
+
+    # The S3-AA criteria (the sub agent's budget · L2).  They run BEFORE
+    # GB-1, because GB-1 reads the gate's OWN result table and therefore
+    # needs every other criterion to have reported already.
+    for group, fn in _load_s3aa():
         if ARGS.only and not group.startswith(ARGS.only):
             continue
         guarded(fn, report)
