@@ -878,6 +878,27 @@ def _change_log(workspace: Path) -> Dict[str, List[Dict[str, Any]]]:
     WORKSPACE (``AGENT.md``, not ``agents/app/AGENT.md``), so the
     lookup has to try the agent's own log FIRST and then the shared
     one, under both spellings.
+
+    **MEASURED (2026-11-03): the bare key belongs to ROOT ALONE.**
+
+    The first version of this function appended EVERY workspace's
+    records under the bare path (``out[raw]``) as well as under the
+    namespaced one.  Every workspace writes its identity files as
+    ``MEMORY.md`` / ``AGENT.md`` / ..., so all sixteen workspaces'
+    records collided in one bucket, and ``DR-2`` — which looks a file
+    up by its ROOT-relative path (``MEMORY.md``) — read ``entries[-1]``
+    of that shared bucket.  Because the workspaces are absorbed in
+    directory-name order, ``entries[-1]`` was always the last
+    teammate's record (``agents/web``), not ROOT's.
+
+    ⇒ ROOT's own ``MEMORY.md`` (changed 11-03 09:07) was judged
+    against ``agents/web/MEMORY.md``'s record (10-30 05:32) ⇒
+    "无源（文件比最后一条记录新）" ⇒ a FALSE RED.
+
+    The fix: the bare key is written ONLY by ROOT's own log
+    (``prefix == ""``).  A teammate's records live under
+    ``agents/<id>/<path>`` — which is the spelling DR-2 already uses
+    for a teammate's identity files, so those lookups are unchanged.
     """
     out: Dict[str, List[Dict[str, Any]]] = {}
 
@@ -898,8 +919,13 @@ def _change_log(workspace: Path) -> Dict[str, List[Dict[str, Any]]]:
             if not isinstance(rec, dict) or not rec.get("path"):
                 continue
             raw = rec["path"].replace("\\", "/")
-            out.setdefault(raw, []).append(rec)
-            if prefix:
+            if not prefix:
+                # ROOT owns the bare key.  ROOT's own log may also carry
+                # ``agents/<id>/...`` paths (the shared writer saw the
+                # whole tree); those keep their own spelling and are
+                # looked up as-is, never as ROOT's bare path.
+                out.setdefault(raw, []).append(rec)
+            else:
                 out.setdefault("%s/%s" % (prefix, raw), []).append(rec)
 
     workspace = Path(workspace)

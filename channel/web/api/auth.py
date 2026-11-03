@@ -101,6 +101,24 @@ class AuthCheckHandler:
 
 
 class AuthLoginHandler:
+    # A refused credential is a 401, not a 200 that happens to carry an
+    # "error" field in its body.  A monitor that reads only the status
+    # code has to be able to tell "signed in" from "rejected", and a
+    # 200 says "signed in" no matter what the body says.
+    #
+    # The body is unchanged on purpose: the console's login form reads
+    # ``data.status`` from the parsed JSON, and the desktop client's
+    # ``LoginGate`` shows the same message for a failed request and a
+    # failed response, so the reason still reaches the user.  The
+    # status code is what the machine reads; the body is what the
+    # person reads.  Both must be right.
+    UNAUTHORIZED_STATUS = "401 Unauthorized"
+
+    def _refused(self, message: str) -> str:
+        """The body of a refused login, with the status code that says so."""
+        web.ctx.status = self.UNAUTHORIZED_STATUS
+        return json.dumps({"status": "error", "message": message})
+
     def POST(self):
         web.header('Content-Type', 'application/json; charset=utf-8')
         if not _is_password_enabled():
@@ -108,12 +126,14 @@ class AuthLoginHandler:
         try:
             data = json.loads(web.data())
         except Exception:
-            return json.dumps({"status": "error", "message": "Invalid request"})
+            # A body that is not JSON carries no credential, so it is a
+            # refused credential like any other.
+            return self._refused("Invalid request")
         password = str(data.get("password", "") or "")
         expected = _get_web_password()
         if not constant_time_equals(password, expected):
             logger.warning("[WebChannel] Invalid login attempt")
-            return json.dumps({"status": "error", "message": "Wrong password"})
+            return self._refused("Wrong password")
         token = _create_auth_token()
         web.setcookie("cow_auth_token", token, expires=_session_expire_seconds(),
                        path="/", httponly=True, samesite="Lax")
