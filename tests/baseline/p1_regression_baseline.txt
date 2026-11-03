@@ -237,6 +237,11 @@
 # 那是 Q5 的设计（它测的是「文本不变量这一组的失败集只减不增」），不是
 # 本基线的疏漏。**门禁的全局失败集合由门禁的汇总行负责，不由 Q5 负责。**
 #
+ROOT:INV-2/3
+agent-mvnerelm:INV-2/3
+agent-mvnes449:INV-2/3
+consistency-guardian:INV-2/3
+core-architect:INV-2/3
 ROOT:SHELF-LAG
 agent-mvnerelm:SHELF-LAG
 agent-mvnes449:SHELF-LAG
@@ -253,16 +258,3 @@ default:SHELF-LAG
 learner-analyst:SHELF-LAG
 teaching-coach:SHELF-LAG
 web:SHELF-LAG
-agent-mvnerelm:INV-2/3
-agent-mvnes449:INV-2/3
-agent-mvnfgk8p:INV-2/3
-agent-mvnfkp3d:INV-2/3
-agent-mvnlair8:INV-2/3
-app:INV-2/3
-consistency-guardian:INV-2/3
-core-architect:INV-2/3
-course-evaluator:INV-2/3
-default:INV-2/3
-learner-analyst:INV-2/3
-teaching-coach:INV-2/3
-web:INV-2/3
