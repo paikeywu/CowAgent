@@ -798,6 +798,17 @@ class SessionSettingsHandler:
                 agent = ab.get_cached_agent(session_id, agent_id)
                 if agent is not None:
                     ab.apply_session_prefs(agent, session_id, agent_id)
+                # A roster change changes what the runtime may offer: the
+                # delegate tool is only assembled for a conversation that has
+                # teammates, and a runtime fixes its tool list when it is
+                # built. The bridge retires a session's runtimes whenever it
+                # rewrites a roster (see AgentBridge._retire_session_runtimes),
+                # so the web path has to do the same — otherwise a teammate
+                # invited into a running conversation is unreachable until a
+                # restart. Only a roster change retires: model and permission
+                # are applied on every turn and cost no rebuild.
+                if "members" in updates:
+                    ab._retire_session_runtimes(session_id)
             except Exception as e:
                 logger.debug(f"[WebChannel] session prefs apply-to-agent skipped: {e}")
 
