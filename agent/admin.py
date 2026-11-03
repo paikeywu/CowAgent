@@ -637,12 +637,32 @@ class AgentAdminService:
             # gone Agent: its own orphaned session overrides and its id lingering
             # in other conversations' team rosters. Best-effort — a hiccup here
             # must not undo a deletion that already committed.
+            #
+            # The sweep rewrites rosters, and a runtime fixes its tool list
+            # when it is built: the delegate tool is only assembled for a
+            # conversation that has teammates. A host whose teammate was just
+            # deleted would otherwise keep a runtime still offering a tool
+            # that points at an Agent which no longer exists, so the affected
+            # sessions' runtimes are retired here — the same action the web
+            # roster path and the bridge take whenever a roster changes.
+            touched_sessions = []
             try:
                 from agent.workspace import session_prefs
 
-                session_prefs.forget_agent(agent_id)
+                touched_sessions = session_prefs.forget_agent(agent_id)
             except Exception as e:
                 logger.warning(f"[AgentAdmin] session prefs cleanup after delete failed: {e}")
+
+            for session_id in touched_sessions:
+                try:
+                    from bridge.bridge import Bridge
+
+                    Bridge().get_agent_bridge()._retire_session_runtimes(session_id)
+                except Exception as e:
+                    logger.warning(
+                        f"[AgentAdmin] could not retire runtimes of session "
+                        f"'{session_id}' after deleting '{agent_id}': {e}"
+                    )
 
             # The project store keys its bindings the same way and needs the same
             # sweep: an Agent's own sessions go away with its workspace, so their

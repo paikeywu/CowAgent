@@ -32,7 +32,7 @@ import json
 import os
 import threading
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from common.atomic_write import write_json_atomic
 from common.log import logger
@@ -166,7 +166,7 @@ def forget_session(session_id: str, agent_id: Optional[str] = None) -> None:
             _save(data)
 
 
-def forget_agent(agent_id: str) -> None:
+def forget_agent(agent_id: str) -> List[str]:
     """Erase every trace of a deleted Agent from the prefs store.
 
     Deleting an Agent leaves two kinds of dangling references here that would
@@ -180,10 +180,19 @@ def forget_agent(agent_id: str) -> None:
 
     Both are pruned in one pass; a row left with nothing pinned is dropped
     rather than kept as an empty husk.
+
+    Returns the ids of the sessions whose roster changed, so a caller that
+    keeps live runtimes can retire them. A runtime fixes its tool list when
+    it is built, and the delegate tool is only assembled for a conversation
+    that has teammates: a roster that loses a member while the conversation
+    is already live has to retire what was built under the old roster, or the
+    conversation keeps offering a tool that points at an Agent which no
+    longer exists.
     """
     if not agent_id:
-        return
+        return []
     owner_prefix = f"{agent_id}::"
+    touched: List[str] = []
     with _lock:
         data = _load()
         sessions = data["sessions"]
@@ -192,6 +201,9 @@ def forget_agent(agent_id: str) -> None:
         for key in [k for k in sessions if str(k).startswith(owner_prefix)]:
             sessions.pop(key, None)
             changed = True
+            _, _, session_id = str(key).partition("::")
+            if session_id:
+                touched.append(session_id)
 
         for key, entry in list(sessions.items()):
             if not isinstance(entry, dict) or not entry.get("members"):
@@ -206,9 +218,13 @@ def forget_agent(agent_id: str) -> None:
                 entry.pop("members", None)
                 if not any(entry.get(f) for f in _FIELDS):
                     sessions.pop(key, None)
+            _, _, session_id = str(key).partition("::")
+            if session_id:
+                touched.append(session_id)
 
         if changed:
             _save(data)
+    return touched
 
 
 def resolve_permission(session_id: str, agent_id: Optional[str] = None) -> str:
