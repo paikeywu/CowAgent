@@ -166,6 +166,37 @@ def test_roster_set_before_the_runtime_grows_the_tool_list(web_team):
     )
 
 
+def test_removing_the_last_teammate_takes_the_tool_away(web_team):
+    """The symmetric arm: the roster goes away, so the tool must go too.
+
+    The tool is assembled from the roster when the runtime is built, so a
+    fix that only ever *adds* it would leave a removed teammate reachable.
+    """
+    ab = web_team["agent_bridge"]
+    prefs = web_team["session_prefs"]
+
+    # A team conversation to begin with.
+    prefs.set_prefs(SID, web_team["owner"], members=[web_team["teammate"]])
+    first = ab.get_agent(session_id=SID, agent_id=web_team["owner"])
+    assert "agent_delegate" in _tool_names(first), (
+        "precondition: a team conversation must be offered the delegate tool"
+    )
+
+    # The user takes the teammate back out, while the conversation is live.
+    response = _post_settings({"members": None})
+    assert response["status"] == "success"
+    assert not prefs.get_prefs(SID, web_team["owner"]).get("members"), (
+        "the roster must actually be cleared"
+    )
+
+    second = ab.get_agent(session_id=SID, agent_id=web_team["owner"])
+    assert "agent_delegate" not in _tool_names(second), (
+        "session %r / agent %r: a teammate removed from a live conversation must "
+        "leave the next turn without the delegate tool"
+        % (SID, web_team["owner"])
+    )
+
+
 def test_changing_only_the_model_does_not_retire_the_runtime(web_team):
     """A model or permission change is applied per turn; it must not cost a
     rebuild. Only a roster change changes what the tool list contains."""
