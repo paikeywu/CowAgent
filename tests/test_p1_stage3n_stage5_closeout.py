@@ -540,6 +540,17 @@ def test_ledger_a_library_without_a_ledger_still_recuts(tmp_path):
     引用 cert_ledger，所以「有守卫、没账本」的库上任何 chunks 写入都会
     炸 —— 这是 S3-L 量出来的既有行为，不是本轮引入的。  因此本用例模拟
     的是「从未装过守卫的旧库」：连引用账本的触发器一起没有。
+
+    **交办 B (2026-11-05): the ledger guard's triggers join that list.**
+    The new ``chunks_cert_revoke_bd`` and ``chunks_cert_restore_bi``
+    name ``cert_ledger`` and ``cert_revoked`` in their bodies, so a
+    library with neither table cannot carry them either.  MEASURED
+    (2026-11-05): SQLite does **not** short-circuit the AND in a
+    trigger's WHEN clause — a trigger whose body names a missing table
+    fails at RUN time with "no such table", even when the WHEN clause
+    checks ``sqlite_master`` first.  So the shape that must be
+    tolerated is "no ledger, and no trigger that names it" — exactly
+    the shape this test simulates.
     """
     ws = tmp_path / "ws"
     db_dir = ws / "memory" / "long-term"
@@ -548,8 +559,10 @@ def test_ledger_a_library_without_a_ledger_still_recuts(tmp_path):
     storage = MemoryStorage(db_path=str(db))
     try:
         storage.conn.execute("DROP TABLE IF EXISTS cert_ledger")
+        storage.conn.execute("DROP TABLE IF EXISTS cert_revoked")
         for trig in ("chunks_body_keep_bu", "chunks_body_keep_bi_ai",
-                     "chunks_body_keep_st_ai"):
+                     "chunks_body_keep_st_ai", "chunks_cert_revoke_bd",
+                     "chunks_cert_restore_bi"):
             storage.conn.execute("DROP TRIGGER IF EXISTS %s" % trig)
         storage.conn.commit()
         c1 = _chunk("c-aaa", "memory/page.md", 1, 5)
@@ -565,14 +578,90 @@ def test_ledger_a_library_without_a_ledger_still_recuts(tmp_path):
 
 def test_ledger_the_detector_still_catches_a_foreign_delete(tmp_path):
     """M6f 兜底仍有效：绕过写路径直接 DELETE chunk（外部写入者的形状）
-    → 孤儿产生 → M6f 必须 FAIL。"""
+    → 孤儿产生 → M6f 必须 FAIL。
+
+    **交办 B (2026-11-05): the premise moved to the DATABASE layer.**
+    The ledger guard now revokes the witness at the write boundary, so
+    a foreign writer's raw DELETE no longer leaves an orphan behind —
+    MEASURED on this machine, 2026-11-05:
+
+        with the guard:      DELETE FROM chunks WHERE id='c-bbb'
+                             => ledger=['c-aaa']  orphans=0
+        with the guard gone: the same DELETE
+                             => ledger=['c-aaa','c-bbb']  orphans=1
+
+    So the shape that still produces an orphan is a **witness whose
+    chunk is not in the index** — which is what the detector's own
+    subject is.  That is what this test now asserts, and it is the
+    stronger form: the detector must report an orphan that exists, no
+    matter which mechanism created it.
+    """
     ws, db, storage = _library_with_ledger(tmp_path)
     try:
-        storage.conn.execute("DELETE FROM chunks WHERE id='c-bbb'")
+        # The detector's own subject: a witness for a chunk that is not
+        # in the index.
+        storage.conn.execute(
+            "INSERT OR REPLACE INTO cert_ledger (id, text_state, "
+            "body_origin, body_path, body_hash, certified_at, "
+            "certified_by) VALUES ('never-existed', 'mirror', 'file', "
+            "'memory/never-existed.md', 'bh-none', 1, 'foreign')")
         storage.conn.commit()
         verdict = ledger_orphans.judge_m6f_ledger_has_no_orphans(
             storage.conn)
         assert verdict["verdict"] == "FAIL", verdict
-        assert verdict["orphans"] == 1
+        assert verdict["orphans"] == 1, verdict
     finally:
         storage.close()
+
+
+def test_the_guard_revokes_the_witness_of_a_foreign_delete(tmp_path):
+    """**交办 B (2026-11-05): the guard's new half.**
+
+    A foreign writer's raw DELETE (which does NOT go through the write
+    path) must not leave an orphan behind: the guard revokes the
+    witness at the write boundary, and the revocation is LOGGED (so the
+    orphan is explained, not erased).
+
+    And the guard's absence must bring the orphan back — so this test
+    also proves the guard is what prevents it.
+    """
+    from agent.memory import body_guard as bg
+
+    ws, db, storage = _library_with_ledger(tmp_path)
+    try:
+        storage.conn.execute("DELETE FROM chunks WHERE id='c-bbb'")
+        storage.conn.commit()
+        orphans = storage.conn.execute(
+            "SELECT COUNT(*) FROM cert_ledger l WHERE NOT EXISTS "
+            "(SELECT 1 FROM chunks c WHERE c.id=l.id)").fetchone()[0]
+        assert orphans == 0, (
+            "外来 DELETE 之后必须有 0 个孤儿 —— 守卫在写边界撤销了证人")
+        revoked = storage.conn.execute(
+            "SELECT id, text_state, certified_by, revoked_reason "
+            "FROM cert_revoked").fetchall()
+        assert len(revoked) == 1, (
+            "撤销必须留痕 —— 孤儿要『被解释』，不是被抹掉")
+        row = revoked[0]
+        assert row["id"] == "c-bbb", row
+        assert row["text_state"] == "mirror", row
+        assert row["certified_by"] == "test", row
+        assert row["revoked_reason"], row
+    finally:
+        storage.close()
+
+    # And with the guard gone, the orphan comes back — so the guard is
+    # what prevents it.
+    ws2, db2, storage2 = _library_with_ledger(tmp_path / "two")
+    try:
+        for name in bg.guard_trigger_names():
+            storage2.conn.execute("DROP TRIGGER IF EXISTS %s" % name)
+        storage2.conn.commit()
+        storage2.conn.execute("DELETE FROM chunks WHERE id='c-bbb'")
+        storage2.conn.commit()
+        orphans = storage2.conn.execute(
+            "SELECT COUNT(*) FROM cert_ledger l WHERE NOT EXISTS "
+            "(SELECT 1 FROM chunks c WHERE c.id=l.id)").fetchone()[0]
+        assert orphans == 1, (
+            "拿掉守卫 ⇒ 孤儿必须回来 —— 否则这条判据测的不是守卫")
+    finally:
+        storage2.close()

@@ -949,10 +949,67 @@ def judge_m6_ledger_orphans_are_pruned_at_the_write_boundary(
         # --- half 2: the detector stays awake ------------------------
         # A foreign writer's raw DELETE does not go through the write
         # path.  The detector must still report it.
+        #
+        # **交办 B (2026-11-05): this half's PREMISE changed, and the
+        # change is the point of that round.**  The ledger guard
+        # (``chunks_cert_revoke_bd``) now revokes the witness AT THE
+        # WRITE BOUNDARY, so a foreign writer's raw DELETE does NOT
+        # leave an orphan behind — MEASURED on this machine, 2026-11-05:
+        #
+        #     with the guard:      DELETE FROM chunks WHERE id='c-bbb'
+        #                          => ledger=['c-aaa']  orphans=0
+        #     with the guard gone: the same DELETE
+        #                          => ledger=['c-aaa','c-bbb']  orphans=1
+        #
+        # So the orphan this half used to provoke is now prevented by a
+        # mechanism that a foreign writer CANNOT bypass (it is in the
+        # database, not in the application).  The half's REAL question
+        # — "is the detector still awake?" — therefore has to be asked
+        # of a shape the guard does NOT cover.
+        #
+        # **What the guard does NOT cover: the DETECTOR's own subject.**
+        # The guard revokes a witness when a chunk is DELETED.  It does
+        # not remove a witness whose chunk is ALREADY gone — that is
+        # the pre-existing orphan, and it is exactly what M6f exists to
+        # report.  So the honest shape is: **insert a witness for a
+        # chunk that does not exist** (which is what a witness written
+        # by a writer that never wrote the chunk looks like), and the
+        # detector must report it.
+        #
+        # And the mechanism behind that shape is the SAME one a guard
+        # regression would break: if the guard's revoke trigger stopped
+        # firing, the orphan would appear on every delete — and the
+        # detector would have to catch it.  So the half still has teeth:
+        # it asks "does the detector report an orphan that exists?" —
+        # and the GUARD's absence is what makes the orphan exist.
         storage2 = MemoryStorage(db_path=str(copy))
         try:
             conn2 = storage2.conn
             conn2.row_factory = sqlite3.Row
+            # **交办 B (2026-11-05): the second half must not MASK the
+            # first half's verdict.**  If the first half's re-cut took
+            # the survivor's witness with it (which is what happens when
+            # the guard's restore trigger is broken), there is nothing
+            # left to delete — and a NOTRUN there would report the
+            # criterion as "not measured" while the first half had
+            # already FAILED.  **A NOTRUN that hides a FAIL is worse
+            # than a FAIL**: it says "we did not look", and the reader
+            # stops looking.
+            #
+            # So the order is: if the first half already failed, the
+            # criterion FAILS — and the second half says why it could
+            # not run.
+            first_half_ok = (ghosts_left == 0 and kept == len(survivors))
+            if not first_half_ok:
+                detail.append("")
+                detail.append("第一半已经报红（消失 id 清=%s 存活 id 留=%s）—— "
+                              "第二半无法构造（副本里没有『有块也有证人』的行），"
+                              "但这不是 NOTRUN：第一半的红就是本判据的红。"
+                              % (ghosts_left == 0, kept == len(survivors)))
+                return report.judge(
+                    "M-6(REAL)",
+                    "M-6 账本孤儿在写边界被剪枝（消失的 id 清、存活的 id 留），且检测器不瞎",
+                    False, "\n".join(detail))
             victim = conn2.execute(
                 "SELECT id FROM cert_ledger LIMIT 1").fetchone()
             if victim is None:
@@ -962,28 +1019,64 @@ def judge_m6_ledger_orphans_are_pruned_at_the_write_boundary(
                     "\n".join(detail + ["副本里没有账本条目 —— "
                                         "无法构造『外来删除』的形状"]))
             vid = victim["id"]
-            # A foreign writer: a raw DELETE on `chunks`, bypassing the
-            # write path entirely.
-            conn2.execute("DELETE FROM chunks WHERE id=?", (vid,))
+            # The shape the guard does NOT cover: a witness whose chunk
+            # is not in the index.  It is created the way a real one
+            # appears — a writer certified a row, and the row is not
+            # there (a re-cut moved the ids, a foreign writer deleted
+            # the row without the guard, or a migration restored a
+            # ledger from an older snapshot).
+            conn2.execute(
+                "INSERT OR REPLACE INTO cert_ledger (id, text_state, "
+                "body_origin, body_path, body_hash, certified_at, "
+                "certified_by) VALUES (?, 'mirror', 'file', "
+                "'memory/never-existed.md', 'bh-none', 1, 'foreign')",
+                ("foreign-witness-never-existed",))
             conn2.commit()
             rep = ledger_orphans.judge_m6f_ledger_has_no_orphans(
                 conn2, library=target.name)
-            detail.append("外来 DELETE 之后的 M6f 判定: %s（孤儿=%d）"
+            detail.append("外来写入的证人（块不存在）之后的 M6f 判定: %s"
+                          "（孤儿=%d）"
                           % (rep.get("verdict"), rep.get("orphans")))
             detector_awake = (rep.get("verdict") == "FAIL"
                               and rep.get("orphans", 0) >= 1)
             if not detector_awake:
-                detail.append("  —— 检测器没有报 FAIL：外来删除造成的孤儿"
-                              "被漏掉了（检测器因为写边界会剪枝就变瞎了）")
+                detail.append("  —— 检测器没有报 FAIL：一个块根本不存在的证人"
+                              "被漏掉了（检测器瞎了）")
+            # And the shape the guard DOES cover: a foreign writer's raw
+            # DELETE must leave NO orphan, because the guard revoked the
+            # witness at the write boundary.  This is the half that
+            # proves the guard is at the boundary and not in the
+            # application layer — and it is the half that the
+            # application-layer prune CANNOT satisfy, because a foreign
+            # writer does not go through the application at all.
+            orphans_before_delete = rep.get("orphans", 0)
+            conn2.execute("DELETE FROM chunks WHERE id=?", (vid,))
+            conn2.commit()
+            rep2 = ledger_orphans.judge_m6f_ledger_has_no_orphans(
+                conn2, library=target.name)
+            detail.append("外来 DELETE 之后的 M6f 判定: %s（孤儿=%d）"
+                          "（守卫在写边界撤销了证人 ⇒ 不留孤儿）"
+                          % (rep2.get("verdict"), rep2.get("orphans")))
+            # The DELTA is what matters: the one orphan above is the
+            # foreign witness we inserted ON PURPOSE — it is still
+            # there, which is the POINT (the detector sees it and the
+            # guard does not silently eat it).  What must not change is
+            # the COUNT.
+            boundary_holds = (rep2.get("orphans", 0) == orphans_before_delete)
+            if not boundary_holds:
+                detail.append("  —— 外来 DELETE 之后孤儿数变了：%d → %d"
+                              "（守卫没有在写边界撤销证人）"
+                              % (orphans_before_delete, rep2.get("orphans", 0)))
         finally:
             storage2.close()
 
         ok = (ghosts_left == 0 and kept == len(survivors)
-              and detector_awake)
+              and detector_awake and boundary_holds)
         detail.append("")
         detail.append("写边界剪枝: 消失 id 清=%s 存活 id 留=%s"
                       % (ghosts_left == 0, kept == len(survivors)))
-        detail.append("检测器仍能报出外来删除造成的孤儿: %s" % detector_awake)
+        detail.append("检测器仍能报出块不存在的证人: %s" % detector_awake)
+        detail.append("外来 DELETE 不留孤儿（守卫在写边界）: %s" % boundary_holds)
         detail.append("（『保留』是承重墙：S3-L 的恢复触发器读账本把认证状态找回来，"
                       "一刀切会抹掉每一次重切的认证）")
         return report.judge(

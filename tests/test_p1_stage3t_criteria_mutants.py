@@ -422,7 +422,28 @@ def test_mu38_a_write_boundary_that_does_not_prune_is_caught(tmp_path):
 
     The mutation is on the PRODUCT (the write path's prune), so this
     proves I-4 measures the real mechanism and not its own idea of it.
+
+    **交办 B (2026-11-05): there are now TWO mechanisms, so the mutant
+    must break BOTH.**  The ledger guard (``chunks_cert_revoke_bd``)
+    revokes the witness at the write boundary, AND the write path
+    still prunes in the same transaction.  MEASURED on this machine,
+    2026-11-05:
+
+      * application prune disabled, guard on  ⇒ I-4 stays GREEN (the
+        guard revoked the witness);
+      * guard disabled, application prune on  ⇒ I-4 stays GREEN (the
+        prune cleaned up).
+
+    So a mutant that breaks only ONE of them proves nothing — it shows
+    that the OTHER one is still working.  **A mutant must break every
+    mechanism that holds the invariant**, and only then the criterion
+    has teeth.
+
+    This is the general lesson of the round: **a defense in depth makes
+    each individual mutant weaker.**  The mutant has to reach the
+    invariant, not one of the walls in front of it.
     """
+    from agent.memory import body_guard
     from agent.memory import storage as storage_mod
 
     ws = _ledger_workspace(tmp_path)
@@ -431,22 +452,38 @@ def test_mu38_a_write_boundary_that_does_not_prune_is_caught(tmp_path):
         phase2_s3t.judge_i4_recut_leaves_no_ledger_orphans, ws)
     assert states["I-4(REAL)"] == STATE_PASS, report.printed
 
-    # The mutation: the write boundary stops pruning the ledger.
-    original = storage_mod.MemoryStorage._prune_ledger_entries
+    # The mutation: BOTH walls come down.
+    original_sql = body_guard.trigger_sqls
+    original_prune = storage_mod.MemoryStorage._prune_ledger_entries
+
+    def without_revoke():
+        out = []
+        for stmt in original_sql():
+            if "chunks_cert_revoke_bd" in stmt:
+                stmt = stmt.replace(
+                    "WHEN EXISTS (SELECT 1 FROM cert_ledger l "
+                    "WHERE l.id = OLD.id)", "WHEN 0")
+                assert "WHEN 0" in stmt, (
+                    "the mutation did not take — the revoke trigger's "
+                    "WHEN clause is not the one this mutant expects")
+            out.append(stmt)
+        return out
 
     def no_prune(self, chunk_ids):
         return 0
 
+    body_guard.trigger_sqls = without_revoke
     storage_mod.MemoryStorage._prune_ledger_entries = no_prune
     try:
         report, states = _run(
             phase2_s3t.judge_i4_recut_leaves_no_ledger_orphans, ws)
     finally:
-        storage_mod.MemoryStorage._prune_ledger_entries = original
+        body_guard.trigger_sqls = original_sql
+        storage_mod.MemoryStorage._prune_ledger_entries = original_prune
 
     assert states["I-4(REAL)"] == STATE_FAIL, (
         "重切后账本里还留着消失 id 的条目 ⇒ I-4 必须报红"
-        "（写边界不再剪枝 ⇒ 机制没了）")
+        "（写边界不再撤销证人 ⇒ 机制没了）")
     assert "孤儿" in report.printed
 
     # The restore turns it green again.

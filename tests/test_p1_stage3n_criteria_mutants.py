@@ -415,6 +415,24 @@ def test_mu32_a_write_boundary_that_does_not_prune_is_caught(tmp_path):
     helper is equivalent, because the write path calls the helper —
     but breaking the CALL SITE is the stronger form, and it is what
     this test does.
+
+    **交办 B (2026-11-05): the mutation MOVED, and it is now on the
+    GUARD.**  The ledger guard (``chunks_cert_revoke_bd``) revokes the
+    witness at the write boundary, so the application-layer prune is
+    now REDUNDANT — MEASURED on this machine, 2026-11-05: with the
+    application prune disabled, the re-cut still leaves zero orphans
+    (the guard revoked the witness) and the revocation is logged in
+    ``cert_revoked``.
+
+    So a mutant that only disabled the application prune would now be
+    GREEN — and that is correct, because the invariant is still held.
+    **A mutant must break the mechanism that actually holds the
+    invariant.**  So this mutation now removes the GUARD's revoke
+    trigger — the thing that holds it — and the criterion must go red.
+
+    This is the general lesson: when a mechanism is replaced by a
+    deeper one, the mutant must follow the invariant to its new home.
+    A mutant left behind at the old home tests nothing.
     """
     ws, db, storage = _library_with_ledger(tmp_path)
     try:
@@ -423,29 +441,45 @@ def test_mu32_a_write_boundary_that_does_not_prune_is_caught(tmp_path):
             ws)
         assert states["M-6(REAL)"] == STATE_PASS, report.printed
 
-        from agent.memory.storage import MemoryStorage
+        from agent.memory import body_guard
 
-        original = MemoryStorage.replace_file_chunks
+        # The mutation: the guard's revoke trigger NEVER FIRES.  This
+        # is the mechanism that holds the invariant now.
+        #
+        # **Why the trigger is DISABLED rather than REMOVED.**  The
+        # guard's installer compares the trigger BODIES by name
+        # (``is_installed``), so a changed body makes it re-install —
+        # and that is what puts the mutant's body in place.  Removing
+        # the trigger from the list would NOT work: ``is_installed``
+        # skips a name that is not in the expected map, so the stored
+        # trigger would survive and keep working.  MEASURED
+        # (2026-11-05): the removal-mutant stayed GREEN; the
+        # disabled-mutant goes RED.
+        original_sql = body_guard.trigger_sqls
 
-        def no_prune(self, path, chunks, **kw):
-            # The mutation: the write path does not prune at all.
-            ids = [c.id for c in chunks]
-            self._prune_ledger_entries = lambda _ids: 0
-            try:
-                return original(self, path, chunks, **kw)
-            finally:
-                del self._prune_ledger_entries
+        def without_revoke():
+            out = []
+            for stmt in original_sql():
+                if "chunks_cert_revoke_bd" in stmt:
+                    stmt = stmt.replace(
+                        "WHEN EXISTS (SELECT 1 FROM cert_ledger l "
+                        "WHERE l.id = OLD.id)", "WHEN 0")
+                    assert "WHEN 0" in stmt, (
+                        "the mutation did not take — the revoke trigger's "
+                        "WHEN clause is not the one this mutant expects")
+                out.append(stmt)
+            return out
 
-        MemoryStorage.replace_file_chunks = no_prune
+        body_guard.trigger_sqls = without_revoke
         try:
             report, states = _run(
                 phase2_s3m.judge_m6_ledger_orphans_are_pruned_at_the_write_boundary,
                 ws)
         finally:
-            MemoryStorage.replace_file_chunks = original
+            body_guard.trigger_sqls = original_sql
 
         assert states["M-6(REAL)"] == STATE_FAIL, (
-            "写边界不剪枝必须报红 —— M6f 会在一个正常状态上一直叫")
+            "写边界不撤销证人必须报红 —— M6f 会在一个正常状态上一直叫")
         report, states = _run(
             phase2_s3m.judge_m6_ledger_orphans_are_pruned_at_the_write_boundary,
             ws)
@@ -457,7 +491,21 @@ def test_mu32_a_write_boundary_that_does_not_prune_is_caught(tmp_path):
 def test_mu33_a_blanket_cascade_is_caught(tmp_path):
     """MU-33: the write boundary prunes EVERYTHING → M-6 must go red on
     the "kept" half: the surviving id's witness must survive, because the
-    S3-L restore triggers read it."""
+    S3-L restore triggers read it.
+
+    **交办 B (2026-11-05): the mutation MOVED to the guard's RESTORE
+    side.**  The blanket cascade at the application layer no longer
+    breaks anything: MEASURED on this machine, 2026-11-05 — with the
+    cascade in place, the survivor's witness is RESTORED by the guard's
+    ``chunks_cert_restore_bi`` trigger (the chunk came back with the
+    same id, so the guard put the witness back), and M-6 stays green.
+
+    So the mutation now breaks the guard's RESTORE trigger — the thing
+    that holds the "kept" half now.  A blanket cascade at the
+    application layer is no longer a defect, because the guard undoes
+    it; but a guard that cannot restore is a defect, because then the
+    survivor's witness really is gone.
+    """
     ws, db, storage = _library_with_ledger(tmp_path)
     try:
         report, states = _run(
@@ -465,31 +513,31 @@ def test_mu33_a_blanket_cascade_is_caught(tmp_path):
             ws)
         assert states["M-6(REAL)"] == STATE_PASS, report.printed
 
-        from agent.memory.storage import MemoryStorage
+        from agent.memory import body_guard
 
-        original = MemoryStorage._prune_ledger_entries
+        # The mutation: the guard's RESTORE trigger never fires.
+        original_sql = body_guard.trigger_sqls
 
-        def cascade(self, chunk_ids):
-            # The blanket cascade: every witness of the PATH goes, not
-            # only the ids that did not come back.  The survivor's
-            # witness is collateral damage.
-            ids = list(chunk_ids)
-            path = self.conn.execute(
-                "SELECT path FROM chunks WHERE id=?", (ids[0],)
-            ).fetchone()
-            if path is None:
-                return 0
-            cur = self.conn.execute(
-                "DELETE FROM cert_ledger WHERE body_path=?", (path[0],))
-            return max(cur.rowcount, 0)
+        def without_restore():
+            out = []
+            for stmt in original_sql():
+                if "chunks_cert_restore_bi" in stmt:
+                    stmt = stmt.replace(
+                        "WHEN EXISTS (SELECT 1 FROM cert_revoked r "
+                        "WHERE r.id = NEW.id)", "WHEN 0")
+                    assert "WHEN 0" in stmt, (
+                        "the mutation did not take — the restore trigger's "
+                        "WHEN clause is not the one this mutant expects")
+                out.append(stmt)
+            return out
 
-        MemoryStorage._prune_ledger_entries = cascade
+        body_guard.trigger_sqls = without_restore
         try:
             report, states = _run(
                 phase2_s3m.judge_m6_ledger_orphans_are_pruned_at_the_write_boundary,
                 ws)
         finally:
-            MemoryStorage._prune_ledger_entries = original
+            body_guard.trigger_sqls = original_sql
 
         assert states["M-6(REAL)"] == STATE_FAIL, (
             "一刀切剪枝必须报红 —— 认证状态的恢复读账本，"

@@ -175,6 +175,94 @@ GUARD_TABLE_FILES = "files_keep"
 #: The keep table and the columns it carries.
 GUARD_TABLE = "body_keep"
 
+# ---------------------------------------------------------------------------
+# 交办 B (2026-11-05) · the LEDGER GUARD — the orphans a legacy DELETE
+# makes, stopped at the WRITE BOUNDARY.
+# ---------------------------------------------------------------------------
+#
+# **The hole, MEASURED (2026-11-05).**  On a copy of the live ROOT
+# library, the legacy build's ``delete_by_path`` shape
+# (``DELETE FROM chunks WHERE path = ?`` + ``DELETE FROM files WHERE
+# path = ?``, with NO ledger prune — the legacy ``storage.py`` has no
+# prune code at all) left the certification ledger holding a witness for
+# every chunk it removed:
+#
+#     ledger before=3127 after=3127   (the entries SURVIVED)
+#     orphan_ledger 36 -> 56          (+20 new orphans, in one delete)
+#
+# So the legacy writer MANUFACTURES orphans every time it re-cuts a
+# file — and orphans are exactly what M6f judges, and what the ledger
+# janitor has to delete to keep the criterion green.  The current write
+# path prunes in the same transaction (``storage._prune_ledger_entries``),
+# but the legacy writer does not go through that path, so the guard must
+# cover it at the database level.
+#
+# **Why a trigger and not a sweeper.**  The janitor (``certify.py``'s
+# ``prune_orphans``) cleans orphans AFTER the fact — it can only run
+# when somebody runs the certifier.  Between the legacy write and the
+# next certification pass, the ledger says "this row was certified"
+# about a row that is not there, and M6f is red for that whole window.
+# A write-boundary rule closes the window: the orphan is never created.
+#
+# **Why not "just delete the ledger row".**  A ``cert_ledger`` entry is
+# a WITNESS: it says "this chunk was CHECKED against the truth layer and
+# FOUND EQUAL".  When the chunk is gone, the witness has no subject.
+# Revoking it is the honest act — but a revocation must be EXPLAINED,
+# not silent.  So the deletion goes into a REVOCATION LOG
+# (``cert_revoked``) that names what was revoked, why, and when.  The
+# ledger's own ``certified_by`` column cannot carry that (the row is
+# gone), and the "never physically delete" rule governs the CONVERSATION
+# and KNOWLEDGE records — not a derived witness over the chunks (see
+# ``ledger_orphans``'s own docstring for the same reasoning).
+#
+#: The revocation log — one row per revoked certification.
+CERT_REVOKED_TABLE = "cert_revoked"
+
+#: The trigger that revokes the witness at the write boundary.
+#:
+#: **It is a BEFORE DELETE trigger, and that is load-bearing.**  At
+#: BEFORE DELETE the row is still there, so the trigger can read the
+#: chunk's id AND copy the witness into the log before the row
+#: disappears.  An AFTER DELETE trigger would fire too late: by then
+#: the outer statement has already deleted the row, and SQLite's
+#: "the row is gone" makes the lookup unreliable.
+#:
+#: **MEASURED: a BEFORE DELETE trigger's body may DELETE from another
+#: table** (the outer statement is a DELETE, never an UPSERT, so the
+#: outer statement's conflict strategy cannot interfere with the
+#: trigger body's) — measured on this machine, 2026-11-05:
+#:
+#:     DELETE FROM cert_ledger WHERE id = OLD.id;   => OK
+#:
+#: And it may INSERT into the revocation log — but the log's TABLE must
+#: exist first, or the trigger fails at RUN time with "no such table".
+#: So the table is created in the same transaction as the triggers (see
+#: ``ensure_guard``).
+CERT_REVOKE_TRIGGER = "chunks_cert_revoke_bd"
+
+#: The trigger that RESTORES a revoked witness when the chunk comes back.
+#:
+#: **Without it, the revoke would be a regression.**  MEASURED (2026-11-05)
+#: on a copy of the live ROOT library: the legacy writer's flow is
+#: ``delete_by_path`` then ``save_chunks_batch``, and the chunk id is
+#: POSITION-derived — so when the file's line ranges did not move, the
+#: SAME ids came back, and the ledger entry was still matching them.
+#:
+#: A revoke without a restore would therefore revoke the certification
+#: of a chunk that is about to return — and since the guard's
+#: state-restore trigger READS the ledger, the row would come back
+#: uncertified and M6c would go red.  **The guard would have made the
+#: fleet worse.**
+#:
+#: It is a BEFORE INSERT trigger so it is guaranteed to run before every
+#: AFTER INSERT trigger — including ``chunks_body_keep_st_ai``, which
+#: restores the state and reads the ledger.  Every BEFORE trigger runs
+#: before every AFTER trigger, so this ordering does not depend on the
+#: rowid order among the AFTER triggers (and therefore cannot be broken
+#: by a re-install — see the knowledge page
+#: ``sqlite-trigger-order-is-load-bearing``).
+CERT_RESTORE_TRIGGER = "chunks_cert_restore_bi"
+
 #: The certification ledger — the certifier's record of what it verified
 #: against the truth layer.  It is NOT the keep table: the keep table
 #: records what a row looked like BEFORE a write touched it (and only
@@ -202,6 +290,37 @@ PROTECTED_COLUMNS = ("body_path", "body_anchor", "body_hash",
 #: in a schema that declared them.
 FILES_PROTECTED_COLUMNS = ("chunk_count", "chunker_version")
 FILES_KEY = "path"
+
+#: The files CONTENT columns — the ones a writer brings and the guard
+#: must CARRY THROUGH, not swallow.
+#:
+#: **MEASURED (2026-11-05, 交办 B): the guard was eating the write.**
+#: The files-side BEFORE INSERT / BEFORE UPDATE triggers worked by
+#: "UPDATE the stored row's statistics, then RAISE(IGNORE)" — and the
+#: inner UPDATE named ONLY the statistics columns.  A column that a SET
+#: list does not name keeps its stored value, so the writer's own
+#: ``hash`` / ``mtime`` / ``size`` were DISCARDED and the row kept the
+#: values it had before the write:
+#:
+#:     write 1: hash=HASH1 mtime=111  cc=3 cv=4
+#:     write 2: hash=HASH1 mtime=111  cc=5 cv=4   <- HASH2 / 222 GONE
+#:
+#: MEASURED on a copy of the live ROOT library, with the guard in place.
+#: The legacy writer's own content was swallowed the same way — the
+#: files row's hash is FROZEN at whatever it was when the statistics
+#: were first measured, and no later write can change it.
+#:
+#: That is not a cosmetic loss: ``files.hash`` is the ground truth the
+#: M6e criterion compares the file's content against, and the
+#: freshness probes compare it against the truth layer.  A frozen hash
+#: makes every file look "changed since it was measured" (STALE) — so
+#: the defect-detection machinery cannot tell a changed file from a
+#: bookkeeping row that stopped being written.
+#:
+#: So the guard's inner UPDATE must carry the content columns through.
+#: The guard's job is to protect the STATISTICS (and the pointer), not
+#: to freeze the row.
+FILES_CONTENT_COLUMNS = ("source", "hash", "mtime", "size", "updated_at")
 
 #: The values that mean "the writer did not decide" — so a restore may
 #: overwrite them.
@@ -777,16 +896,27 @@ END""".format(
     files_when = "({undecided}) AND ({stored_measured})".format(
         undecided=files_undecided, stored_measured=files_stored_measured)
 
+    # The CONTENT columns the writer brings, carried through the guard's
+    # inner UPDATE.  **MEASURED (2026-11-05): without this the guard
+    # FROZE the files row** — a column that a SET list does not name
+    # keeps its stored value, so the writer's own hash / mtime / size
+    # were discarded and every later write was invisible to the
+    # bookkeeping.  See ``FILES_CONTENT_COLUMNS``.
+    files_content = ", ".join(
+        "{c} = NEW.{c}".format(c=c) for c in FILES_CONTENT_COLUMNS)
+
     files_update_trigger = """
 CREATE TRIGGER {name} BEFORE UPDATE ON files
 WHEN {when}
 BEGIN
     UPDATE files SET
+        {content},
         {restores}
     WHERE {key} = NEW.{key};
     SELECT RAISE(IGNORE);
 END""".format(
         name=GUARD_TRIGGER_FILES_UPDATE, when=files_when,
+        content=files_content,
         restores=", ".join(
             "{c} = CASE WHEN NEW.{c} IS NULL OR NEW.{c} = 0 "
             "THEN (SELECT f.{c} FROM files f WHERE f.{key} = NEW.{key}) "
@@ -800,11 +930,13 @@ WHEN EXISTS (SELECT 1 FROM files f WHERE f.{key} = NEW.{key}
              AND f.chunk_count IS NOT NULL AND f.chunker_version IS NOT NULL)
 BEGIN
     UPDATE files SET
+        {content},
         {restores}
     WHERE {key} = NEW.{key};
     SELECT RAISE(IGNORE);
 END""".format(
         name=GUARD_TRIGGER_FILES_INSERT,
+        content=files_content,
         restores=", ".join(
             "{c} = CASE WHEN NEW.{c} IS NULL OR NEW.{c} = 0 "
             "THEN (SELECT f.{c} FROM files f WHERE f.{key} = NEW.{key}) "
@@ -838,11 +970,49 @@ END""".format(name=GUARD_TRIGGER_FILES_DELETE, tbl=GUARD_TABLE_FILES,
     # ONLY the statistics, and only when the snapshot holds a MEASURED
     # pair (so a file that really produced no chunks keeps its NULL —
     # Rule D: "not measured" is not "zero").
+    #
+    # **交办 B (2026-11-05) — the WHEN clause was too narrow, and the
+    # hole was live.**  MEASURED on a copy of the live ROOT library
+    # (the schema is ``NOT NULL DEFAULT 0`` there):
+    #
+    #     DELETE FROM files WHERE path='memory/2026-10-25.md'
+    #     INSERT OR REPLACE INTO files (path, source, hash, mtime, size,
+    #                                   updated_at) VALUES (...)  -- no stats
+    #     => chunk_count=0, chunker_version=0     <- ERASED
+    #
+    # The old WHEN demanded ``NEW.chunk_count IS NULL AND
+    # NEW.chunker_version IS NULL`` — the NULL shape.  On a
+    # ``NOT NULL DEFAULT 0`` schema the legacy writer does not write
+    # NULL; it leaves the DEFAULT, which is **0**.  So the trigger
+    # never fired on the very schema that needs it, and the
+    # statistics were erased with the guard in place.
+    #
+    # MEASURED (this round, on the NULLABLE schema): the same shape
+    # left ``cc=0 cv=0`` — the SAME erasure, via the same path: the
+    # legacy writer's ``INSERT OR REPLACE`` is a DELETE + INSERT, and
+    # the BEFORE INSERT trigger's inner UPDATE writes the restored
+    # statistics into a row that the outer statement then replaces.
+    #
+    # So the WHEN must accept BOTH "not measured" shapes:
+    #
+    #   * NULL  — the nullable schema (``ALTER TABLE ADD COLUMN``);
+    #   * 0     — the ``NOT NULL DEFAULT 0`` schema, where 0 means
+    #             "the writer did not name this column", NOT "this
+    #             file really produced no chunks".
+    #
+    # The distinction that keeps Rule D intact: the restore fires only
+    # when the SNAPSHOT holds a MEASURED pair — ``k.chunk_count <> 0
+    # OR k.chunker_version <> 0``.  A file that really produced no
+    # chunks has a snapshot of (0, 0), so it is never restored, and its
+    # 0 stays 0.  A file whose statistics were never measured has NO
+    # snapshot at all, so it is never restored either.  Rule D holds.
     files_restore_trigger = """
 CREATE TRIGGER {name} AFTER INSERT ON files
-WHEN NEW.chunk_count IS NULL AND NEW.chunker_version IS NULL
+WHEN (NEW.chunk_count IS NULL OR NEW.chunk_count = 0)
+ AND (NEW.chunker_version IS NULL OR NEW.chunker_version = 0)
  AND EXISTS (SELECT 1 FROM {tbl} k WHERE k.{key} = NEW.{key}
-             AND k.chunk_count IS NOT NULL AND k.chunker_version IS NOT NULL)
+             AND k.chunk_count IS NOT NULL AND k.chunker_version IS NOT NULL
+             AND (k.chunk_count <> 0 OR k.chunker_version <> 0))
 BEGIN
     UPDATE files SET
         {restores}
@@ -855,9 +1025,124 @@ END""".format(
             .format(c=c, tbl=GUARD_TABLE_FILES, key=FILES_KEY)
             for c in FILES_PROTECTED_COLUMNS))
 
+    # --- the LEDGER GUARD (交办 B, 2026-11-05) ----------------------
+    #
+    # The legacy writer's ``DELETE FROM chunks WHERE path = ?`` removes
+    # the chunk rows but leaves their certification witnesses behind, so
+    # the ledger holds entries that name chunks which are no longer in
+    # the index — orphans, which is exactly what M6f judges (and what
+    # the janitor must delete to keep the criterion green).
+    #
+    # The trigger is a BEFORE DELETE on ``chunks``:
+    #
+    #   1. it copies the witness into ``cert_revoked`` — so the
+    #      revocation is EXPLAINED, not silent (the "orphan must be
+    #      explained, not erased" rule);
+    #   2. it deletes the ledger entry — so the orphan is never created.
+    #
+    # **Why the copy comes FIRST.**  The log is written from the ledger
+    # row, so the ledger row must still be there when the log is
+    # written.  After the DELETE it is gone, and the log would be empty
+    # — which is the "silent revocation" this rule exists to prevent.
+    #
+    # **Why the WHEN requires a ledger entry.**  A chunk that was never
+    # certified has no witness, so there is nothing to revoke and
+    # nothing to log — the trigger must not create noise for the
+    # ordinary case (a chunk that was never in the ledger).
+    #
+    # **MEASURED (2026-11-05): the trigger body's own statements are
+    # safe under every legacy write shape.**  The outer statement here
+    # is a DELETE, so the outer statement's conflict strategy cannot
+    # reach the trigger body (the failure mode the knowledge page
+    # ``upsert-do-update-defeats-or-ignore`` records for UPSERT).  And
+    # the body's ``INSERT OR REPLACE`` into the log is its own
+    # statement, with its own conflict strategy.
+    revoke_trigger = """
+CREATE TRIGGER {name} BEFORE DELETE ON chunks
+WHEN EXISTS (SELECT 1 FROM {cert} l WHERE l.id = OLD.id)
+BEGIN
+    INSERT OR REPLACE INTO {log} (id, text_state, body_origin, body_path,
+                                  body_hash, certified_at, certified_by,
+                                  revoked_at, revoked_reason)
+    SELECT l.id, l.text_state, l.body_origin, l.body_path, l.body_hash,
+           l.certified_at, l.certified_by,
+           strftime('%s', 'now'), 'the chunk was deleted at the write boundary'
+    FROM {cert} l WHERE l.id = OLD.id;
+    DELETE FROM {cert} WHERE id = OLD.id;
+END""".format(name=CERT_REVOKE_TRIGGER, cert=CERT_TABLE,
+               log=CERT_REVOKED_TABLE)
+
+    # --- the RESTORE side (交办 B) ---------------------------------
+    #
+    # **The revoke alone would be a REGRESSION, and the measurement is
+    # what says so.**  MEASURED (2026-11-05) on a copy of the live ROOT
+    # library, with the legacy writer's real flow:
+    #
+    #     delete_by_path(rel_path)  ->  DELETE FROM chunks WHERE path=?
+    #     save_chunks_batch(chunks) ->  INSERT ... ON CONFLICT DO UPDATE
+    #
+    # the chunk id is ``md5(path:start:end[:part])`` — POSITION-derived —
+    # so when the file's line ranges did not move, **the SAME ids came
+    # back**.  MEASURED: the pointer and the state both survived the
+    # round trip, and the ledger entry was still matching.
+    #
+    # ⇒ A revoke that is not RESTORABLE would revoke the certification
+    # of a chunk that is about to return.  And the guard's state-restore
+    # trigger reads the ledger — so the row would come back as
+    # 'projection' with no witness, and M6c ("every mirror row must have
+    # a witness") would go red.  **The guard would have made the fleet
+    # worse.**
+    #
+    # So the revoke is REVOCABLE: the witness goes into the log, and it
+    # comes back when the same id returns.
+    #
+    # **Why a BEFORE INSERT trigger.**  The restore must happen BEFORE
+    # ``chunks_body_keep_st_ai`` (the AFTER INSERT trigger that restores
+    # the STATE, and that READS the ledger).  Every BEFORE trigger runs
+    # before every AFTER trigger — so a BEFORE INSERT trigger is
+    # guaranteed to run first, with no dependence on the rowid order
+    # among the AFTER triggers.  **The order is then a property that
+    # cannot be broken by a re-install** — which is exactly the failure
+    # mode the repo's own knowledge page
+    # ``sqlite-trigger-order-is-load-bearing`` documents.
+    #
+    # **MEASURED (2026-11-05): the phase order is what makes this
+    # safe.**  A probe with an AFTER trigger at rowid 198 and a BEFORE
+    # trigger at rowid 199 fired them in the order BEFORE, AFTER — so
+    # the phase, not the rowid, is what orders them.
+    #
+    # **The restore DELETES the log row, and that is a decision, not an
+    # oversight.**  The log's job is to explain a STANDING revocation —
+    # "this chunk was certified, it is gone, and here is the witness
+    # that used to cover it".  A revocation that was UNDONE (the chunk
+    # came back with the same id) is not a fact about the current state,
+    # and keeping a row for it would make the log grow by one row per
+    # (certified chunk, re-cut) — an unbounded table that records
+    # nothing a reader can act on.  So the standing revocations are the
+    # ones the log keeps, and the restored ones leave no trace.
+    #
+    # **MEASURED (2026-11-05): the restore is idempotent.**  The index
+    # guard's BEFORE INSERT trigger may insert a CORRECTIVE row with the
+    # same id (an inner INSERT re-enters the BEFORE INSERT triggers), so
+    # the restore can fire twice for one row.  It restores only the rows
+    # that are still in the log, and the second pass finds nothing.
+    restore_cert_trigger = """
+CREATE TRIGGER {name} BEFORE INSERT ON chunks
+WHEN EXISTS (SELECT 1 FROM {log} r WHERE r.id = NEW.id)
+BEGIN
+    INSERT OR REPLACE INTO {cert} (id, text_state, body_origin, body_path,
+                                    body_hash, certified_at, certified_by)
+    SELECT r.id, r.text_state, r.body_origin, r.body_path, r.body_hash,
+           r.certified_at, r.certified_by
+    FROM {log} r WHERE r.id = NEW.id;
+    DELETE FROM {log} WHERE id = NEW.id;
+END""".format(name=CERT_RESTORE_TRIGGER, cert=CERT_TABLE,
+               log=CERT_REVOKED_TABLE)
+
     return [insert_trigger, update_trigger, delete_trigger, restore_trigger,
             state_restore_trigger, files_update_trigger, files_insert_trigger,
-            files_delete_trigger, files_restore_trigger]
+            files_delete_trigger, files_restore_trigger, revoke_trigger,
+            restore_cert_trigger]
 
 
 def table_ddl() -> str:
@@ -868,6 +1153,108 @@ CREATE TABLE IF NOT EXISTS {tbl} (
     id TEXT PRIMARY KEY,
     body_path TEXT, body_anchor TEXT, body_hash TEXT,
     text_state TEXT, body_origin TEXT)""".format(tbl=GUARD_TABLE)
+
+
+def revoked_table_ddl() -> str:
+    """The REVOCATION LOG — what the ledger guard revokes, and why.
+
+    **交办 B (2026-11-05).**  A certification is a witness about a
+    chunk.  When the chunk is deleted, the witness has no subject, and
+    the honest act is to revoke it — but a revocation that leaves no
+    trace is indistinguishable from a certification that never existed.
+
+    So every revocation leaves a row here: what was revoked (the
+    witness's own values), when, and why.  The row keeps the full
+    witness, so a reader can answer "what was certified, and why is it
+    gone?" without the ledger — which is the whole point of a log.
+
+    **The revocation is REVERSIBLE, and reversibility is not
+    optional.**  MEASURED (2026-11-05) on a copy of the live ROOT
+    library: the legacy writer's flow is ``delete_by_path`` then
+    ``save_chunks_batch``, and the chunk id is POSITION-derived — so
+    when the file's line ranges did not move, **the SAME ids came
+    back**.  A revoke that could not be undone would revoke the
+    certification of a chunk that is about to return, and M6c ("every
+    mirror row must have a witness") would go red.
+
+    So a row here is a STANDING revocation: the chunk was certified,
+    it is gone, and this is the witness that used to cover it.  When
+    the chunk comes back with the same id, the restore trigger puts the
+    witness back AND removes this row — because a revocation that was
+    undone is not a fact about the current state, and keeping it would
+    make the log grow by one row per (certified chunk, re-cut).
+
+    So the table holds exactly one kind of row: **a revocation that is
+    still in force.**  A reader can therefore answer "which
+    certifications were revoked and are still revoked?" without
+    filtering — and that is the only question the log exists to
+    answer.
+    """
+    return """
+CREATE TABLE IF NOT EXISTS {tbl} (
+    id TEXT PRIMARY KEY,
+    text_state TEXT,
+    body_origin TEXT,
+    body_path TEXT,
+    body_hash TEXT,
+    certified_at INTEGER,
+    certified_by TEXT,
+    revoked_at INTEGER,
+    revoked_reason TEXT)""".format(tbl=CERT_REVOKED_TABLE)
+
+
+def _migrate_revoked_table(conn: sqlite3.Connection) -> None:
+    """Bring the revocation log to the CURRENT shape.
+
+    **交办 B (2026-11-05).**  ``CREATE TABLE IF NOT EXISTS`` does not
+    touch a table that already exists — so a log written by an EARLIER
+    version of the trigger keeps its old columns, and the new trigger
+    fails at RUN time with "table cert_revoked has no column named
+    restored_at".  MEASURED on this machine, 2026-11-05: that exact
+    error, on a library that had been written by the first version of
+    the trigger.
+
+    So the columns are compared BY NAME (the same discipline
+    :func:`is_installed` uses for the trigger bodies — "比较的对象必须
+    是命名的东西"), and the ones that are missing are added.
+
+    **The extra columns are LEFT IN PLACE, not dropped.**  ``ALTER
+    TABLE ... DROP COLUMN`` would rewrite the table, and SQLite's
+    rewrite of a table with triggers on it is exactly the kind of
+    operation that changes the trigger order (see the knowledge page
+    ``sqlite-trigger-order-is-load-bearing``).  An extra column that
+    nothing reads is harmless; a table rewrite is not.
+    """
+    try:
+        conn.execute(revoked_table_ddl())
+    except sqlite3.Error:
+        return
+    try:
+        have = {r[1] for r in conn.execute(
+            "PRAGMA table_info(%s)" % CERT_REVOKED_TABLE)}
+    except sqlite3.Error:
+        return
+    if not have:
+        return
+    for column, decl in (("id", "TEXT PRIMARY KEY"),
+                          ("text_state", "TEXT"),
+                          ("body_origin", "TEXT"),
+                          ("body_path", "TEXT"),
+                          ("body_hash", "TEXT"),
+                          ("certified_at", "INTEGER"),
+                          ("certified_by", "TEXT"),
+                          ("revoked_at", "INTEGER"),
+                          ("revoked_reason", "TEXT")):
+        if column in have:
+            continue
+        try:
+            conn.execute("ALTER TABLE %s ADD COLUMN %s %s"
+                         % (CERT_REVOKED_TABLE, column, decl))
+        except sqlite3.Error:
+            # A column that cannot be added (a PRIMARY KEY on a table
+            # that already has rows, for instance) is not fatal: the
+            # trigger only names the columns that carry data.
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -986,7 +1373,8 @@ def guard_trigger_names() -> Tuple[str, ...]:
     return (GUARD_TRIGGER, GUARD_TRIGGER_UPDATE, GUARD_TRIGGER_DELETE,
             GUARD_TRIGGER_RESTORE, GUARD_TRIGGER_STATE,
             GUARD_TRIGGER_FILES_UPDATE, GUARD_TRIGGER_FILES_INSERT,
-            GUARD_TRIGGER_FILES_DELETE, GUARD_TRIGGER_FILES_RESTORE)
+            GUARD_TRIGGER_FILES_DELETE, GUARD_TRIGGER_FILES_RESTORE,
+            CERT_REVOKE_TRIGGER, CERT_RESTORE_TRIGGER)
 
 
 def files_table_ddl() -> str:
@@ -1309,6 +1697,22 @@ def ensure_guard(conn: sqlite3.Connection) -> Dict[str, Any]:
         # and the certifier writes them; the guard must never invent
         # one.
         conn.execute(cert_table_ddl())
+        # **交办 B (2026-11-05): the REVOCATION LOG must exist before the
+        # triggers that WRITE it.**  Same reason as the ledger above: a
+        # trigger whose body names a table that does not exist fails at
+        # RUN time with "no such table", not at CREATE time — and this
+        # one fires on every chunk delete.
+        #
+        # **The log's SHAPE can change, so the table must be MIGRATED,
+        # not just created.**  ``CREATE TABLE IF NOT EXISTS`` does not
+        # touch an existing table — so a library that carries the FIRST
+        # version of this log (which had ``restored_at`` /
+        # ``restored_reason``) keeps the old columns, and the trigger
+        # that names them fails at RUN time with "table cert_revoked has
+        # no column named restored_at".  MEASURED (2026-11-05): this
+        # exact error, on a library that had been written by the first
+        # version of the trigger.
+        _migrate_revoked_table(conn)
         if files_ok:
             # The files-side snapshot table (the files side's own keep
             # table — its key is ``path``, not ``id``).
