@@ -207,15 +207,34 @@ def remove_guard(conn: sqlite3.Connection) -> int:
 
     拿掉的是**产品自己声明的**触发器清单，所以「拿掉守卫」这件事
     不依赖判据自己抄一份名字。
+
+    **The count is read back, not taken from ``rowcount``.**  MEASURED
+    (2026-11-05): ``DROP TRIGGER`` reports ``rowcount == 0`` — the
+    statement drops a schema object, not a row — so counting the
+    ``rowcount`` says "0 triggers were removed" while the triggers are
+    demonstrably gone.  A report that says "0" about a mutation that
+    removed ten things is a lie in the evidence, and the reader cannot
+    tell it from a mutation that did not take.
+
+    So the count is read from ``sqlite_master`` BEFORE and AFTER.
     """
     from agent.memory.body_guard import guard_trigger_names
 
-    n = 0
-    for name in guard_trigger_names():
-        cur = conn.execute("DROP TRIGGER IF EXISTS %s" % name)
-        n += max(cur.rowcount, 0)
+    names = list(guard_trigger_names())
+    before = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger'")}
+    present = [n for n in names if n in before]
+    for name in present:
+        conn.execute("DROP TRIGGER IF EXISTS %s" % name)
     conn.commit()
-    return n
+    after = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger'")}
+    still = [n for n in present if n in after]
+    if still:
+        raise AssertionError(
+            "the mutation did not take — these guard triggers are still "
+            "installed: %s" % ", ".join(still))
+    return len(present)
 
 
 # ---------------------------------------------------------------------------
