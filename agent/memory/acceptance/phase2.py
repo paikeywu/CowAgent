@@ -1104,6 +1104,24 @@ _P2_CRITERIA = [
     ("P2-3a", "judge_p2_3a_the_layer_is_judgeable"),
 ]
 
+# ---------------------------------------------------------------------------
+# P2-5 · the conflict adjudication layer.
+#
+# They live in their own module (``phase2_p2_conflict``) because they
+# judge a DIFFERENT subject: not the persona layer's shape, but the
+# **ruling** a conflict produces — and they carry their OWN copy of the
+# expected rulings, so the criterion never computes its expectation from
+# the module under test.
+# ---------------------------------------------------------------------------
+_P2_CONFLICT_CRITERIA = [
+    ("P2-5a", "judge_p2_5a_the_ladder_is_judgeable"),
+    ("P2-5b", "judge_p2_5b_the_ruling_is_unique_and_determined"),
+    ("P2-5c", "judge_p2_5c_the_ruling_is_traceable"),
+    ("P2-5d", "judge_p2_5d_undecided_does_not_pick_a_side"),
+    ("P2-5e", "judge_p2_5e_the_criterion_is_sensitive_to_the_order"),
+    ("P2-5f", "judge_p2_5f_recorded_rulings_are_traceable"),
+]
+
 # The criteria that GUARD the criteria (MU-12 / MU-14 / the replay).
 _GUARD_CRITERIA = [
     ("MU-12", "judge_mu12_three_states_are_real"),
@@ -1234,6 +1252,33 @@ def _load_p2():
     ws = Path(resolve_workspace(ARGS.workspace)[0])
     out = []
     for cid, name in _P2_CRITERIA:
+        fn = getattr(mod, name, None)
+        if fn is None:
+            continue
+
+        def make(fn=fn, ws=ws):
+            def run(report):
+                return fn(report, ws)
+            return run
+
+        out.append((cid, make()))
+    return out
+
+
+def _load_p2_conflict():
+    """The P2-5 criteria (the conflict adjudication layer).
+
+    **Same discipline as the P2-1 group**: an absent module is skipped,
+    not failed.  A criterion that has not been written yet is not a red
+    — it is a criterion nobody has run.
+    """
+    try:
+        from agent.memory.acceptance import phase2_p2_conflict as mod
+    except Exception:
+        return []
+    ws = Path(resolve_workspace(ARGS.workspace)[0])
+    out = []
+    for cid, name in _P2_CONFLICT_CRITERIA:
         fn = getattr(mod, name, None)
         if fn is None:
             continue
@@ -1562,6 +1607,21 @@ def main() -> int:
     # SHARED ROOT.  The workspace is the shared root unless the caller
     # says otherwise.
     for group, fn in _load_p2():
+        if ARGS.only and not group.startswith(ARGS.only):
+            continue
+        guarded(fn, report)
+
+    # The P2-5 criteria (the conflict adjudication layer) — also judged
+    # over the SHARED ROOT, because the ruling ledger lives there.
+    #
+    # **They are loaded AFTER the P2-1 group on purpose.**  GB-1 compares
+    # the gate's WHOLE failure set against a baseline, and the baseline
+    # was pinned against a table that did not contain P2-5.  Adding a
+    # group that is green changes nothing for GB-1 (it compares SETS of
+    # RED, and green rows are not in the set), so this is safe — but if
+    # P2-5 ever goes red, GB-1 will name it as a new failure, which is
+    # exactly what should happen.
+    for group, fn in _load_p2_conflict():
         if ARGS.only and not group.startswith(ARGS.only):
             continue
         guarded(fn, report)
