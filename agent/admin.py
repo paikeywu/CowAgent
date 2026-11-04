@@ -559,8 +559,22 @@ class AgentAdminService:
                 knowledge=new_knowledge,
             )
             registry.upsert(updated)
+            archived_now = False
             if not new_enabled:
                 registry.set_enabled(agent_id, False)
+                # Going out of service takes the Agent out of every team
+                # roster that names it. A roster entry is a promise that the
+                # named teammate can be reached, and an archived one cannot:
+                # the hand-off would be refused, so a conversation that kept
+                # the name would keep offering a delegate tool with nobody
+                # behind it while its roster page still showed the name.
+                #
+                # The sweep happens after the roster is committed, so a
+                # rejected edit (a stale revision) leaves the rosters alone
+                # rather than pruning a teammate that never went out of
+                # service. Only a real transition counts: an Agent that was
+                # already archived is not swept twice.
+                archived_now = current.enabled
             if make_default:
                 registry.set_default(agent_id)
 
@@ -575,10 +589,49 @@ class AgentAdminService:
                 {"agents": profiles, "default_agent_id": registry.default_agent_id},
                 revision,
             )
+            if archived_now:
+                self._sweep_archived_agent_from_rosters(agent_id)
             return updated.to_dict()
 
     def archive_agent(self, agent_id: str, revision: str = None) -> Dict:
         return self.update_agent(agent_id, enabled=False, revision=revision)
+
+    @staticmethod
+    def _sweep_archived_agent_from_rosters(agent_id: str) -> list:
+        """Take an archived Agent out of every team roster, and retire what it changed.
+
+        Two steps that belong together: the sweep rewrites the rosters, and a
+        runtime fixes its tool list when it is built, so the conversations
+        whose roster just changed have to retire what was built under the old
+        one. Without the retirement a conversation would keep offering a
+        delegate tool whose only target has gone out of service.
+
+        Best-effort: a hiccup here must not undo an archive that already
+        committed. The Agent's own sessions and workspace are untouched --
+        archiving is not deleting.
+        """
+        touched_sessions = []
+        try:
+            from agent.workspace import session_prefs
+
+            touched_sessions = session_prefs.forget_agent_from_rosters(agent_id)
+        except Exception as e:
+            logger.warning(
+                f"[AgentAdmin] roster cleanup after archiving '{agent_id}' failed: {e}"
+            )
+            return touched_sessions
+
+        for session_id in touched_sessions:
+            try:
+                from bridge.bridge import Bridge
+
+                Bridge().get_agent_bridge()._retire_session_runtimes(session_id)
+            except Exception as e:
+                logger.warning(
+                    f"[AgentAdmin] could not retire runtimes of session "
+                    f"'{session_id}' after archiving '{agent_id}': {e}"
+                )
+        return touched_sessions
 
     def delete_agent(self, agent_id: str, revision: str = None) -> Dict:
         """Remove an Agent from the roster for good, files and all.

@@ -413,11 +413,20 @@ class SessionService:
             return
         from agent.workspace import project_store, session_prefs
 
-        for module in (project_store, session_prefs):
-            try:
-                module.forget_session(session_id, agent_id=scoped)
-            except Exception as e:
-                logger.debug(f"[SessionService] Side-store cleanup skipped: {e}")
+        try:
+            project_store.forget_session(session_id, agent_id=scoped)
+        except Exception as e:
+            logger.debug(f"[SessionService] Side-store cleanup skipped: {e}")
+        # The prefs row is keyed by the resolved owner id, but a row written
+        # before the write side started resolving the alias still lives under
+        # the alias. Drop the row under both ids, so neither one is left
+        # behind after the conversation is gone.
+        try:
+            session_prefs.forget_session_under_any(
+                session_id, (agent_id, scoped)
+            )
+        except Exception as e:
+            logger.debug(f"[SessionService] Side-store cleanup skipped: {e}")
 
     def rename_session(
         self, session_id: str, title: str, agent_id: str = None

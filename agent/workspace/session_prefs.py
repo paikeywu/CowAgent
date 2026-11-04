@@ -32,7 +32,7 @@ import json
 import os
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 from common.atomic_write import write_json_atomic
 from common.log import logger
@@ -166,6 +166,43 @@ def forget_session(session_id: str, agent_id: Optional[str] = None) -> None:
             _save(data)
 
 
+def forget_session_under_any(
+    session_id: str, agent_ids: Iterable[Optional[str]]
+) -> None:
+    """Drop a session's overrides under every id in *agent_ids*.
+
+    A session's row is keyed by the owning Agent's id, and the id the row
+    was written under and the id it is read back under have to be the same.
+    The write side resolves the reserved "default" alias to the real id of
+    the Agent behind it, so a row written today lives under the real id --
+    but a row written before that still lives under the alias.
+
+    A delete that only knows one of the two keys leaves the other behind: the
+    conversation is gone and its overrides are not. So the caller passes
+    every id the row could be under, and this drops whichever of them exist.
+    Duplicates are harmless.
+
+    The store is written once, not once per id.
+    """
+    if not session_id:
+        return
+    keys = []
+    for agent_id in agent_ids or ():
+        key = _session_key(session_id, agent_id)
+        if key not in keys:
+            keys.append(key)
+    if not keys:
+        return
+    with _lock:
+        data = _load()
+        changed = False
+        for key in keys:
+            if data["sessions"].pop(key, None) is not None:
+                changed = True
+        if changed:
+            _save(data)
+
+
 def forget_agent(agent_id: str) -> List[str]:
     """Erase every trace of a deleted Agent from the prefs store.
 
@@ -205,23 +242,78 @@ def forget_agent(agent_id: str) -> List[str]:
             if session_id:
                 touched.append(session_id)
 
-        for key, entry in list(sessions.items()):
-            if not isinstance(entry, dict) or not entry.get("members"):
-                continue
-            members = [m for m in entry["members"] if m != agent_id]
-            if len(members) == len(entry["members"]):
-                continue
-            changed = True
-            if members:
-                entry["members"] = members
-            else:
-                entry.pop("members", None)
-                if not any(entry.get(f) for f in _FIELDS):
-                    sessions.pop(key, None)
-            _, _, session_id = str(key).partition("::")
-            if session_id:
-                touched.append(session_id)
+        # The roster sweep itself is shared with the archive path; see
+        # ``forget_agent_from_rosters``.
+        roster_changed, roster_touched = _forget_agent_from_rosters(sessions, agent_id)
+        changed = changed or roster_changed
+        touched.extend(roster_touched)
 
+        if changed:
+            _save(data)
+    return touched
+
+
+def _forget_agent_from_rosters(sessions: Dict, agent_id: str) -> tuple:
+    """Prune *agent_id* out of every team roster in *sessions*, in place.
+
+    Only the rosters are touched: an Agent's own ``{agent_id}::*`` rows stay
+    untouched here, because an archived Agent keeps its workspace and its
+    history -- only a deleted one loses them.
+
+    Returns ``(changed, touched)``: whether any roster was rewritten, and the
+    ids of the sessions whose roster changed, so a caller that keeps live
+    runtimes can retire them. The two are separate because a roster can
+    change without yielding a session id, and the store still has to be
+    written in that case.
+
+    The caller holds the store's lock and saves the file.
+    """
+    changed = False
+    touched: List[str] = []
+    for key, entry in list(sessions.items()):
+        if not isinstance(entry, dict) or not entry.get("members"):
+            continue
+        members = [m for m in entry["members"] if m != agent_id]
+        if len(members) == len(entry["members"]):
+            continue
+        changed = True
+        if members:
+            entry["members"] = members
+        else:
+            entry.pop("members", None)
+            if not any(entry.get(f) for f in _FIELDS):
+                sessions.pop(key, None)
+        _, _, session_id = str(key).partition("::")
+        if session_id:
+            touched.append(session_id)
+    return changed, touched
+
+
+def forget_agent_from_rosters(agent_id: str) -> List[str]:
+    """Prune an archived Agent's id out of every team roster, and report which.
+
+    Archiving an Agent takes it out of service without deleting it: its
+    workspace and its history stay. What must not stay is its name sitting in
+    other conversations' team rosters, because a roster entry names a
+    teammate that can actually be reached -- an archived one cannot, and a
+    hand-off to it is refused. A conversation whose roster still lists it
+    would keep offering a delegate tool with nobody behind it while the
+    roster page still showed the name.
+
+    Returns the ids of the sessions whose roster changed, so a caller that
+    keeps live runtimes can retire them: a runtime fixes its tool list when
+    it is built, so a roster that changed under a live conversation has to
+    retire what was built under the old one.
+
+    Deliberately does *not* touch the Agent's own ``{agent_id}::*`` rows --
+    those belong to an Agent that is still here.
+    """
+    if not agent_id:
+        return []
+    with _lock:
+        data = _load()
+        sessions = data["sessions"]
+        changed, touched = _forget_agent_from_rosters(sessions, agent_id)
         if changed:
             _save(data)
     return touched

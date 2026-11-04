@@ -438,10 +438,20 @@ class SessionDetailHandler:
             # namespace their rows by Agent, so the row to drop is the one
             # under this session's own Agent — the unscoped key is
             # ``default::`` and would leave the real row behind.
+            #
+            # The prefs row is keyed by the *resolved* owner id (the write
+            # side resolves it, see SessionSettingsHandler.POST), but a row
+            # written before that still lives under the alias. The delete
+            # therefore drops the row under both ids, so neither one is left
+            # behind. The project store keeps its own key convention and is
+            # left as it is.
             try:
                 from agent.workspace import project_store, session_prefs
                 project_store.forget_session(session_id, agent_id=agent_id)
-                session_prefs.forget_session(session_id, agent_id=agent_id)
+                session_prefs.forget_session_under_any(
+                    session_id,
+                    (agent_id, _resolve_owner_id_or_none(agent_id)),
+                )
             except Exception as e:
                 logger.debug(f"[WebChannel] Session side-store cleanup skipped: {e}")
 
@@ -671,6 +681,102 @@ def _session_settings_state(session_id: str, agent_id: Optional[str]) -> dict:
     }
 
 
+class RosterUnverifiableError(RuntimeError):
+    """The roster could not be checked against the reachable teammates.
+
+    Raised instead of storing an unchecked roster: a roster is a promise, and a
+    promise that cannot be kept must not be written down.
+    """
+
+
+def _resolve_owner_id(agent_id: Optional[str]) -> str:
+    """The real id of the Agent a session's preferences belong to.
+
+    Every reader of ``session_prefs`` asks for the row under the *resolved*
+    owner id -- the delegate tool, the prompt builder, the team addressing and
+    the bridge all hold a resolved id, never the reserved "default" alias.
+    The write side used to key the row under whatever the request happened to
+    name, so a request that named nobody stored the row under ``default::``
+    while every reader looked under ``{real id}::`` and found nothing: a
+    roster the user had just set was invisible to the conversation it was set
+    for.
+
+    Resolving on the write side puts the two ends on the same key. The
+    resolution goes through the bridge's registry, the one the delegate tool
+    consults when it looks for a hand-off target.
+    """
+    from bridge.bridge import Bridge
+
+    agent_bridge = Bridge().get_agent_bridge()
+    registry = agent_bridge.agent_registry
+    return registry.get_addressed(agent_id, require_enabled=False).id
+
+
+def _resolve_owner_id_or_none(agent_id: Optional[str]) -> Optional[str]:
+    """The resolved owner id, or None when the owner does not resolve.
+
+    The delete path uses this: it has to drop the row under every id the row
+    could be filed under, and a row filed under the alias is still a row the
+    user must not be left with. When the owner cannot be resolved the alias
+    is the only id worth trying, so None -- which the store keys as
+    ``default`` -- is the honest answer rather than a guess.
+    """
+    try:
+        return _resolve_owner_id(agent_id)
+    except Exception as e:
+        logger.debug(f"[WebChannel] owner id unresolved ({agent_id!r}): {e}")
+        return None
+
+
+def _clean_roster_for_session(session_id: str, agent_id: Optional[str], members: list) -> list:
+    """The teammates this conversation can actually reach, in the order asked for.
+
+    The roster is stored under the conversation's owner, and the owner is the
+    Agent the console addressed the conversation to -- the reserved "default"
+    alias when it named nobody. The stored roster is read back by the host
+    under that same owner, so the roster has to be cleaned against the same
+    owner id: cleaning against the alias would let the owner invite itself.
+
+    "Reachable" is the rule the delegate tool itself applies when it looks
+    for a hand-off target: an enabled Agent of this instance, or a teammate
+    another process hosts. A name that resolves to neither -- an archived
+    Agent, an id nobody knows -- is dropped instead of stored, because the
+    hand-off would be refused and keeping it would leave the conversation
+    offering a delegate tool with nobody behind it while the roster page
+    still listed the name.
+
+    The owner and the members are resolved through the bridge's registry,
+    which is the one the delegate tool consults when it looks for a target:
+    resolving the owner through one registry and the members through another
+    could compare an owner id from the first against member ids from the
+    second, and keep the owner as its own teammate.
+
+    **Fails closed.** When the roster cannot be checked -- the bridge is down,
+    the owner does not resolve -- this raises instead of returning the list as
+    asked. Storing an unchecked roster would create exactly the state this
+    cleaning exists to prevent: a roster full of names nobody can be reached
+    at, a delegate tool offered with no target behind it, and a success
+    response the user cannot see the failure in. The caller turns the error
+    into a visible rejection and writes nothing.
+    """
+    try:
+        from bridge.bridge import Bridge
+
+        agent_bridge = Bridge().get_agent_bridge()
+        registry = agent_bridge.agent_registry
+        owner_id = registry.get_addressed(agent_id, require_enabled=False).id
+        return agent_bridge._clean_team_members(members, owner_id)
+    except Exception as e:
+        logger.error(
+            f"[WebChannel] roster cleaning failed, refusing to store an "
+            f"unverified roster: sid={session_id}, agent={agent_id!r}: {e}"
+        )
+        raise RosterUnverifiableError(
+            "cannot verify that every invited teammate is reachable; "
+            "the roster was not changed"
+        ) from e
+
+
 def _session_team_state(prefs: dict, agent_id: Optional[str]) -> dict:
     """Who else is on this conversation, and who could be added.
 
@@ -730,9 +836,12 @@ class SessionSettingsHandler:
             if not session_id:
                 return json.dumps({"status": "error", "message": "session_id required"})
             params = web.input(agent='', agent_id='')
-            state = _session_settings_state(
-                session_id, params.agent or params.agent_id or None
-            )
+            # The read side must ask for the row under the same key the write
+            # side used: the resolved owner id. Asking under the reserved
+            # alias would report an empty roster for a conversation that has
+            # one.
+            owner_id = _resolve_owner_id(params.agent or params.agent_id or None)
+            state = _session_settings_state(session_id, owner_id)
             return json.dumps({"status": "success", **state}, ensure_ascii=False)
         except Exception as e:
             logger.error(f"[WebChannel] Session settings read error: {e}")
@@ -781,6 +890,30 @@ class SessionSettingsHandler:
                         "status": "error",
                         "message": "members must be a list of agent ids",
                     })
+                # A roster is stored under the owner, and the owner is whoever
+                # the console addressed the conversation to -- the reserved
+                # "default" alias when it named nobody.
+                #
+                # If the roster cannot be checked against the reachable
+                # teammates, the whole write is refused: an unchecked roster
+                # is exactly the zombie state this cleaning exists to prevent,
+                # and a success response would hide it. Nothing is written --
+                # neither an unverified roster nor an empty one, and the
+                # roster already stored stays exactly as it was.
+                if updates["members"] is not None:
+                    try:
+                        updates["members"] = _clean_roster_for_session(
+                            session_id, agent_id, updates["members"]
+                        )
+                    except RosterUnverifiableError as e:
+                        return json.dumps({
+                            "status": "error",
+                            "message": (
+                                "cannot verify that every invited teammate is "
+                                "reachable; the roster was not changed"
+                            ),
+                            "roster_error": str(e),
+                        })
 
             if not updates:
                 return json.dumps({
@@ -788,16 +921,24 @@ class SessionSettingsHandler:
                     "message": "permission, model, provider or members required",
                 })
 
-            session_prefs.set_prefs(session_id, agent_id, **updates)
+            # The row is keyed by the *resolved* owner id. Every reader of the
+            # store asks under that id -- the delegate tool, the prompt
+            # builder, the bridge and the team addressing all hold a resolved
+            # id -- so keying the write under whatever the request happened to
+            # name would put the two ends on different keys and make the row
+            # invisible to the very conversation it was written for.
+            owner_id = _resolve_owner_id(agent_id)
+
+            session_prefs.set_prefs(session_id, owner_id, **updates)
 
             # Retarget the live agent so the change lands on the next message
             # without waiting for a fresh get_agent.
             try:
                 from bridge.bridge import Bridge
                 ab = Bridge().get_agent_bridge()
-                agent = ab.get_cached_agent(session_id, agent_id)
+                agent = ab.get_cached_agent(session_id, owner_id)
                 if agent is not None:
-                    ab.apply_session_prefs(agent, session_id, agent_id)
+                    ab.apply_session_prefs(agent, session_id, owner_id)
                 # A roster change changes what the runtime may offer: the
                 # delegate tool is only assembled for a conversation that has
                 # teammates, and a runtime fixes its tool list when it is
@@ -815,7 +956,7 @@ class SessionSettingsHandler:
             logger.info(
                 f"[WebChannel] Session settings updated: sid={session_id}, {updates}"
             )
-            state = _session_settings_state(session_id, agent_id)
+            state = _session_settings_state(session_id, owner_id)
             return json.dumps({"status": "success", **state}, ensure_ascii=False)
         except Exception as e:
             logger.error(f"[WebChannel] Session settings update error: {e}")
