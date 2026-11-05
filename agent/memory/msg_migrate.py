@@ -233,6 +233,61 @@ def append_rows_to_truth(conn: sqlite3.Connection, workspace: Union[str, Path],
     return len(lines)
 
 
+def _recover_rows_from_other_files(conn: sqlite3.Connection,
+                                   workspace: Union[str, Path],
+                                   agent_id: str, session_id: str,
+                                   seqs: List[int],
+                                   across: Dict[int, Dict[str, Any]],
+                                   ) -> int:
+    """Point the rows whose seq already lives in ANOTHER file at THAT
+    file — instead of writing them a second time (2026-11-06, 交办书 I-3).
+
+    **Why the pointer must name the other file.**  The pointer is
+    ``(content_path, content_anchor, content_hash)`` and the reader
+    resolves the content from it ⇒ a pointer that names THIS call's file
+    would point at a line that is not there ⇒ the reader would raise.
+
+    **The hash is RE-COMPUTED from the line**, not taken on trust (the
+    file's self-reported hash is a claim — 裁决 §8.2).
+    """
+    from agent.memory import msg_chain
+    from agent.memory.msg_write_ext import _read_file_lines
+
+    healed = 0
+    for seq in seqs:
+        entry = across.get(seq) or {}
+        path = entry.get("file")
+        if not path:
+            continue
+        p = Path(path)
+        if not p.is_file():
+            continue
+        lines, _physical = _read_file_lines(p)
+        physical = 0
+        line = None
+        for i, cand in enumerate(lines, 1):
+            if cand.get("seq") is not None and int(cand["seq"]) == seq:
+                physical = i
+                line = cand
+                break
+        if line is None:
+            continue
+        rel = entry.get("rel") or ""
+        # the pointer is relative to ``memory/`` (``messages_export/...``)
+        if rel.startswith("memory/"):
+            rel = rel[len("memory/"):]
+        cur = conn.execute(
+            "UPDATE messages SET content = NULL, content_path = ?, "
+            "content_anchor = ?, content_hash = ?, content_state = 'external' "
+            "WHERE agent_id = ? AND session_id = ? AND seq = ?",
+            (rel, "line:%d" % physical, msg_chain.msg_line_hash(line),
+             agent_id, session_id, seq),
+        )
+        healed += max(cur.rowcount, 0)
+    conn.commit()
+    return healed
+
+
 def externalise_session(conn: sqlite3.Connection, workspace: Union[str, Path],
                         agent_id: str, session_id: str, batch_date: str,
                         *, dry_run: bool = False) -> Dict[str, Any]:
@@ -308,6 +363,44 @@ def externalise_session(conn: sqlite3.Connection, workspace: Union[str, Path],
             "(--stage rollback) and start the migration over."
             % (session_id, rel, len(overlap), overlap[:5],
                "…" if len(overlap) > 5 else ""))
+
+    # **The cross-file check (2026-11-06, 交办书 I-3).**  The guard
+    # above only asks "does **THIS** file already hold those seqs?" —
+    # but the session's file is resolved by TWO rules that disagree
+    # (the write path asks the DB, the migration asks ``batch_date``),
+    # so the same session can live in TWO files.  ⇒ a seq that is in the
+    # OTHER file is just as "already written" (immutable, R4) as one in
+    # this one, and writing it again is the double-write that makes
+    # MSG-INV-5 RED.
+    #
+    # MEASURED (2026-11-06): the session ``session_mvnxdpzkmy5z`` had
+    # 1290 lines in ``2026-11-03/…jsonl`` and 7324 in ``2026-10-31/…jsonl``;
+    # the two files' seq sets intersected in exactly **2** seqs (8830 /
+    # 8831) ⇒ MSG-INV-5 RED with a gap of exactly 2.
+    #
+    # ⇒ The migration must ask the SAME question the write path asks:
+    # "does this seq exist in ANY of this session's files?"  And when it
+    # does, the row is **recovered** (pointed at the file that holds it),
+    # not written again.
+    from agent.memory.msg_write_ext import session_seq_index
+    across = session_seq_index(workspace, session_id, agent_id)
+    out["across_files_seqs"] = len(across)
+    cross_overlap = sorted(set(across).intersection(
+        int(r[0]) for r in rows))
+    if cross_overlap:
+        # The rows are ALREADY externalised — in another file.  ⇒ point
+        # them there and do NOT write them again.
+        out["already_in_other_files"] = [
+            {"seq": s, "file": across[s].get("rel")} for s in cross_overlap]
+        _recover_rows_from_other_files(
+            conn, workspace, agent_id, session_id, cross_overlap, across)
+        # and only the rows that are NOT already written get written.
+        rows = [r for r in rows if int(r[0]) not in set(cross_overlap)]
+        out["rows_after_cross_check"] = len(rows)
+        if not rows:
+            out["written"] = 0
+            out["skipped"] = len(cross_overlap)
+            return out
 
     lines: List[Dict[str, Any]] = []
     for seq, role, content, created_at, run_id, extras, _rid in rows:

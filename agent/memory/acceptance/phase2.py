@@ -1078,6 +1078,30 @@ _S3W_CRITERIA = [
 #
 # **GB-1 must run LAST** — it reads the gate's own result table, so every
 # other criterion must already have reported.
+# ------------------------------------------------------------------
+# S3-WB · the ``messages`` WRITE-BOUNDARY criterion (WB-1).
+#
+# It lives in its own group because the messages group ``msg_inv`` is a
+# CONTRACT with a fixed set of SEVEN names (``MSG_INV_NAMES`` in
+# ``phase2_s3m.py``) and its verdict is the roll-up of its members.  An
+# eighth member would break the name-set contract AND flip the group's
+# verdict to NOTRUN on every library whose recorder is not installed yet
+# — which would turn M-1/M-2 red for a reason that has nothing to do
+# with them.
+#
+# **What it closes.**  The old desktop build writes ``messages`` rows
+# that never externalise.  On the FINAL row its shape is IDENTICAL to
+# the new build's (measured 2026-11-05: all eleven columns), so every
+# existing criterion is blind to it — and a gate that REFUSED the row
+# would break the product.  The boundary is therefore a RECORDER (an
+# AFTER INSERT trigger that records and never refuses) plus a patrol
+# that asks "is the row STILL inline?".
+# ------------------------------------------------------------------
+_S3WB_CRITERIA = [
+    ("WB-1", "judge_wb1_write_boundary_has_no_unowned_rows"),
+]
+
+
 _S3X_CRITERIA = [
     ("EE-1", "judge_external_edit_is_traceable"),
     ("EE-2", "judge_external_edit_mechanism_witnesses_edits"),
@@ -1471,6 +1495,33 @@ def _load_s3w():
     return out
 
 
+def _load_s3wb():
+    """The S3-WB criterion functions, bound to the workspace.
+
+    **Why a group of its own.**  The messages group ``msg_inv`` is a
+    CONTRACT with a fixed set of SEVEN names, and its verdict is the
+    roll-up of its members.  The write-boundary criterion therefore
+    cannot be an eighth member of it: that would break the name-set
+    contract AND flip the group's verdict to NOTRUN on every library
+    whose recorder is not installed yet (turning M-1/M-2 red for a
+    reason that has nothing to do with them).
+    """
+    from agent.memory.acceptance import phase2_s3wb
+
+    ws = Path(resolve_workspace(ARGS.workspace)[0])
+    out = []
+    for group, attr in _S3WB_CRITERIA:
+        fn = getattr(phase2_s3wb, attr)
+
+        def make(fn=fn, ws=ws):
+            def run(report):
+                return fn(report, ws)
+            return run
+
+        out.append((group, make()))
+    return out
+
+
 def _load_s3x():
     """The S3-X criterion functions, bound to the workspace."""
     from agent.memory.acceptance import phase2_s3x
@@ -1622,6 +1673,15 @@ def main() -> int:
     # P2-5 ever goes red, GB-1 will name it as a new failure, which is
     # exactly what should happen.
     for group, fn in _load_p2_conflict():
+        if ARGS.only and not group.startswith(ARGS.only):
+            continue
+        guarded(fn, report)
+
+    # The S3-WB criteria (the messages WRITE-BOUNDARY recorder · WB-1).
+    # They run BEFORE GB-1, because GB-1 reads the gate's OWN result
+    # table and therefore needs every other criterion to have reported
+    # already.
+    for group, fn in _load_s3wb():
         if ARGS.only and not group.startswith(ARGS.only):
             continue
         guarded(fn, report)

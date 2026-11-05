@@ -193,6 +193,76 @@ def _existing_seq_map(path: Path) -> Dict[int, Dict[str, Any]]:
     return out
 
 
+def session_seq_index(workspace: Union[str, Path], session_id: str,
+                      agent_id: str = "") -> Dict[int, Dict[str, Any]]:
+    """``seq -> {file, line, line_hash}`` for EVERY file that holds this
+    session's lines — not just the file the caller picked.
+
+    **Why this exists (2026-11-06, 交办书 I-3).**  A session's truth
+    file is supposed to be ONE file (the contract
+    ``msg_chain.session_filename`` states).  But the file is resolved by
+    TWO different rules, and they disagree:
+
+      * the **write path** (``session_target_file``) asks the DATABASE
+        which file this session's rows point at;
+      * the **migration** (``msg_migrate.externalise_session``) asks
+        ``batch_date``.
+
+    ⇒ When they disagree, the same session gets written into TWO files,
+    and the seqs that land in both are **written twice** — once per
+    file, each with its own chain (so a different ``line_hash`` for the
+    same content).
+
+    MEASURED on this machine (2026-11-06): the session
+    ``session_mvnxdpzkmy5z`` had **1290** lines in
+    ``2026-11-03/…jsonl`` and **7324** in ``2026-10-31/…jsonl``, and the
+    two files' seq sets intersected in exactly **2** seqs (8830 / 8831)
+    — the same two rows, written twice, with different line hashes.
+    ⇒ MSG-INV-5 counts the JSONL's lines (60748) against the DB's
+    externalised rows (60746) and reports RED with a gap of exactly 2.
+
+    ⇒ So the write path must ask **"does this seq exist in ANY of this
+    session's files?"**, not "does it exist in the file I picked?".
+    This function is that question, asked once.
+    """
+    root = msg_chain.export_root(Path(workspace))
+    out: Dict[int, Dict[str, Any]] = {}
+    if not root.is_dir():
+        return out
+    # **The file name is the session's identity** (``session_filename``
+    # = slug + a hash of ``agent_id|session_id``) ⇒ every file that
+    # holds this session's lines has THE SAME NAME, in a different
+    # batch directory.  ⇒ matching on the name is exact, not a
+    # heuristic.
+    want = msg_chain.session_filename(session_id, agent_id)
+    for p in sorted(root.rglob(want)):
+        if msg_chain.AUDIT_DIRNAME in p.parts:
+            continue
+        try:
+            lines, _physical = _read_file_lines(p)
+        except OSError:
+            continue
+        for line in lines:
+            seq = line.get("seq")
+            if seq is None:
+                continue
+            try:
+                s = int(seq)
+            except (TypeError, ValueError):
+                continue
+            # The LAST occurrence wins (same rule as _existing_seq_map).
+            rel = (p.relative_to(root.parent.parent).as_posix()
+                   if root.parent.parent in p.parents else p.name)
+            # the pointer is relative to ``memory/`` (``messages_export/...``)
+            if rel.startswith("memory/"):
+                rel = rel[len("memory/"):]
+            out[s] = {"file": str(p),
+                      "rel": rel,
+                      "line_hash": line.get("line_hash"),
+                      "created_at": line.get("created_at")}
+    return out
+
+
 def _seq_physical_map(path: Path) -> Dict[int, int]:
     """``seq -> PHYSICAL line number`` for one JSONL.
 
@@ -452,12 +522,56 @@ def externalise_messages(
 
     # 1. build the lines — and split the rows into "already written"
     #    (the idempotent recovery) and "to be written".
+    #
+    # **The idempotent recovery must look at EVERY file this session
+    # has, not only the one this call picked** (2026-11-06, 交办书 I-3).
+    #
+    # The hole this closes: the file is resolved by TWO rules that
+    # disagree — the write path asks the DATABASE which file the
+    # session's rows point at, the migration asks ``batch_date`` ⇒ the
+    # same session can end up in TWO files ⇒ a seq that is in both is
+    # written TWICE (once per file, each with its own chain ⇒ a
+    # different ``line_hash`` for the same content) ⇒ MSG-INV-5 counts
+    # the JSONL's lines against the DB's externalised rows and reports a
+    # gap of exactly the number of double-written rows.
+    #
+    # MEASURED (2026-11-06): the session ``session_mvnxdpzkmy5z`` had
+    # 1290 lines in ``2026-11-03/…jsonl`` and 7324 in ``2026-10-31/…jsonl``;
+    # the two files' seq sets intersected in exactly 2 seqs (8830/8831)
+    # ⇒ MSG-INV-5 RED with a gap of exactly 2.
+    #
+    # ⇒ The row is therefore recovered from WHICHEVER file holds it,
+    # and the pointer points at THAT file — which is the truth: the row
+    # IS externalised, just in the other file.
+    across = session_seq_index(workspace, session_id, agent_id)
+    out["across_files_seqs"] = len(across)
     to_write: List[Tuple[tuple, Dict[str, Any]]] = []
     recovered: List[Tuple[tuple, Dict[str, Any], int]] = []
+    recovered_from_other_file = 0
     for row in rows:
         seq, role, content, created_at, run_id, extras = row
         seq = int(seq)
         prior = existing_by_seq.get(seq)
+        if prior is None and seq in across:
+            # **The seq lives in ANOTHER file of this session.**  It was
+            # already written (immutable, R4) ⇒ do NOT write it again.
+            # The pointer must name the file that actually holds it.
+            other = across[seq]
+            other_path = Path(other["file"])
+            other_lines, other_physical = _read_file_lines(other_path)
+            other_phys = 0
+            for i, line in enumerate(other_lines, 1):
+                if line.get("seq") is not None and int(line["seq"]) == seq:
+                    other_phys = i
+                    break
+            out.setdefault("recovered_from_other_files", []).append({
+                "seq": seq, "file": other["rel"], "physical_line": other_phys})
+            recovered.append((row, {"line_hash": other.get("line_hash")},
+                              other_phys))
+            recovered_from_other_file += 1
+            # the pointer has to name the OTHER file, not this one
+            out.setdefault("_rel_override", {})[seq] = other["rel"]
+            continue
         if prior is not None:
             # **The idempotent recovery (R7).**  The line is already on
             # disk: it is IMMUTABLE (R4), so it is NOT rewritten.  Its
@@ -475,6 +589,7 @@ def externalise_messages(
         to_write.append((row, line))
 
     out["recovered"] = len(recovered)
+    out["recovered_from_other_file"] = recovered_from_other_file
 
     if to_write:
         # ---- 1b. the crash-window marker -----------------------------
@@ -571,6 +686,7 @@ def externalise_messages(
     # ``content IS NULL AND content_state='inline'`` behind a crash —
     # the MSG-INV-6 illegal state.
     pointers: List[Tuple[str, int, str, int]] = []
+    rel_override = out.get("_rel_override") or {}
     if to_write:
         for offset, (_row, line) in enumerate(to_write):
             pointers.append((rel, first_line_no + offset,
@@ -579,8 +695,15 @@ def externalise_messages(
         # The recovered line's own hash and physical line number.  The
         # hash is RE-COMPUTED from the line, not taken on trust: the
         # file's self-reported hash is a claim (裁决 §8.2).
+        #
+        # **The file may be a DIFFERENT one** (the cross-file recovery of
+        # 交办书 I-3): the seq was found in ANOTHER file of this session
+        # ⇒ the pointer must name THAT file, or it would point at a
+        # line that is not there.
+        seq = int(row[0])
+        p_rel = rel_override.get(seq, rel)
         recomputed = msg_chain.msg_line_hash(prior)
-        pointers.append((rel, physical_no, recomputed, int(row[0])))
+        pointers.append((p_rel, physical_no, recomputed, seq))
     for p_rel, line_no, line_hash, seq in pointers:
         cur = conn.execute(
             "UPDATE messages SET content = NULL, content_path = ?, "

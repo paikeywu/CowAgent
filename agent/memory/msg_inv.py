@@ -63,6 +63,7 @@ CODE_COMPENSATION_IN_MAIN = "msg-compensation-in-main-chain"
 CODE_CONTENT_NULL_INLINE = "msg-content-null-inline"
 CODE_PENDING_ORPHANED = "msg-pending-orphaned"
 CODE_READPATH_DIVERGED = "msg-readpath-diverged"
+CODE_WRITE_BOUNDARY = "msg-write-boundary-unresolved"
 
 REASON_TEXT = {
     CODE_CHAIN_BROKEN: "messages 主链哈希链断裂",
@@ -77,6 +78,7 @@ REASON_TEXT = {
     CODE_CONTENT_NULL_INLINE: "messages 出现 content IS NULL 且 state=inline 的非法状态",
     CODE_PENDING_ORPHANED: "messages 存在 pending 行且真源无对应行",
     CODE_READPATH_DIVERGED: "messages 外置前后读路径结果不一致",
+    CODE_WRITE_BOUNDARY: "messages 写入边界存在未被接管的 inline 行",
 }
 
 
@@ -643,6 +645,92 @@ def check_msg_inv7(workspace: Union[str, Path], conn: sqlite3.Connection,
     return _result("MSG-INV-7", RED if out else GREEN, fp, out)
 
 
+def check_msg_inv8(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """MSG-INV-8: the ``messages`` write boundary has no unowned rows.
+
+    **The question.**  The old desktop build writes ``messages`` rows
+    with a seven-column ``INSERT`` that does not name the
+    externalisation columns, so the row keeps ``content_state='inline'``
+    and its three pointer columns empty — **forever**.  The new build
+    writes the same shape and externalises it within the request.
+
+    ⇒ On the final row the two writers are **indistinguishable**
+    (measured 2026-11-05: all eleven columns identical).  So a gate
+    that looks at the ROW cannot tell them apart — and a gate that
+    refuses the row would break the product.
+
+    ⇒ So the boundary is measured by a **RECORDER**: the trigger sees
+    every insert and writes down what it saw; the question is then
+    "is the row still inline?".  The new writer's row is external by
+    now; the old writer's row is not.  **That** is the difference, and
+    it is a fact about the row's HISTORY, not its shape.
+
+    **The three states, never two.**
+
+    * ``NOTRUN`` — the recorder is not installed on this library.  That
+      is "nobody is watching", NOT "nothing is wrong": the criterion
+      cannot answer, so it says so.  (Before the recorder existed, this
+      is what every library would have said — and the 1,593 legacy rows
+      in ROOT were invisible to every other criterion.)
+    * ``RED`` — the recorder saw a row that is STILL inline and old
+      enough that no in-flight externalisation could still be
+      explaining it.  That is the old writer, named.
+    * ``GREEN`` — the recorder is installed and every row it saw has
+      been taken over (or is young enough that it might be).
+
+    **The age threshold is a PARAMETER, not a constant.**  "How long is
+    too long" is a deployment question; the criterion takes it as an
+    argument so the caller (the acceptance layer) decides, and the
+    fingerprint says which threshold was used.
+    """
+    from agent.memory import msg_write_guard
+
+    out: List[Dict[str, Any]] = []
+    try:
+        installed = msg_write_guard.is_installed(conn)
+    except Exception as e:
+        return _result("MSG-INV-8", NOTRUN, "recorder=unknown", [
+            _v(CODE_WRITE_BOUNDARY,
+               "cannot read the recorder's state: %s: %s"
+               % (type(e).__name__, e), severity="mid")])
+
+    if not installed:
+        # NOTRUN, never GREEN: "nobody is watching" is not "all good".
+        return _result("MSG-INV-8", NOTRUN, "recorder=absent", [
+            _v(CODE_WRITE_BOUNDARY,
+               "the messages write-boundary recorder is not installed on "
+               "this library — the old writer's rows cannot be told from "
+               "the new writer's, so this criterion cannot answer "
+               "(NOTRUN, not GREEN: nobody is watching is not "
+               "『nothing is wrong』)", severity="mid")])
+
+    report = msg_write_guard.patrol(conn)
+    fp = ("recorder=present watch_rows=%s legacy_inline_rows=%s "
+          "older_than=%ss" % (report.get("watch_rows"),
+                              report.get("legacy_inline_rows"),
+                              report.get("older_than")))
+    if report.get("error"):
+        return _result("MSG-INV-8", NOTRUN, fp, [
+            _v(CODE_WRITE_BOUNDARY, report["error"], severity="mid")])
+
+    rows = report.get("rows") or []
+    if rows:
+        for r in rows[:20]:
+            out.append(_v(
+                CODE_WRITE_BOUNDARY,
+                "the recorder saw this row at insert time (session=%r "
+                "seq=%s, state_at_insert=%r, seen_at=%s) and it is STILL "
+                "inline (created_at=%s) — the new writer externalises "
+                "within the request, so a row that stays inline was "
+                "written by a writer that does not externalise"
+                % (r.get("session_id"), r.get("seq"),
+                   r.get("state_at_insert"), r.get("seen_at"),
+                   r.get("created_at"))))
+    # The count is in the fingerprint, so a reader can see how many were
+    # looked at even when the verdict is green.
+    return _result("MSG-INV-8", RED if out else GREEN, fp, out)
+
+
 def _db_path_of(conn: sqlite3.Connection) -> Optional[Path]:
     """The file behind an open connection, when it can be found."""
     for row in conn.execute("PRAGMA database_list").fetchall():
@@ -879,6 +967,22 @@ def run_msg_invariants(workspace: Union[str, Path], db: Union[str, Path],
     The three states are kept apart: ``NOTRUN`` is not ``GREEN`` and
     not ``RED``.  The fingerprint of every criterion says how many files
     and lines it looked at.
+
+    **MSG-INV-8 is PUBLISHED SEPARATELY, not inside this group.**
+
+    The group ``msg_inv`` is a CONTRACT: the acceptance layer compares
+    its check names against a fixed set of SEVEN (``MSG_INV_NAMES`` in
+    ``phase2_s3m.py``) and reports "缺项" / "多出的判据名" when the set
+    does not match.  And the group's VERDICT is the roll-up of its
+    members — so adding an eighth member would (a) break the name-set
+    contract and (b) flip the group's verdict to NOTRUN on every
+    library whose recorder is not installed yet, which would turn
+    M-1 and M-2 red for a reason that has nothing to do with them.
+
+    ⇒ So the eighth criterion is published under its own key
+    (``write_boundary``), and the acceptance layer reads it there.  One
+    group, one question, one verdict — and the recorder's question does
+    not contaminate the externalisation group's verdict.
     """
     ws = Path(workspace)
     conn = sqlite3.connect(str(db))
@@ -893,6 +997,7 @@ def run_msg_invariants(workspace: Union[str, Path], db: Union[str, Path],
             "MSG-INV-6": check_msg_inv6(ws, conn),
             "MSG-INV-7": check_msg_inv7(ws, conn, agent_id),
         }
+        write_boundary = check_msg_inv8(conn)
     finally:
         conn.close()
     violations: List[Dict[str, Any]] = []
@@ -912,4 +1017,6 @@ def run_msg_invariants(workspace: Union[str, Path], db: Union[str, Path],
         "checks": checks,
         "violations": violations,
         "violation_count": len(violations),
+        # The write boundary is its own group (see the docstring).
+        "write_boundary": write_boundary,
     }

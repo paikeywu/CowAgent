@@ -1718,6 +1718,39 @@ class MemoryManager:
             logger.warning(
                 f"[MemoryManager] external-edit reconciliation skipped: {e}")
 
+        # 【裁决 G-2026-11-06-Q2】写后兜底判定必须**早于**早退分支。
+        #
+        # 为什么在这里（而不是在写入之后）：
+        #   旧桌面端（十二列 INSERT，不认识 body 四列）送来的行**不会进
+        #   pending** —— 它们是别的写者写的，本进程没写过它们。而
+        #   ``manager.py:1578`` 的 ``file_hash_matches`` 会因为那个旧写者
+        #   同时写了 ``files.hash`` 而判定「内容没变」⇒ continue ⇒
+        #   **pending 为空** ⇒ ``if not pending: ... return`` ★早退★
+        #   ⇒ 判定永远走不到 ⇒ 那行永远停在 ``unresolved`` ⇒
+        #   M4 / Q1 永远红，且没有任何人会发现。
+        #
+        # 为什么可以放在这里（架构师裁决的三个实测支撑）：
+        #   ① 判定读**真源层**，而真源在 scan 阶段已读完
+        #      （``manager.py:1509-1514``）⇒ pending 为空时判定照常可跑；
+        #   ② 判定是**幂等**的（``decide_origin.py:316`` 的
+        #      ``WHERE id=? AND body_origin='unresolved'`` 乐观锁）
+        #      ⇒ 重复跑不产生副作用；
+        #   ③ 判定**不写 text_state**（``decide_origin.py:43-50``）
+        #      ⇒ 不会污染认证状态。
+        #
+        # **判定只有这一处**（架构师裁决 §3.3「一处实现，两个调用者才是
+        # 同一个规则」）：原来的晚调用点（写入之后、正常路径末尾）已删除，
+        # 否则同一批行会被判定两次。
+        #
+        # 它**永不抛进 sync**：判定失败是一条被记下来的事实，不是一次
+        # 失败的同步 —— 写入已经成功了，拒绝上报只会把债藏起来。
+        try:
+            self._decide_after_write()
+        except Exception as e:
+            logger.warning(
+                "[MemoryManager] the decision before the early return did "
+                "not complete: %s: %s", type(e).__name__, e)
+
         if not pending:
             # P0-11 P-2: nothing changed on disk, but the truth layer's
             # RELEASE state may have moved (a release writes a new version
@@ -1943,14 +1976,20 @@ class MemoryManager:
         # about the past, not about the current index.
         self._certify_after_write()
 
-        # T2b: the write path's own DECISION.  A row that arrives with
-        # ``body_origin='unresolved'`` — the old desktop build writes
-        # exactly that shape, because its twelve-column INSERT does not
-        # know the body columns — must not stay undecided.  The decision
-        # is by CONTENT (D1/D2) and it rides on the write because it
-        # reads the truth layer, which is complete by now.
-        self._decide_after_write()
-
+        # T2b: the write path's own DECISION **moved** (2026-11-06,
+        # 【裁决 G-2026-11-06-Q2】).  It used to run HERE — after the
+        # write, on the normal path only.  That placement had a hole:
+        # a row written by the OLD desktop build never enters ``pending``
+        # (this process did not write it), and the old build also writes
+        # ``files.hash``, so ``file_hash_matches`` says "the content did
+        # not change" ⇒ ``continue`` ⇒ **pending is empty** ⇒ the
+        # early return at ``if not pending: ... return`` fires ⇒ **this
+        # call site was unreachable for exactly the rows it existed for**.
+        #
+        # The decision now runs BEFORE that early return (one call site,
+        # one rule — 架构师裁决 §3.3).  The certification stays here:
+        # it certifies the rows THIS write produced, and it is only
+        # meaningful once the write happened.
         self._dirty = False
 
     def flush_memory(

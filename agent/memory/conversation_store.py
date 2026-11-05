@@ -786,6 +786,11 @@ class ConversationStore:
         # history query -- runs are auxiliary to conversation storage.
         self._runs_ready = False
         self._artifacts_ready = False
+        # True once the messages write-boundary recorder is confirmed
+        # present. When it is not, the write boundary cannot be audited
+        # -- but conversations still work, because the recorder never
+        # refuses a write (2026-11-06, 交办书 I-2).
+        self._write_watch_ready = False
         self._init_db()
 
     # ------------------------------------------------------------------
@@ -1204,6 +1209,15 @@ class ConversationStore:
         with self._lock:
             conn = self._connect()
             try:
+                # The write-boundary RECORDER (2026-11-06, 交办书 I-2).
+                # It is installed HERE — on the write path — because the
+                # recorder is a WRITE, and a measurement must not write to
+                # the thing it measures (交办书 D-2's ``certify=False``).
+                # The trigger never refuses: it only records what it saw,
+                # so the patrol can tell the old writer's rows (still
+                # inline forever) from the new writer's (externalised
+                # within the request).
+                self._ensure_write_watch(conn)
                 with conn:
                     aid = self._agent_id
                     if not create_if_missing:
@@ -3124,6 +3138,48 @@ class ConversationStore:
         finally:
             conn.close()
         self._schema_identity = self._db_identity()
+
+    def _ensure_write_watch(self, conn: sqlite3.Connection) -> bool:
+        """Install the ``messages`` write-boundary RECORDER, if it is not
+        there yet (idempotent).
+
+        **Why this is NOT in ``_init_db``.**  The recorder is a WRITE
+        (a table + a trigger), and ``_init_db`` runs when ANY handle is
+        opened — including the **read-only** handles the inspector opens
+        while MEASURING the library.  Installing it there would make a
+        measurement write to the thing it measures, which is the exact
+        failure the acceptance layer's ``certify=False`` switch was added
+        to prevent (交办书 D-2).  ⇒ **the recorder is installed on the
+        WRITE path only**, where a write is what is happening anyway.
+
+        **Why it is idempotent and cheap.**  ``CREATE TABLE IF NOT EXISTS``
+        + ``CREATE TRIGGER IF NOT EXISTS`` are no-ops once installed, and
+        the check is one ``sqlite_master`` lookup.
+
+        Returns True when the recorder is in place afterwards.
+        """
+        if self._write_watch_ready:
+            return True
+        try:
+            from agent.memory import msg_write_guard
+            if msg_write_guard.is_installed(conn):
+                self._write_watch_ready = True
+                return True
+            report = msg_write_guard.install(conn)
+            self._write_watch_ready = bool(report.get("installed"))
+            if not self._write_watch_ready:
+                logger.warning(
+                    "[ConversationStore] The messages write-boundary "
+                    "recorder is unavailable (%s); conversations are "
+                    "unaffected, but the write boundary cannot be "
+                    "audited", "; ".join(report.get("errors") or []))
+        except Exception as e:
+            self._write_watch_ready = False
+            logger.warning(
+                "[ConversationStore] The messages write-boundary recorder "
+                "could not be installed (%s: %s); conversations are "
+                "unaffected", type(e).__name__, e)
+        return bool(self._write_watch_ready)
 
     def _init_artifacts(self, conn: sqlite3.Connection) -> None:
         """Create the artifacts index without ever risking the core schema."""
