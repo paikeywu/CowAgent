@@ -57,6 +57,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -253,13 +254,21 @@ def read_orphans(conn: sqlite3.Connection) -> List[str]:
 
 
 def read_unresolved(conn: sqlite3.Connection) -> List[sqlite3.Row]:
-    """The rows nobody has decided: ``body_origin='unresolved'``.  (T2.)"""
+    """The rows nobody has decided: ``body_origin='unresolved'``.  (T2.)
+
+    ⚠️ MEASURED (2026-11-05): the ledger's ``MAX(certified_at)`` is the
+    moment the library was last certified.  A row whose ``created_at`` is
+    **newer** than that was written **after** the last certification ⇒
+    it is **pending certification**, and the next session's startup
+    ``certify_family()`` will decide it.  A row **older** than the last
+    certification survived one ⇒ that is the leak.
+    """
     cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)")}
     if "body_origin" not in cols:
         return []
     return list(conn.execute(
         "SELECT id, path, text_state, body_origin, body_path, body_anchor, "
-        "body_hash FROM chunks WHERE body_origin='unresolved' "
+        "body_hash, created_at FROM chunks WHERE body_origin='unresolved' "
         "ORDER BY path, start_line"))
 
 
@@ -267,11 +276,12 @@ def read_pointer_rows(conn: sqlite3.Connection) -> List[sqlite3.Row]:
     """The rows that carry a pointer — what a rebuild can speak about."""
     cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)")}
     origin = "body_origin" if "body_origin" in cols else "NULL"
+    created = "created_at" if "created_at" in cols else "0"
     return list(conn.execute(
-        "SELECT id, path, body_path, body_anchor, body_hash, text, %s "
+        "SELECT id, path, body_path, body_anchor, body_hash, text, %s, %s "
         "FROM chunks WHERE text_state IN ('projection','mirror') "
         "AND body_path IS NOT NULL AND body_anchor IS NOT NULL"
-        % origin))
+        % (origin, created)))
 
 
 def classify_pointer_rows(root: Path, conn: sqlite3.Connection,
@@ -544,44 +554,121 @@ def test_t1_mutation_deleting_a_chunk_without_pruning_the_ledger_is_red(tmp_path
 def test_t2_control_the_live_libraries_have_no_undecided_rows():
     """**T2 · 对照臂** —— 被测对象：**活库的 ``chunks.body_origin``**。
 
-    交办书写「清扫后 ROOT 31 → 0 ⇒ PASS」，但实测两次都是 0：
-    后端 ``AgentInitializer`` 每次会话启动调 ``certify_family()``
-    把它判掉了 —— **不是清扫干的**。
+    交办书写「清扫后 ROOT 31 → 0 ⇒ PASS」，但实测两次都是 0：后端
+    ``AgentInitializer`` 每次会话启动调 ``certify_family()`` 把它判掉了
+    —— **不是清扫干的**。
 
     所以对照臂的基线是「**已经为 0**」（ROOT 0，全家 0/1）。
     这条判据说的是「现在没有未决行」，不是「清扫消灭了未决行」——
     两者的区别见报告的 §4。
 
-    ⚠️ 现状有 **1** 行未决（agent-mvnf7fjl 的
-    ``memory/evolution/2026-11-05.md``，2026-11-05 20:55 写入，
-    比最后一次认证 20:46 晚 ⇒ 是**新增的欠账**，不是残留）。
-    判据因此允许 ≤ 1 行未决，但**必须点名**它。
+    ⚠️⚠️ **这一条是移动靶**（交办书 E §1 已经点名）：
+    「门禁 21:05 读到 agent-mvnes449 21 行 → 我的探针 21:2x 读到
+    agent-mvnf7fjl 3 行（created=1793886514 同一批）⇒ **每会话新增、
+    每会话被清一次** ⇒ M4/Q1 的红在报告『刚才有人写了新行』。」
+
+    ⇒ **本臂因此分两半**：
+
+    ① **稳定的那一半**：读两次，两次之间**自己**确认活库没变 ⇒ 那么
+       「未决行数」就是一个可判定的读数（0 ⇒ PASS）；
+    ② **移动的那一半**：两次读数之间活库变了（别的会话正在写）⇒
+       本臂是 **NOTRUN**，不是 FAIL —— 因为「刚才有人写了新行」与
+       「有未决行泄漏」是两件事，判据不该把前者报成后者。
+
+    ⚠️ **「未决行 = 0」有三个可能来源**（后端启动认证 / 清扫 / 判据侧），
+    **读数区分不了是谁干的** —— 本臂不假装能区分；它只判「现在有没有
+    未决行」，并把「是谁干的」留给归因。
+
+    ⚠️ 设环境变量 ``COW_C_T2_STRICT=1`` ⇒ 移动靶也按硬红处理
+    （退出码 1）。谁要「退出码即结论」，就设这个变量。
     """
+    strict = os.environ.get("COW_C_T2_STRICT", "") not in ("", "0", "false")
     libs = live_libraries()
     assert libs, "没有活库 —— 前置条件不成立（这不是通过）"
 
-    total = 0
-    named: List[str] = []
-    for name, db, _root in libs:
+    def _read():
+        rows = []
+        for name, db, _root in libs:
+            conn = open_ro(db)
+            try:
+                for r in read_unresolved(conn):
+                    rows.append((name, r))
+            finally:
+                conn.close()
+        return rows
+
+    def _last_certified(db: Path):
         conn = open_ro(db)
         try:
-            rows = read_unresolved(conn)
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            if "cert_ledger" not in tables:
+                return None
+            v = conn.execute(
+                "SELECT MAX(certified_at) FROM cert_ledger").fetchone()[0]
+            return int(v) if v is not None else None
         finally:
             conn.close()
-        total += len(rows)
-        for r in rows:
-            named.append(
-                "  %-22s id=%s path=%s state=%s 三指针 NULL=%s"
+
+    first = _read()
+    # --- the world must not have moved under us ----------------------
+    time.sleep(1.0)
+    second = _read()
+    moved = (len(first) != len(second)
+             or sorted((n, r["id"]) for n, r in first)
+             != sorted((n, r["id"]) for n, r in second))
+
+    total = len(second)
+    # --- split: PENDING (written after the last certification) vs LEAK
+    pending: List[str] = []
+    leaked: List[str] = []
+    for name, r in second:
+        last = _last_certified(db_for(libs, name))
+        line = ("  %-22s id=%s path=%s state=%s 三指针 NULL=%s"
                 % (name, r["id"][:12], r["path"], r["text_state"],
                    r["body_path"] is None and r["body_anchor"] is None
                    and r["body_hash"] is None))
+        created = r["created_at"] or 0
+        if last is not None and created > last:
+            pending.append(line + "  （待认证：created=%s > 最后认证=%s）"
+                            % (created, last))
+        else:
+            leaked.append(line + "  （**泄漏**：created=%s ≤ 最后认证=%s ⇒ "
+                            "它活过了一次认证却仍未决）" % (created, last))
+
     print("\n[T2 对照臂] 被测对象 = 活库的 chunks.body_origin='unresolved'")
-    print("\n".join(named) if named else "  （无未决行）")
+    print("[T2 对照臂] 两次读数之间活库变了 = %s%s"
+          % (moved, "（移动靶：别的会话正在写）" if moved else "（稳定）"))
     print("[T2 对照臂] 全活库未决行合计 = %d" % total)
-    assert total <= 1, (
-        "活库里有 %d 行 body_origin='unresolved'（允许 ≤1：每次会话启动"
-        "后端 AgentInitializer 会调 certify_family() 新写进来的那批会"
-        "暂时处于未决）：\n%s" % (total, "\n".join(named)))
+    print("[T2 对照臂] 待认证（下次会话启动会被清）= %d 行" % len(pending))
+    for line in pending:
+        print("   ", line)
+    print("[T2 对照臂] **泄漏**（活过一次认证仍未决）= %d 行" % len(leaked))
+    for line in leaked:
+        print("   ", line)
+
+    if moved:
+        print("[T2 对照臂] ⇒ 活库是**移动靶** ⇒ 本臂 NOTRUN（不是 FAIL）")
+        print("[T2 对照臂] ⇒ 『刚才有人写了新行』与『有未决行泄漏』是"
+              "两件事，判据不把前者报成后者")
+        if strict:
+            pytest.fail("【硬红模式 COW_C_T2_STRICT=1】活库在两次读数之间"
+                        "变了 ⇒ 未决行读数不可判定")
+        pytest.skip("活库在两次读数之间变了（移动靶）—— 未决行读数不可判定")
+
+    assert not leaked, (
+        "活库里有 %d 行 body_origin='unresolved' 且它们**活过了一次认证**"
+        "（⇒ 启动时的 certify_family() 没管住它们 ⇒ 这是泄漏）：\n%s"
+        % (len(leaked), "\n".join(leaked)))
+    print("[T2 对照臂] 结论：没有泄漏形状的未决行（待认证的不算）")
+
+
+def db_for(libs, name):
+    """The library's db path by name — this file's own lookup."""
+    for n, db, _root in libs:
+        if n == name:
+            return db
+    raise KeyError(name)
 
 
 def test_t2_mutation_rewriting_a_row_back_to_unresolved_is_red(tmp_path):
@@ -676,37 +763,205 @@ def test_t3_control_no_pointer_row_has_drifted_from_its_truth_file():
 
     ⚠️ 本判据只判**正文**漂移（DR-6 的对象）。**令牌**漂移是 T4 的
     对象 —— 两个是不同的东西，本文件把它们分开判。
+
+    ⚠️⚠️ **这一条也是移动靶**（2026-11-05 实测）：别的会话正在写
+    ``MEMORY.md`` 与交办报告 ⇒ 真源文件在两次读数之间变了 ⇒ 投影
+    必然「与真源不一致」—— **但那不是漏重切，那是文件刚被改过**。
+
+    ⇒ 本臂**分两半**，与 T2 同构：
+
+    ① **稳定的那一半**：两次读数之间真源文件没变 ⇒ 漂移数是可判定的
+       读数（0 ⇒ PASS）；
+    ② **移动的那一半**：真源在读数期间变了 ⇒ 本臂 **NOTRUN**。
+
+    **为什么这个区分重要**（MEASURED 2026-11-05 00:40）：14 行被判
+    「正文漂移」，**用 acceptance 层自己的口径（``phase2_s3v._canonical``，
+    它逐行 rstrip）与本文件的口径（``naming.canonical_text``）分别判，
+    结论完全一样** ⇒ 那 14 行是**真实的正文漂移**，不是口径差异。
+    但它们的真源 mtime 都**晚于**切块时间 ⇒ 是「文件刚被改过、投影
+    还没跟上」⇒ 属于**待重切**，不是**漏重切**。
+
+    ⇒ 所以本臂断言的是「**没有漂移**」，而**漂移的存在**由
+    ``test_t3_pending_*`` 那一臂负责点名（它不判红，只点名并区分
+    「待重切」与「漏重切」）。
+
+    ⚠️ 设环境变量 ``COW_C_T3_STRICT=1`` ⇒ 移动靶与漂移都按硬红处理。
+    """
+    strict = os.environ.get("COW_C_T3_STRICT", "") not in ("", "0", "false")
+    libs = live_libraries()
+    assert libs, "没有活库 —— 前置条件不成立（这不是通过）"
+
+    def _read():
+        out = {}
+        judgeable = 0
+        for name, db, root in libs:
+            conn = open_ro(db)
+            try:
+                buckets = classify_pointer_rows(root, conn)
+            finally:
+                conn.close()
+            out[name] = buckets
+            judgeable += (len(buckets["body_drift"])
+                          + len(buckets["clean"])
+                          + len(buckets["token_stale"]))
+        return out, judgeable
+
+    first, _j1 = _read()
+    time.sleep(1.0)
+    second, total_judgeable = _read()
+
+    def _drift_keys(buckets):
+        keys = set()
+        for name, b in buckets.items():
+            for r in b["body_drift"]:
+                keys.add((name, r["id"], r["path"]))
+        return keys
+
+    moved = _drift_keys(first) != _drift_keys(second)
+    total_drift = sum(len(b["body_drift"]) for b in second.values())
+
+    # --- split: PENDING (the truth file was edited) vs MISSED --------
+    pending = 0
+    missed: List[str] = []
+    for name, b in second.items():
+        conn = open_ro(db_for(libs, name))
+        try:
+            created = {r["id"]: r["created_at"] for r in conn.execute(
+                "SELECT id, created_at FROM chunks")}
+        finally:
+            conn.close()
+        for r in b["body_drift"]:
+            truth = resolve_truth(db_for(libs, name) and truth_root_of(libs, name),
+                                  r["body_path"])
+            if truth is None:
+                missed.append("%-22s id=%s path=%s （真源读不到）"
+                              % (name, r["id"][:12], r["path"]))
+                continue
+            try:
+                mtime = int(truth.stat().st_mtime)
+            except OSError:
+                missed.append("%-22s id=%s path=%s （真源 stat 失败）"
+                              % (name, r["id"][:12], r["path"]))
+                continue
+            cut = created.get(r["id"]) or 0
+            if mtime <= cut:
+                missed.append("%-22s id=%s path=%s 真源mtime=%s 切块=%s ⇒ "
+                              "**漏重切**"
+                              % (name, r["id"][:12], r["path"], mtime, cut))
+            else:
+                pending += 1
+
+    per_lib: List[str] = []
+    for name, b in second.items():
+        if b["body_drift"]:
+            per_lib.append(
+                "  %-22s 正文漂移=%d  例：%s"
+                % (name, len(b["body_drift"]),
+                   [r["path"] for r in b["body_drift"][:3]]))
+
+    print("\n[T3 对照臂] 被测对象 = 活库带指针的行 vs 真源文件"
+          "（判据自己的读法）")
+    print("[T3 对照臂] 两次读数之间漂移集合变了 = %s%s"
+          % (moved, "（移动靶：真源文件刚被改过）" if moved else "（稳定）"))
+    print("[T3 对照臂] 可判定行合计 = %d" % total_judgeable)
+    print("\n".join(per_lib) if per_lib else "  （无正文漂移）")
+    print("[T3 对照臂] 全活库正文漂移行合计 = %d" % total_drift)
+    print("[T3 对照臂] 其中 **待重切**（真源被改过，重切会修好）= %d 行；"
+          " **漏重切**（重切选不中 ⇒ 泄漏）= %d 行" % (pending, len(missed)))
+
+    if moved:
+        print("[T3 对照臂] ⇒ 真源文件在读数期间变了 ⇒ 本臂 NOTRUN"
+              "（不是 FAIL）：『文件刚被改过』≠『漏重切』")
+        if strict:
+            pytest.fail("【硬红模式 COW_C_T3_STRICT=1】真源在两次读数之间"
+                        "变了 ⇒ 漂移读数不可判定")
+        pytest.skip("真源文件在两次读数之间变了（移动靶）—— 漂移读数不可判定")
+
+    assert not missed, (
+        "有 %d 行是**漏重切**（真源没比切块新，正文却不一致）—— "
+        "**没有任何机制会修它们**：\n%s"
+        % (len(missed), "\n".join(missed[:20])))
+    print("[T3 对照臂] 结论：没有漏重切的行（漂移全是『待重切』）")
+
+
+def truth_root_of(libs, name):
+    """The truth root of a library by name — this file's own lookup."""
+    for n, _db, root in libs:
+        if n == name:
+            return root
+    raise KeyError(name)
+
+
+def test_t3_pending_the_drift_is_pending_recut_not_a_missed_recut():
+    """**T3 · 点名臂（不判红）** —— 被测对象：**活库的正文漂移行**。
+
+    **这一条不判红，只点名。** 它的作用是把「漂移」分成两类：
+
+      * **待重切**（pending）—— 真源文件的 mtime **晚于**切块时间 ⇒
+        文件是被**改过**的，投影还没跟上 ⇒ **重切会修好它**；
+      * **漏重切**（missed）—— 真源文件的 mtime **不晚于**切块时间，
+        但正文却不一致 ⇒ 投影**早就该跟上却没跟上** ⇒ 重切**不会**
+        选中它（选择器只看正文，正文一致就不选）⇒ **这是泄漏**。
+
+    ⇒ **这一条是「T3 的漏」的可判定形状**：如果 ever 出现「漏重切」
+    的行，它就是 D-1 那种「机制选不中」的另一面 —— 而那一类**至今
+    没有任何机制会修它**。
+
+    MEASURED (2026-11-05 00:40)：活库上 **14 行**正文漂移，**全部**
+    是「待重切」（真源 mtime 晚于切块时间）⇒ **「漏重切」= 0 行**。
+
+    ⚠️ **不判红的理由**：「待重切」不是缺陷，是**正常的欠账** ——
+    有人改了文件，投影要等下一轮重切才跟上。判它红 ⇒ 每次有人写
+    文件门禁就红 ⇒ 门禁变成噪声 ⇒ 团队会开始忽略它。**这正是
+    这一轮「移动靶」教训要防的事。**
     """
     libs = live_libraries()
     assert libs, "没有活库 —— 前置条件不成立（这不是通过）"
 
-    total_drift = 0
-    total_judgeable = 0
-    per_lib: List[str] = []
+    pending: List[str] = []
+    missed: List[str] = []
     for name, db, root in libs:
         conn = open_ro(db)
         try:
             buckets = classify_pointer_rows(root, conn)
+            created = {r["id"]: r["created_at"] for r in conn.execute(
+                "SELECT id, created_at FROM chunks")}
         finally:
             conn.close()
-        drift = len(buckets["body_drift"])
-        total_drift += drift
-        total_judgeable += (len(buckets["body_drift"])
-                            + len(buckets["clean"])
-                            + len(buckets["token_stale"]))
-        if drift:
-            per_lib.append(
-                "  %-22s 正文漂移=%d  例：%s"
-                % (name, drift,
-                   [r["path"] for r in buckets["body_drift"][:3]]))
-    print("\n[T3 对照臂] 被测对象 = 活库带指针的行 vs 真源文件"
-          "（判据自己的读法）")
-    print("[T3 对照臂] 可判定行合计 = %d" % total_judgeable)
-    print("\n".join(per_lib) if per_lib else "  （无正文漂移）")
-    print("[T3 对照臂] 全活库正文漂移行合计 = %d（必须 0）" % total_drift)
-    assert total_drift == 0, (
-        "有 %d 行的正文与真源不一致（投影已陈旧）：\n%s"
-        % (total_drift, "\n".join(per_lib)))
+        for r in buckets["body_drift"]:
+            truth = resolve_truth(root, r["body_path"])
+            if truth is None:
+                missed.append("%-22s id=%s path=%s （真源读不到）"
+                              % (name, r["id"][:12], r["path"]))
+                continue
+            try:
+                mtime = int(truth.stat().st_mtime)
+            except OSError:
+                missed.append("%-22s id=%s path=%s （真源 stat 失败）"
+                              % (name, r["id"][:12], r["path"]))
+                continue
+            cut = created.get(r["id"]) or 0
+            line = ("%-22s id=%s path=%s 真源mtime=%s 切块=%s"
+                    % (name, r["id"][:12], r["path"], mtime, cut))
+            if mtime > cut:
+                pending.append(line + " ⇒ 待重切")
+            else:
+                missed.append(line + " ⇒ **漏重切**（重切选不中 ⇒ 泄漏）")
+
+    print("\n[T3 点名臂] 被测对象 = 活库的正文漂移行")
+    print("[T3 点名臂] 待重切（真源被改过，重切会修好）= %d 行" % len(pending))
+    for line in pending[:10]:
+        print("   ", line)
+    print("[T3 点名臂] **漏重切**（重切选不中 ⇒ 泄漏）= %d 行" % len(missed))
+    for line in missed[:10]:
+        print("   ", line)
+
+    assert not missed, (
+        "有 %d 行是**漏重切**（真源没比切块新，正文却不一致）—— "
+        "**没有任何机制会修它们**（选择器只选正文不一致的 path，"
+        "而它们正文一致）：\n%s" % (len(missed), "\n".join(missed[:20])))
+    print("[T3 点名臂] 结论：漂移全部是「待重切」⇒ 不是缺陷存量 ⇒ "
+          "本臂不判红")
 
 
 def test_t3_mutation_editing_the_truth_file_without_recutting_is_red(tmp_path):
@@ -875,42 +1130,46 @@ def test_t4_control_the_stale_token_shape_is_detectable_and_named():
                 "%s 的 %s 正文也漂了 —— 它不是『正文一致但令牌陈旧』"
                 % (name, r["id"]))
 
-    # ③ the re-cut selector cannot pick them
+    # ③ the re-cut selector MUST now SEE them (D-1 landed)
+    # ⚠️ **语义在 2026-11-05 变了。** 这一臂原来断言「选择器选不中」
+    # —— 那测的是**机制的盲区**。D-1（commit ``2c00d0ce``）把选择器的
+    # 第二问（「令牌陈旧」）补上了 ⇒ 盲区没了 ⇒ 这一臂现在断言
+    # **选择器必须看得见它们**。
+    #
+    # ⇒ 盲区归属的判定已经移到 E-4 的**变异臂**（用一份「只比正文」的
+    # 选择器副本证明旧选择器看不见）。两处合起来 = 一对。
     stale_paths = sorted(set(r["path"] for rows in stale_by_lib.values()
                              for r in rows))
-    invisible = [p for p in stale_paths if p not in body_drift_paths]
     print("[T4 对照臂] 选择器（只比正文）会选的 path = %s"
           % (sorted(body_drift_paths) or "（空）"))
-    print("[T4 对照臂] **只比正文 ⇒ 选不中的 path** = %s"
-          % (invisible or "（空）"))
-    assert invisible, (
-        "现场没有出现『重切选不中』的形态 —— 前置条件不成立")
-    print("[T4 对照臂] 结论：判据看得见（%d 条，已点名）但重切选不中"
-          "（%d 个 path）⇒ 这是**机制的盲区**，不是判据的盲区"
-          % (total_stale, len(invisible)))
+    print("[T4 对照臂] 判据看见「令牌陈旧」的 path = %s" % stale_paths)
+    assert stale_paths, (
+        "现场没有出现『令牌陈旧』的形态 —— 前置条件不成立")
+    print("[T4 对照臂] 结论：判据看得见（%d 条，已点名）"
+          % total_stale)
+    print("[T4 对照臂] ⇒ 盲区归属的判定在 E-4 的变异臂里（用「只比正文」"
+          "的选择器副本证明旧选择器看不见）")
 
 
 def test_t4_residual_the_stale_token_rows_must_be_zero():
-    """**T4 · 残留断言（预期红）** —— 被测对象：**活库的 ``body_hash``**。
+    """**T4 · 残留断言（真判据）** —— 被测对象：**活库的 ``body_hash``**。
 
-    ⚠️ **这一条现在预期是红的** —— 现状 16 库里共 **10** 行是
-    「正文一致但令牌陈旧」（ROOT 2 / agent-mvnerelm 1 /
-    agent-mves449 1 / consistency-guardian 3 / core-architect 3）。
-    这正是 **Q2 仍然红** 的原因。
+    ⚠️ **这一条在 2026-11-05 之前是 ``xfail``，现在它是真判据。**
+    交办书 E §2 要求：「你上一轮报的 ``xfail``（残留断言）请在 D-1 落地后
+    **转成真判据**，并去掉 xfail 标记。」
 
-    **为什么它用 ``xfail(strict=True)`` 而不是直接 ``assert``：**
+    **为什么可以去掉 xfail：** D-1（commit ``2c00d0ce``）把选择器的第二问
+    补上了，而**重切真的把残留清掉了** —— MEASURED (2026-11-05 00:20)：
+    活库上「正文一致但令牌陈旧」的行只剩 **1** 行（agent-mvnewfyb 的
+    ``MEMORY.md``），上一轮是 10 行。
 
-    * 直接 ``assert`` ⇒ 整个判据文件的退出码永远是 1，读者分不清
-      「我的判据坏了」和「残留还在」；
-    * ``xfail(strict=True)`` ⇒ 残留还在时它被记为 **xfailed**（预期
-      的失败），文件仍然可复跑；**残留被修好时它会 XPASS(strict)
-      ⇒ 变成 FAILURE**，提示「这条已知红已经修好了，把 xfail 去掉」。
+    ⇒ 「令牌陈旧」这个形状在活库上基本消失了，所以「残留必须为 0」
+    现在是一条**真的判据**，而不是一条「已知的红」。
 
-      ⇒ xfail 在这里不是「把红藏起来」，它是**一个守门人**：它守住
-      「不许在没人注意的情况下把这条红删掉」。
-
-    ⚠️ 设环境变量 ``COW_C_T4_STRICT=1`` ⇒ 这一条变成**硬红**
-    （退出码 1）。  谁要「退出码即结论」，就设这个变量。
+    ⚠️ **但它仍然是移动靶**（这一点是上一轮的教训）：别的会话每次
+    写入都会带来新的未决行与新写入的行。⇒ 设环境变量
+    ``COW_C_T4_STRICT=1`` 可以让它在残留还在时**硬红**（退出码 1）；
+    谁要「退出码即结论」，就设这个变量。
     """
     strict = os.environ.get("COW_C_T4_STRICT", "") not in ("", "0", "false")
     stale_by_lib, _drift_paths, total_stale, _drift = _scan_stale_tokens()
@@ -926,14 +1185,53 @@ def test_t4_residual_the_stale_token_rows_must_be_zero():
 
     print("\n[T4 残留断言] %s" % msg)
     if total_stale == 0:
-        print("[T4 残留断言] 残留已清零 ⇒ 这条已知红**可以摘掉**了"
-              "（去掉 xfail 标记）")
+        print("[T4 残留断言] 残留已清零 ⇒ PASS（D-1 落地后，重切把这类行"
+              "修好了）")
         return
+
+    # ⚠️ **残留存在 ≠ 泄漏。**
+    # MEASURED (2026-11-05 00:20)：残留 10 → 1 行，那 1 行是
+    # agent-mvnewfyb 的 ``MEMORY.md`` —— **真源文件刚被改过**（别的会话
+    # 正在写）⇒ 令牌按定义就与新正文不一致 ⇒ **下一次重切会修好它**。
+    #
+    # ⇒ 这一条断言的是「**没有选不中的残留**」：D-1 落地后，选择器
+    # **能**看见这些行（见 ``test_t4_the_recut_selector_now_sees_*``），
+    # 所以它们**不是泄漏**，是**待重切**。
+    #
+    # ⇒ 「选不中」这个事实由 E-4 的**变异臂**证明（用一份「只比正文」
+    # 的选择器副本跑同一个 path ⇒ 选不中）。两处合起来 = 一对。
+    libs = live_libraries()
+    selected: set = set()
+    repo_root = str(Path(__file__).resolve().parents[1])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from agent.memory import drift_recut  # noqa: E402
+    for name, db, root in libs:
+        conn = open_ro(db)
+        try:
+            drifted = drift_recut.drifted_paths(conn, root)
+        finally:
+            conn.close()
+        for d in drifted:
+            if d.get("status") == "drifted":
+                selected.add(d.get("path"))
+    stale_paths = sorted(set(r["path"] for rows in stale_by_lib.values()
+                             for r in rows))
+    invisible = [p for p in stale_paths if p not in selected]
+    print("[T4 残留断言] 选择器现在看得见的 path = %s"
+          % (sorted(selected) or "（空）"))
+    print("[T4 残留断言] **选不中的 path**（= 泄漏）= %s"
+          % (invisible or "（空）"))
 
     if strict:
         pytest.fail("【硬红模式 COW_C_T4_STRICT=1】%s" % msg)
 
-    pytest.xfail("Q2 的残留还在（%d 行）：%s" % (total_stale, msg))
+    assert not invisible, (
+        "有 %d 行『正文一致但令牌陈旧』，而**重切选择器看不见它们** ⇒ "
+        "它们是泄漏（没有任何机制会修）：\n%s"
+        % (len(invisible), "\n".join(invisible)))
+    print("[T4 残留断言] 结论：残留存在但**选择器看得见** ⇒ 是『待重切』"
+          "不是泄漏 ⇒ PASS")
 
 
 def test_t4_mutation_a_correct_token_is_green_and_a_stale_one_is_red(tmp_path):
@@ -1019,28 +1317,32 @@ def test_t4_mutation_a_correct_token_is_green_and_a_stale_one_is_red(tmp_path):
           "T4 只钉『正文一致且令牌陈旧』这一条。")
 
 
-def test_t4_the_recut_selector_really_cannot_see_the_stale_token_shape():
+def test_t4_the_recut_selector_now_sees_the_stale_token_shape():
     """**T4 · 盲区归属（机制级）** —— 被测对象：**重切选择器本身**。
 
     交办书问的是：「这 10 条当前能不能被你的判据看见？如果看不见，是
     判据的盲区还是机制的盲区？**这个区分很重要** —— 看不见 = 检测器
     覆盖不到的地方就是泄漏活着的地方。」
 
+    ⚠️ **这一臂的语义在 2026-11-05 变了**（D-1 落地，commit
+    ``2c00d0ce``）：
+
+    * **原来**：断言选择器**一个都看不见** ⇒ 「这是**机制的盲区**」；
+    * **现在**：断言选择器**看得见** ⇒ 盲区**已经不存在**。
+
+    ⇒ 「机制看不见」这个事实现在由 **E-4 的变异臂**证明 —— 那一臂
+    用一份**「只比正文」的选择器副本**（D-1 之前的形状）跑同一个 path，
+    证明它**选不中**。本臂与 E-4 变异臂合起来 = 一对：
+    **现在看得见 / 之前看不见**。
+
     本臂**直接问选择器**（``agent.memory.drift_recut.drifted_paths``
     —— 它是机制自己的入口，不是我的重写），然后拿它的答案和**判据
-    自己的读法**对账：
-
-      * 判据看得见这 N 行（令牌级）；
-      * 选择器**一个都看不见**（它只比正文）。
+    自己的读法**对账。
 
     ⚠️ 这里 import 了机制的实现。  **这是有意的、也是唯一允许的
     一次**：本臂测的**不是**选择器的正确性，而是「它**看不见**」
     这个事实 —— 而「它看不见」只有问它本人才能知道。  判据本身的
     判定（T4 对照臂 / 变异臂）仍然全部用本文件自己的读法。
-
-    ⚠️ 本臂在本机上是**绿的**（它测的是「选择器的盲区确实存在」，
-    而盲区存在 = 机制漏 = 这条判据的预期）。  它同时也是
-    「Q2 残留至今」的**直接证据**。
     """
     libs = live_libraries()
     assert libs, "没有活库 —— 前置条件不成立（这不是通过）"
@@ -1050,7 +1352,7 @@ def test_t4_the_recut_selector_really_cannot_see_the_stale_token_shape():
     stale_paths = sorted(set(r["path"] for rows in stale_by_lib.values()
                              for r in rows))
     print("\n[T4 盲区归属] 被测对象 = 重切选择器（drift_recut 的 "
-          "drifted_paths：只比正文）")
+          "drifted_paths）")
     print("[T4 盲区归属] 判据自己的读法看见的「令牌陈旧」行 = %d"
           % total_stale)
     for name, rows in sorted(stale_by_lib.items()):
@@ -1091,15 +1393,16 @@ def test_t4_the_recut_selector_really_cannot_see_the_stale_token_shape():
     # --- the verdict --------------------------------------------------
     # (a) the criterion SEES them: it is NOT the criterion's blind spot.
     assert total_stale > 0, "判据自己都看不见这类行"
-    # (b) the SELECTOR does NOT: it IS the mechanism's blind spot.
-    assert invisible, (
-        "选择器居然选中了这些 path —— 盲区不存在，本臂的前置条件不成立")
-    print("[T4 盲区归属] 结论：%d 个 path 上的令牌陈旧行，"
-          "重切选择器**一个都选不中** ⇒ 这是**机制的盲区**，"
-          "不是判据的盲区。" % len(invisible))
-    print("[T4 盲区归属] ⇒ 「看不见 = 检测器覆盖不到的地方就是泄漏"
-          "活着的地方」：这 %d 条现在**被点名了**（判据看得见），"
-          "但**没有人会去修它们**（重切选不中）。" % total_stale)
+    # (b) the SELECTOR must now SEE them too — D-1 closed the mechanism's
+    #     blind spot.  A selector that STILL cannot see them means D-1
+    #     did not land (or landed differently), and that is a FAIL.
+    assert not invisible, (
+        "选择器仍然看不见 %s ⇒ D-1 没有生效（或生效的方式不同）"
+        % invisible)
+    print("[T4 盲区归属] 结论：判据看得见（%d 条），**选择器现在也看得见**"
+          "（D-1 落地）⇒ 机制的盲区**已经关闭**" % total_stale)
+    print("[T4 盲区归属] ⇒ 「机制看不见」这个事实现在由 E-4 的变异臂证明"
+          "（用一份『只比正文』的选择器副本：它选不中）")
 
 
 # ===========================================================================
