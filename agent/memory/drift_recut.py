@@ -65,6 +65,35 @@ to the stored text — the same reading the criterion uses.  The
 "how far behind" number is reported for the human, but the DECISION to
 re-cut is made on the content.
 
+**The drift measurement has TWO questions, not one (2026-11-05,
+交办书 D-1).**  The selector used to ask ONE question — "does the
+rebuilt fragment differ from ``chunks.text``?" — and that question has
+a blind spot, measured on the live corpus:
+
+  * the rebuilt fragment differs from the stored text ⇒ **body drift**
+    (the projection is behind the truth layer); and
+  * the rebuilt fragment EQUALS the stored text, but the stored
+    ``body_hash`` is not the hash of that fragment ⇒ **stale token**.
+
+The second shape is invisible to the first question, so the re-cut
+never selects those paths — **the leak survives every sweep**, and the
+INV-3 criterion (``inv3-fragment-hash-mismatch``) stays red forever.
+MEASURED on this machine (2026-11-05): 10 rows across 5 libraries were
+"body consistent but token stale"; the selector selected **none** of
+their paths.  ⇒ Q2 was structurally unfixable by the re-cut.
+
+⇒ The selector now asks **BOTH** questions, and the report keeps them
+apart (``body_drift_rows`` vs ``stale_token_rows``) so a reader can see
+WHICH kind of drift a path had.  **Both are repaired by the same
+operation** (a re-cut re-derives the pointer AND the token from the
+truth file), so both must SELECT the path.
+
+**Why the token is compared the way it is.**  The drift token is
+``sha256(canonical_text(fragment))`` — the system's own definition
+(:func:`agent.memory.body_pointer.body_hash`), never a re-spelling of
+it.  A second copy of the hashing rule is exactly how the two sides
+end up disagreeing about what "the same text" means.
+
 **What a re-cut does to the ledger.**  The chunk ids are
 position-derived, so a re-cut replaces the ids.  ``replace_file_chunks``
 prunes the ledger entries of the ids that did NOT come back, inside the
@@ -272,14 +301,35 @@ def drifted_paths(conn: sqlite3.Connection,
     because the invariant the criterion guards is "the projection
     rebuilds to the truth", not "the bytes are identical" — a line-ending
     difference is not drift, a content difference is.
+
+    **TWO questions, since 2026-11-05 (交办书 D-1).**  A path is
+    selected when EITHER of these holds for at least one of its rows:
+
+      ① **body drift** — the rebuilt fragment differs from the stored
+         ``text`` (the projection is behind the truth layer); OR
+      ② **stale token** — the rebuilt fragment EQUALS the stored
+         ``text``, but the stored ``body_hash`` is not the hash of that
+         fragment (the token is from somewhere else).
+
+    ② used to be invisible here, so the re-cut never selected those
+    paths and the INV-3 red survived every sweep.  Both are repaired by
+    the same operation (a re-cut re-derives the pointer AND the token
+    from the truth file), so both must select the path.
+
+    The two counts are reported SEPARATELY (``body_drift_rows`` /
+    ``stale_token_rows``): a reader must be able to see WHICH kind of
+    drift a path had, because the two have different histories (a body
+    drift means the file moved; a stale token means the row was copied
+    from somewhere else).
     """
-    from agent.memory.body_pointer import read_fragment
+    from agent.memory.body_pointer import body_hash, read_fragment
     from agent.memory.naming import canonical_text
 
     root = Path(workspace)
     try:
         rows = conn.execute(
-            "SELECT id, path, body_path, body_anchor, text FROM chunks "
+            "SELECT id, path, body_path, body_anchor, body_hash, text "
+            "FROM chunks "
             "WHERE body_path IS NOT NULL AND body_anchor IS NOT NULL "
             "ORDER BY path, start_line, id").fetchall()
     except sqlite3.Error as e:
@@ -302,22 +352,37 @@ def drifted_paths(conn: sqlite3.Connection,
             # difference between "checked and fine" and "not checked".
             out.append({"path": path, "status": "unmeasurable",
                         "reason": "the truth file does not exist",
-                        "rows": len(group), "drifted_rows": 0})
+                        "rows": len(group), "drifted_rows": 0,
+                        "body_drift_rows": 0, "stale_token_rows": 0})
             continue
-        drifted = 0
+        body_drifted = 0
+        stale_token = 0
         checked = 0
         sample = None
-        for (cid, _p, bp, anchor, text) in group:
+        stale_sample = None
+        for (cid, _p, bp, anchor, bhash, text) in group:
             frag = read_fragment(truth, anchor)
             if frag is None:
                 continue
             checked += 1
             if canonical_text(frag) != canonical_text(text or ""):
-                drifted += 1
+                body_drifted += 1
                 if sample is None:
                     sample = {"id": cid, "anchor": anchor,
                               "stored_len": len(text or ""),
                               "rebuilt_len": len(frag)}
+                continue
+            # ② the STALE TOKEN: the body agrees with the truth, but
+            # the drift token does not.  This is the shape the old
+            # selector could not see.
+            actual = body_hash(frag)
+            if (bhash or "") != actual:
+                stale_token += 1
+                if stale_sample is None:
+                    stale_sample = {"id": cid, "anchor": anchor,
+                                    "stored_token": (bhash or "")[:32],
+                                    "actual_token": actual[:32]}
+        drifted = body_drifted + stale_token
         if drifted:
             stat = truth.stat()
             out.append({
@@ -326,11 +391,14 @@ def drifted_paths(conn: sqlite3.Connection,
                 "rows": len(group),
                 "checked_rows": checked,
                 "drifted_rows": drifted,
+                "body_drift_rows": body_drifted,
+                "stale_token_rows": stale_token,
                 "truth_file": str(truth),
                 "truth_mtime": int(stat.st_mtime),
                 "oldest_chunk_created_at": _oldest_created(conn, path),
                 "lag_seconds": _lag_seconds(conn, path, int(stat.st_mtime)),
                 "sample": sample,
+                "stale_token_sample": stale_sample,
             })
     return out
 
@@ -462,6 +530,8 @@ def recut_library(workspace: Union[str, Path],
             "path": d["path"],
             "truth_file": d.get("truth_file"),
             "drifted_rows": d.get("drifted_rows"),
+            "body_drift_rows": d.get("body_drift_rows"),
+            "stale_token_rows": d.get("stale_token_rows"),
             "rows": d.get("rows"),
             "lag_seconds": d.get("lag_seconds"),
             "would": ("re-cut this path from the truth file; the chunk "
@@ -583,12 +653,18 @@ def format_report(report: Dict[str, Any], verbose: bool = False) -> str:
                 lines.append("    [unmeasurable] %s (%s)"
                              % (d.get("path"), d.get("reason")))
                 continue
-            lines.append("    %-58s rows=%-4s drifted=%-4s lag=%ss"
+            lines.append("    %-58s rows=%-4s drifted=%-4s (body=%-4s "
+                         "token=%-4s) lag=%ss"
                          % ((d.get("path") or "")[:58], d.get("rows"),
-                            d.get("drifted_rows"), d.get("lag_seconds")))
+                            d.get("drifted_rows"),
+                            d.get("body_drift_rows"),
+                            d.get("stale_token_rows"),
+                            d.get("lag_seconds")))
             if verbose:
                 lines.append("        truth=%s" % d.get("truth_file"))
                 lines.append("        sample=%s" % d.get("sample"))
+                lines.append("        stale_token_sample=%s"
+                             % d.get("stale_token_sample"))
         if rep.get("error"):
             lines.append("    ERROR: %s" % rep["error"])
     return "\n".join(lines)

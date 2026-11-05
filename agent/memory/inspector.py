@@ -268,11 +268,45 @@ class Inspector:
     # -- public entry --------------------------------------------------------
 
     def inspect(self, *, trigger: str = "manual",
-                persist_snapshot: bool = True) -> Dict[str, Any]:
+                persist_snapshot: bool = True,
+                certify: bool = True) -> Dict[str, Any]:
         """Run all four checks. Returns the report dict (also written to
         .audit/inspector.jsonl). ``trigger`` is one of
         'shelf-rebuild' / 'startup' / 'manual' and is recorded, not branched
         on — the checks are identical at every trigger point.
+
+        **``certify`` is the READ-ONLY MODE (2026-11-05, 交办书 D-2).**
+        With ``certify=False`` the inspection performs **no write to the
+        index at all**: the ``'mirror'`` promotion is skipped, so the
+        certification ledger and the chunks table are untouched.
+
+        **Why the switch exists.**  The startup path calls
+        ``certify_family()`` on every session launch — that is a PRODUCT
+        feature (a row written after the last inspection must not stay
+        uncertified forever).  The ACCEPTANCE path calls
+        ``Inspector.inspect()`` too — and that is an INSTRUMENT, whose
+        job is to MEASURE.  A measuring instrument that writes to the
+        thing it measures produces readings that are partly
+        self-induced: the "before" and the "after" of two consecutive
+        runs are not the same world, so the comparison between them is
+        not a comparison.
+
+        MEASURED (2026-11-05): the gate's M-1 criterion called
+        ``Inspector.inspect()`` against the LIVE libraries, which called
+        ``certify_library(dry_run=False)``, which wrote certifications
+        into the live ``cert_ledger`` — so "the gate writes the live
+        library" was true, and the acceptance layer's own content digest
+        (which covers ``chunks`` only) could not see it.
+
+        ⇒ **The switch is deliberately narrow.**  It is a PARAMETER of
+        ``inspect()``, not a mode of the runtime: the startup path
+        (``bridge/agent_initializer.py``) calls ``certify_family()``
+        DIRECTLY and is NOT affected by this parameter — the product
+        behaviour at startup is unchanged.  Only the callers that pass
+        ``certify=False`` get the read-only behaviour, and the report
+        SAYS SO (``report["certify"]`` and
+        ``report["mirror_state"]["skipped_reason"]``), so a reader can
+        never mistake a read-only reading for a full one.
         """
         prev_snapshot = self._load_latest_snapshot()
         report: Dict[str, Any] = {
@@ -283,6 +317,10 @@ class Inspector:
             "violations": [],
             "snapshot_baseline": (
                 prev_snapshot["date"] if prev_snapshot else None),
+            # The mode is PART OF THE REPORT, not a hidden detail: a
+            # reader must be able to tell a read-only reading from a
+            # writing one without reading the call site.
+            "certify": bool(certify),
         }
         self._check_markdown(report)
         snapshot = self._check_facts(report, prev_snapshot)
@@ -326,7 +364,25 @@ class Inspector:
         # the promotion is only legal for the rows the invariants just
         # verified byte-for-byte.  The count is reported, so the state is
         # never a silent decoration.
-        report["mirror_state"] = self._set_mirror_state()
+        #
+        # **The promotion is the ONE write this module does to the
+        # index** — so it is the ONE thing the read-only mode turns
+        # off.  Every check above is a read.
+        if certify:
+            report["mirror_state"] = self._set_mirror_state()
+        else:
+            report["mirror_state"] = {
+                "promoted": 0,
+                "checked": 0,
+                "skipped": 0,
+                "derived": 0,
+                "refusals": [],
+                "skipped_reason": (
+                    "the read-only mode (certify=False): the 'mirror' "
+                    "promotion was NOT performed, so the index was not "
+                    "written.  This is the ACCEPTANCE mode — the "
+                    "inspection measures, it does not repair."),
+            }
         # P0-22: the sweep over EVERY index of the family. The checks above
         # look at THIS workspace; the sweep looks at every index that
         # exists — including the ones nobody has addressed in a session,

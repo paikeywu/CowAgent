@@ -193,8 +193,18 @@ def judge_m1_msg_inv_group_is_complete(report: Report, workspace: Path):
             # messages truth tree lives under the workspace root, and a
             # ROOT library's root is the workspace, an agent library's
             # root is the agent's own directory.
+            #
+            # **``certify=False`` (2026-11-05, 交办书 D-2).**  This
+            # criterion MEASURES the messages domain; it must not
+            # WRITE the library it measures.  The inspection's
+            # ``'mirror'`` promotion is the one write it would do
+            # (via ``certify_library(dry_run=False)``), and it is
+            # switched off here — so the gate's reading is a reading of
+            # the world as it is, not of the world the gate itself
+            # changed.  The criterion's 口径 (what it measures, its
+            # thresholds, its verdict) is NOT touched by this.
             report_data = Inspector(lib.workspace).inspect(
-                trigger="manual", persist_snapshot=False)
+                trigger="manual", persist_snapshot=False, certify=False)
         except Exception as e:
             detail.append("      巡检失败（%s: %s）" % (type(e).__name__, e))
             notrun.append(lib.name)
@@ -474,7 +484,8 @@ def judge_m3_the_wiring_is_real(report: Report, workspace: Path):
         try:
             from agent.memory.inspector import Inspector
             rep = Inspector(lib.workspace).inspect(trigger="manual",
-                                                    persist_snapshot=False)
+                                                    persist_snapshot=False,
+                                                    certify=False)
             group = rep.get("msg_inv")
             if group is None:
                 behaviour_detail.append("巡检报告里没有 msg_inv 组")
