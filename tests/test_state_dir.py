@@ -299,7 +299,18 @@ def test_tmp_file_is_unique_and_under_tmp_dir(monkeypatch, tmp_path):
 # 桌面端都走这里。
 
 def test_a_workspace_inside_a_source_tree_is_refused(tmp_path):
-    """L-1：工作区落在 git 源码树内 → 拒绝，并说明该指向哪里。"""
+    """L-1：工作区落在 git 源码树内 → 拒绝，并说明该指向哪里。
+
+    SVC-WSGIT-001（断言更新 · 规格演进）：这条断言原先要求文案里出现
+    「源码树」。交办把那段文案判为**误导性**并要求改写：
+    「工作区位于源码树内」既没点名真凶（``.git``），又建议把工作区指向
+    ``%USERPROFILE%\\cow`` —— 而多数安装的工作区**本来就是**那个路径，
+    等于让用户做一件做不到的事。
+
+    ⇒ 「文案里必须有『源码树』三个字」这个**措辞断言**被废止；
+    **行为断言**（拒绝必须说清楚该指向哪里、必须点名仓库）原样保留并加强：
+    现在要求文案同时给出**工作区路径**与**仓库路径**。
+    """
     tree = tmp_path / "repo"
     (tree / ".git").mkdir(parents=True)
     ws = tree / "sub" / "workspace"
@@ -310,8 +321,10 @@ def test_a_workspace_inside_a_source_tree_is_refused(tmp_path):
 
     # 拒绝必须说清楚「该指向哪里」，否则它只是挡住工作。
     message = str(exc.value)
-    assert "源码树" in message
     assert "agent_workspace" in message
+    # 并且必须说得具体：工作区在哪、仓库在哪（否则用户仍然无从下手）。
+    assert str(ws.resolve()) in message
+    assert str(tree.resolve()) in message
 
 
 def test_the_repository_root_itself_is_refused(tmp_path):

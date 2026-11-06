@@ -705,6 +705,96 @@ def _warn_if_legacy_workspace_data_exists():
         logger.warning(f"[App] Legacy workspace check failed: {e}")
 
 
+def _workspace_git_tree_violations():
+    """Which enabled Agents have a workspace that resolves inside a git tree.
+
+    Returns a tuple ``(total_agents, violations)`` where ``violations`` is a
+    list of ``(agent_id, workspace, reason)`` triples — one per affected
+    Agent. ``total_agents`` is how many enabled Agents were probed.
+
+    This is a PROBE, not a second decision: it calls the very same
+    ``assert_not_source_tree`` that ``state_root`` calls, so it can never
+    disagree with the guard. It exists so the failure is visible at
+    STARTUP instead of surfacing later as one ``[ERROR]`` line per request
+    inside a 100 MB log.
+
+    SVC-WSGIT-001: the incident this came from failed for two days
+    unnoticed. The refusal existed in the log since 2 seconds after the
+    process started, but nobody read it until a user hit a Web UI button.
+    A startup check that names the affected Agents and the first offending
+    path turns "the server is refusing service" into "the server started
+    BROKEN, here is why".
+
+    Each Agent is probed in isolation: one bad workspace must not hide the
+    others behind the first exception.
+    """
+    try:
+        from agent.registry import get_agent_registry
+        from common.state_dir import assert_not_source_tree
+
+        profiles = get_agent_registry().list(include_disabled=False)
+    except Exception as e:
+        logger.warning(f"[App] Workspace pre-check could not run: {e}")
+        return 0, []
+
+    violations = []
+    for profile in profiles:
+        try:
+            assert_not_source_tree(profile.workspace)
+        except Exception as e:
+            # The guard's own message names the culprit and the fix; keep it
+            # intact, but lead with the Agent so the reader knows WHICH
+            # Agent is broken and how many there are.
+            violations.append((profile.id, profile.workspace, str(e)))
+    return len(profiles), violations
+
+
+def _warn_workspace_inside_git_tree():
+    """Startup pre-check: refuse to start quietly with a broken workspace.
+
+    The guard (``common.state_dir.assert_not_source_tree``) is what stops
+    runtime state from being written into a repository, and it is NOT
+    weakened here — this function only asks it the question earlier and
+    louder.
+
+    What changed vs. before: the refusal used to appear as one ``[ERROR]``
+    line per call site, buried in the log, while the process kept running
+    and looked healthy from the outside. Now it is ONE summary line that
+    states how many Agents are affected and where the first offending path
+    is, and it says in the text that the server is running broken.
+
+    It does NOT stop the process: the guard keeps refusing the writes
+    either way, and a refusal that only logs is exactly what let this
+    incident hide for two days. Refusing to start would turn a broken
+    workspace into a dead service, which is a different failure with a
+    different owner.
+    """
+    total, violations = _workspace_git_tree_violations()
+    if not violations:
+        return []
+
+    first_agent, first_workspace, first_reason = violations[0]
+    logger.error(
+        "[App] WORKSPACE REJECTED BY THE SOURCE-TREE GUARD — the server is "
+        "running BROKEN: %d of %d enabled Agent(s) have a workspace inside a "
+        "git tree. Every request that touches runtime state for those "
+        "Agents will fail with 'SourceTreeWorkspaceError' until this is "
+        "fixed. First affected Agent: '%s' (workspace: %s). Full detail "
+        "for every affected Agent follows."
+        % (len(violations), total, first_agent, first_workspace)
+    )
+    for agent_id, workspace, reason in violations:
+        logger.error(
+            "[App]   - Agent '%s' (workspace: %s)\n%s"
+            % (agent_id, workspace, reason)
+        )
+    logger.error(
+        "[App] Fix the workspace layout (see the message above for the "
+        "exact culprit and the two possible fixes), then restart. Do NOT "
+        "run 'git init' on the workspace root — that is what causes this."
+    )
+
+
 def _sync_builtin_skills():
     """Sync builtin skills from project skills/ into every enabled Agent's
     workspace, so a newly configured Agent is not born without them."""
@@ -802,6 +892,13 @@ def run():
         _register_pid_file()
         _migrate_team_roster()
         _migrate_conversations()
+        # Startup pre-check for the source-tree guard: probe every enabled
+        # Agent's workspace BEFORE anything else touches the state layout, so
+        # a broken layout is one loud summary line instead of one buried
+        # [ERROR] per request for the next two days. Must run after
+        # load_config() (the registry needs the config) and after the roster
+        # migration (the roster decides the Agents' workspaces).
+        _warn_workspace_inside_git_tree()
         _warn_if_legacy_workspace_data_exists()
         # ctrl + c
         sigterm_handler_wrap(signal.SIGINT)

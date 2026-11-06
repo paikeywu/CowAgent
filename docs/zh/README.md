@@ -187,12 +187,35 @@ mkdir -p ~/cow-workspace
 这一点在启动时被强制检查。`agent_workspace` 落在检出目录里，进程会拒绝启动：
 
 ```
-common.state_dir.SourceTreeWorkspaceError: 工作区位于源码树内，拒绝把运行时状态写进源码树：'/home/<user>/CowAgent' 在 '/home/<user>/CowAgent' 之内。
+common.state_dir.SourceTreeWorkspaceError: 工作区位于某个 git 仓库内，拒绝把运行时状态写进版本库。
+  工作区：/home/<user>/CowAgent
+  仓库：/home/<user>/CowAgent（该目录下的 .git 是真凶）
   运行时状态（memory/long-term/index.db 等）属于运行它的人，不属于仓库；它一旦进入版本库，clone 的人会拿到别人的记忆索引。
-  请把 agent_workspace / workspace 指向一个工作区目录（例如 %USERPROFILE%\cow），而不是源码目录。
+  怎么修：把工作区（agent_workspace / workspace）移到 /home/<user>/CowAgent 之外（即选一个不在该仓库及其任何子目录里的路径）。
+  注意：不要在工作区根目录执行 git init —— 那会把它变成仓库根。
 ```
 
 这个检查会从工作区一路向上找 `.git` 祖先目录，所以检出目录下的任何位置都会被拒绝。把它指向 `~/cow-workspace`（或任何树外的目录）即可启动。
+
+**如果工作区根目录自己就有 `.git`**（通常是在工作区根执行过 `git init` 造成的），报错会直接点名真凶，并给出两种真正能改变现状的修法：
+
+```
+common.state_dir.SourceTreeWorkspaceError: 工作区根目录自己就是一个 git 仓库，拒绝把运行时状态写进版本库。
+  工作区：/home/<user>/cow
+  真凶：工作区根目录下存在 .git（/home/<user>/cow/.git）—— 通常是有人在这台机器上执行过 git init（它把整个工作区变成了 git 工作树）。
+  ...
+  怎么修（选一种）：
+    ① 把 git 元数据改名移开，保留历史：把 /home/<user>/cow/.git 改名为 /home/<user>/cow/.ledger-git，并在其中设置 core.worktree = /home/<user>/cow（此后用 git --git-dir=.ledger-git --work-tree=. 操作）。
+    ② 或者把工作区（agent_workspace / workspace）指向另一个不在任何 git 仓库内的目录。
+  注意：不要在工作区根目录执行 git init —— 那正是本次拒绝的成因。
+```
+
+修法 ① 保留历史并让工作区不再是工作树；修法 ② 把工作区搬走。
+**不要在工作区根目录执行 `git init`** —— 那正是本次问题的成因。
+
+启动时服务端还会主动探测每个已启用 Agent 的工作区，并输出**一条**汇总告警，
+写明受影响的 Agent 数量与第一个具体路径 —— 这样「工作区布局坏了」在启动
+那一刻就看得见，而不是只以每请求一行错误的形式埋在日志里。
 
 ### 4. 写 `config.json` 和凭据文件
 

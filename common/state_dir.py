@@ -126,6 +126,28 @@ def assert_not_source_tree(workspace_root: Path | str) -> None:
     the refusal only fires on something that is actually a path-like value
     that resolves under a real ``.git``. A mock is the caller's problem,
     not the layout's — it must not be turned into a fake refusal.
+
+    SVC-WSGIT-001: the refusal now says WHICH of the two shapes it found,
+    because the old single sentence ("'X' 在 'X' 之内") named neither the
+    culprit nor an action that helps. There are two shapes and they need
+    different fixes:
+
+    - **Shape A** — the workspace root ITSELF holds a ``.git``. The real
+      culprit is a ``git init`` that landed on the workspace. The fix is to
+      move the git metadata aside (rename ``.git`` to e.g. ``.ledger-git``
+      and point ``core.worktree`` at the workspace) or to move the
+      workspace elsewhere.
+    - **Shape B** — the workspace sits INSIDE some ancestor repository. The
+      fix is to move the workspace out of that repository.
+
+    The old text also suggested pointing the workspace at the default
+    ``<USERPROFILE>\\cow`` location — which is where most installs ALREADY
+    point it, so for shape A it told the reader to do what they are already
+    doing. That advice is gone; each shape now names an action that changes
+    the state that actually causes the refusal.
+
+    The DECISION is unchanged: the same ``_source_tree_root`` walk, the
+    same refusal. Only the text differs.
     """
     root = _as_path(workspace_root)
     if root is None:
@@ -134,12 +156,94 @@ def assert_not_source_tree(workspace_root: Path | str) -> None:
     if tree is None:
         return
     raise SourceTreeWorkspaceError(
-        "工作区位于源码树内，拒绝把运行时状态写进源码树：%r 在 %r 之内。\n"
+        _workspace_refusal_message(root, tree)
+    )
+
+
+def _workspace_refusal_message(root: Path, tree: Path) -> str:
+    """The refusal text for a workspace that resolves inside a git tree.
+
+    Split out from ``assert_not_source_tree`` so the wording can be read
+    (and tested) on its own, while the refusal itself stays where it is.
+
+    Two shapes, two fixes:
+
+    - **A** — ``tree == root``: the workspace root itself holds a ``.git``.
+      The culprit is a ``git init`` on the workspace root, and the fix is to
+      move that git metadata aside or move the workspace elsewhere.
+    - **B** — ``tree != root``: the workspace sits inside an ancestor
+      repository, and the fix is to move the workspace out of it.
+
+    The reason for the refusal is stated once, after the shape-specific
+    part, because it is the same reason in both shapes.
+    """
+    # The tree comes from ``_source_tree_root`` (already realpath-ed) while
+    # the root is whatever the caller passed (possibly a symlink, a relative
+    # path, or a differently-cased spelling). Both sides are resolved HERE so
+    # the shape test compares like with like: a workspace that IS the
+    # repository root must not be reported as "inside an ancestor repo"
+    # because the two spellings differ.
+    root_resolved = Path(os.path.realpath(str(root)))
+    tree_resolved = Path(os.path.realpath(str(tree)))
+
+    reason = (
         "  运行时状态（memory/long-term/index.db 等）属于运行它的人，不属于仓库；"
         "它一旦进入版本库，clone 的人会拿到别人的记忆索引。\n"
-        "  请把 agent_workspace / workspace 指向一个工作区目录（例如 %%USERPROFILE%%\\cow），"
-        "而不是源码目录。" % (str(root), str(tree))
     )
+
+    if _same_path(root_resolved, tree_resolved):
+        # Shape A: the workspace root IS the repository root.
+        return (
+            "工作区根目录自己就是一个 git 仓库，拒绝把运行时状态写进版本库。\n"
+            "  工作区：%s\n"
+            "  真凶：工作区根目录下存在 .git（%s/.git）—— "
+            "通常是有人在这台机器上执行过 git init（它把整个工作区变成了 git 工作树）。\n"
+            "%s"
+            "  怎么修（选一种）：\n"
+            "    ① 把 git 元数据改名移开，保留历史：把 %s/.git 改名为 %s/.ledger-git，"
+            "并在其中设置 core.worktree = %s（此后用 git --git-dir=.ledger-git --work-tree=. 操作）。\n"
+            "    ② 或者把工作区（agent_workspace / workspace）指向另一个不在任何 git 仓库内的目录。\n"
+            "  注意：不要在工作区根目录执行 git init —— 那正是本次拒绝的成因。"
+            % (
+                str(root_resolved),
+                str(root_resolved),
+                reason,
+                str(root_resolved), str(root_resolved), str(root_resolved),
+            )
+        )
+
+    # Shape B: the workspace is inside an ancestor repository.
+    return (
+        "工作区位于某个 git 仓库内，拒绝把运行时状态写进版本库。\n"
+        "  工作区：%s\n"
+        "  仓库：%s（该目录下的 .git 是真凶）\n"
+        "%s"
+        "  怎么修：把工作区（agent_workspace / workspace）移到 %s 之外"
+        "（即选一个不在该仓库及其任何子目录里的路径）。\n"
+        "  注意：不要在工作区根目录执行 git init —— 那会把它变成仓库根。"
+        % (
+            str(root_resolved),
+            str(tree_resolved),
+            reason,
+            str(tree_resolved),
+        )
+    )
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    """True when two paths name the same place.
+
+    Case-insensitive, because Windows paths are: a guard that reports shape B
+    where shape A is the truth sends the reader after the wrong fix. Both
+    sides are expected to be resolved already; the realpath is applied again
+    because a caller may pass an unresolved path.
+    """
+    try:
+        return os.path.normcase(os.path.realpath(str(left))) == os.path.normcase(
+            os.path.realpath(str(right))
+        )
+    except (TypeError, ValueError, OSError):
+        return False
 
 
 def _resolve(identity: Optional[RuntimeIdentity]) -> RuntimeIdentity:

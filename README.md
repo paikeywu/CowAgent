@@ -225,14 +225,41 @@ This is enforced at startup. With `agent_workspace` pointing inside the
 checkout, the process refuses to start with:
 
 ```
-common.state_dir.SourceTreeWorkspaceError: 工作区位于源码树内，拒绝把运行时状态写进源码树：'/home/<user>/CowAgent' 在 '/home/<user>/CowAgent' 之内。
+common.state_dir.SourceTreeWorkspaceError: 工作区位于某个 git 仓库内，拒绝把运行时状态写进版本库。
+  工作区：/home/<user>/CowAgent
+  仓库：/home/<user>/CowAgent（该目录下的 .git 是真凶）
   运行时状态（memory/long-term/index.db 等）属于运行它的人，不属于仓库；它一旦进入版本库，clone 的人会拿到别人的记忆索引。
-  请把 agent_workspace / workspace 指向一个工作区目录（例如 %USERPROFILE%\cow），而不是源码目录。
+  怎么修：把工作区（agent_workspace / workspace）移到 /home/<user>/CowAgent 之外（即选一个不在该仓库及其任何子目录里的路径）。
+  注意：不要在工作区根目录执行 git init —— 那会把它变成仓库根。
 ```
 
 The check walks up from the workspace looking for a `.git` ancestor, so a
 workspace anywhere under a checkout is rejected. Point it at `~/cow-workspace`
 (or any directory outside the tree) and the app boots.
+
+**If the workspace root itself holds a `.git`**, the refusal names the real
+culprit — a `git init` that landed on the workspace root — and offers two
+fixes that actually change the state that causes the refusal:
+
+```
+common.state_dir.SourceTreeWorkspaceError: 工作区根目录自己就是一个 git 仓库，拒绝把运行时状态写进版本库。
+  工作区：/home/<user>/cow
+  真凶：工作区根目录下存在 .git（/home/<user>/cow/.git）—— 通常是有人在这台机器上执行过 git init（它把整个工作区变成了 git 工作树）。
+  ...
+  怎么修（选一种）：
+    ① 把 git 元数据改名移开，保留历史：把 /home/<user>/cow/.git 改名为 /home/<user>/cow/.ledger-git，并在其中设置 core.worktree = /home/<user>/cow（此后用 git --git-dir=.ledger-git --work-tree=. 操作）。
+    ② 或者把工作区（agent_workspace / workspace）指向另一个不在任何 git 仓库内的目录。
+  注意：不要在工作区根目录执行 git init —— 那正是本次拒绝的成因。
+```
+
+Option ① keeps the history and stops the workspace from being a work tree;
+option ② moves the workspace. **Do not run `git init` on the workspace root
+— that is what causes this in the first place.**
+
+At startup the server also probes every enabled Agent's workspace and logs
+ONE summary line naming how many Agents are affected and where the first
+offending path is, so a broken layout is visible at boot rather than only as
+a per-request error buried in the log.
 
 ### 4. Write `config.json` and the credentials file
 
@@ -596,12 +623,27 @@ Keep helper scripts in `~/cow-workspace`, or add the file to `.gitignore`.
 grep "SourceTreeWorkspaceError" nohup.out run.log
 ```
 
-`agent_workspace` resolves inside the git checkout. Move it out of the tree —
-step 4 already points it at `~/cow-workspace`, so this only happens if you
-edited `config.json` by hand. Check what it says now:
+Two different layouts cause this, and the message tells you which one you have:
+
+1. **The workspace root itself holds a `.git`** — the message says so and
+   names the culprit (`git init` on the workspace root). Fix it by renaming
+   the git metadata aside and pointing `core.worktree` at the workspace, or
+   by moving the workspace. **Do not run `git init` on the workspace root** —
+   that is what causes this.
+2. **The workspace sits inside some other repository** — the message names
+   both the workspace and the repository. Move the workspace out of it.
+
+Check what the workspace is now:
 
 ```bash
 grep agent_workspace ~/CowAgent/config.json
+```
+
+The startup log also carries a one-line summary when any enabled Agent is
+affected, so you do not have to grep for it:
+
+```bash
+grep "WORKSPACE REJECTED BY THE SOURCE-TREE GUARD" nohup.out run.log
 ```
 
 Verify before restarting:
