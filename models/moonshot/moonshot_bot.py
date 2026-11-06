@@ -32,6 +32,25 @@ class MoonshotBot(Bot):
     def api_key(self):
         return conf().get("moonshot_api_key")
 
+    def _request_proxies(self) -> dict:
+        """The proxy map every outbound request must carry.
+
+        ``requests`` defaults to ``trust_env=True``, which makes it read the
+        OS-level proxy (Windows: the Internet Settings registry key) and route
+        the request through it. That is the wrong route for Kimi: the
+        endpoint resets the TLS session on that path and the call dies with
+        ``SSLEOFError`` before a single byte of the response arrives.
+
+        Passing an explicit map with ``None`` values tells ``requests`` "use
+        no proxy for this scheme", so the connection goes straight to the
+        endpoint. A proxy configured under ``proxy`` still wins -- an operator
+        who needs the tunnel can set it.
+        """
+        configured = str(conf().get("proxy") or "").strip()
+        if configured:
+            return {"http": configured, "https": configured}
+        return {"http": None, "https": None}
+
     @property
     def base_url(self):
         url = conf().get("moonshot_base_url", "https://api.moonshot.cn/v1")
@@ -45,6 +64,29 @@ class MoonshotBot(Bot):
         model = str(conf().get("model", ""))
         base = str(conf().get("moonshot_base_url", ""))
         return model == "kimi-for-coding" or "api.kimi.com/coding" in base
+
+    @staticmethod
+    def _model_forbids_sampling_params(model_name: str) -> bool:
+        """True for Kimi models that only accept temperature=1.
+
+        The provider answers ``temperature=0.3`` with HTTP 400 "invalid
+        temperature: only 1 is allowed for this model", so those parameters
+        must be omitted entirely rather than sent with their default value.
+
+        Covers the K3 family (``kimi-k3``, ``k3``, ``k3.1-pro`` ...), the K2
+        family and the Coding Plan aliases. ``k3`` is matched on a word
+        boundary so a future ``k30-something`` is not caught by accident.
+        """
+        name = str(model_name or "").strip().lower()
+        if not name:
+            return False
+        if name.startswith(("kimi-k3", "kimi-k2", "kimi-k1.5")):
+            return True
+        if name == "kimi-for-coding" or name.startswith("kimi-for-coding-"):
+            return True
+        if name == "k3" or name.startswith("k3.") or name.startswith("k3-"):
+            return True
+        return False
 
     @staticmethod
     def _is_builtin_reasoning_model(model_name: str) -> bool:
@@ -143,15 +185,19 @@ class MoonshotBot(Bot):
             body = dict(args) if args else dict(self.args)
             body["messages"] = session.messages
             model_name = str(body.get("model", ""))
-            # K2.x / Coding Plan enforce fixed temperature/top_p; strip them.
-            if model_name.startswith("kimi-k2") or model_name == "kimi-for-coding":
+            # K2.x / K3 / Coding Plan enforce fixed temperature/top_p; strip them.
+            # The provider rejects anything other than temperature=1 with
+            # HTTP 400 "invalid temperature: only 1 is allowed for this model",
+            # so a model that is not covered here never gets an answer.
+            if self._model_forbids_sampling_params(model_name):
                 body.pop("temperature", None)
                 body.pop("top_p", None)
             res = requests.post(
                 f"{self.base_url}/chat/completions",
                 headers=headers,
                 json=body,
-                timeout=120
+                timeout=120,
+                proxies=self._request_proxies()
             )
             if res.status_code == 200:
                 response = res.json()
@@ -211,7 +257,8 @@ class MoonshotBot(Bot):
             }
             headers = self._build_headers()
             resp = requests.post(f"{self.base_url}/chat/completions",
-                                 headers=headers, json=payload, timeout=180)
+                                 headers=headers, json=payload, timeout=180,
+                                 proxies=self._request_proxies())
             if resp.status_code != 200:
                 return {"error": True, "message": f"HTTP {resp.status_code}: {resp.text[:300]}"}
             data = resp.json()
@@ -333,7 +380,8 @@ class MoonshotBot(Bot):
             headers = self._build_headers()
 
             url = f"{self.base_url}/chat/completions"
-            response = requests.post(url, headers=headers, json=request_body, stream=True, timeout=120)
+            response = requests.post(url, headers=headers, json=request_body, stream=True, timeout=120,
+                                     proxies=self._request_proxies())
 
             if response.status_code != 200:
                 error_msg = response.text
@@ -476,7 +524,8 @@ class MoonshotBot(Bot):
 
             request_body.pop("stream", None)
             url = f"{self.base_url}/chat/completions"
-            response = requests.post(url, headers=headers, json=request_body, timeout=120)
+            response = requests.post(url, headers=headers, json=request_body, timeout=120,
+                                     proxies=self._request_proxies())
 
             if response.status_code != 200:
                 error_msg = response.text
