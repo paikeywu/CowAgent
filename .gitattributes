@@ -11,3 +11,17 @@
 * text=auto
 *.sh text eol=lf
 *.bash text eol=lf
+
+# Windows batch files and the WinSW config must stay CRLF on checkout.
+#
+# Why this is explicit: `deploy\` held the service's whole launch chain
+# (start-backend-service.cmd, release-pid-switch.cmd, CowAgentBackend.xml)
+# and it was an UNTRACKED directory -- so a `git clean` (or any tool that
+# prunes untracked files) deleted the service's launch chain and the
+# service could not start again. A .cmd with LF endings still runs under
+# cmd.exe, but a .cmd with mixed endings breaks on the `for /f` line, and
+# the XML is read by WinSW's own parser. Pinning the line endings removes
+# the question instead of leaving it to chance.
+*.cmd text eol=crlf
+*.xml text eol=crlf
+*.py text eol=lf

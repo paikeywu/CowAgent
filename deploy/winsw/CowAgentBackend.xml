@@ -1,0 +1,195 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  WinSW configuration for the NEW (live-memory) CowAgent backend.
+
+  Run the backend as a Windows service on port 9902, ALONGSIDE the old
+  desktop app on 9876. Both run at the same time; they share the same
+  memory store but use different readers.
+
+  Naming rule (WinSW requirement): the XML file name MUST match the
+  executable base name. The exe is "CowAgentBackend.exe", so the config
+  is "CowAgentBackend.xml" - WinSW discovers it by convention.
+
+  WHY THIS SERVICE EXISTS
+
+  A backend started from an agent session dies with the session: the
+  process tree is reaped when the parent exits, and - worse - the
+  desktop app's own update/restart flow kills whatever PID sits in
+  <project_root>\\.cow.pid, which a second instance in the same source
+  tree claims for itself. A service has its own process, its own
+  lifetime, and a supervisor that restarts it when it dies.
+
+  WHY THE ENVIRONMENT IS SET HERE AND NOT IN THE BATCH FILE
+
+  The service account matters more than usual. The memory store lives at
+  C:\\Users\\User\\cow and the config at C:\\Users\\User\\.cow - both under the
+  interactive user profile. Running as LocalSystem would point HOME and
+  USERPROFILE at C:\\Windows\\System32\\config\\systemprofile, and the
+  backend would come up against an EMPTY workspace: healthy, serving,
+  and remembering nothing. That is the same silent failure as the old
+  reader, so the account is pinned explicitly below.
+
+  The four settings that decide whether the service can read the real
+  history at all:
+
+    AGENT_WORKSPACE = C:\\Users\\User\\cow
+        config.py overrides config.json with this. If it points at the
+        source tree, state_dir.assert_not_source_tree() REFUSES to write
+        memory/long-term/index.db and the backend starts against an
+        empty store. It must be the workspace directory.
+
+    COW_WEB_PORT = 9902
+        channel/web/core/channel.py:1538 reads this, falling back to
+        conf()["web_port"] and then 9899. The old desktop backend owns
+        9876, so a fixed port avoids the collision.
+
+    COW_DATA_DIR = C:\\Users\\User\\.cow
+        Where config.json and run.log live.
+
+    COW_DESKTOP is deliberately NOT set.
+        Setting it to 1 turns on desktop mode (no browser pop-up, IM
+        plugin denylist, tighter "workspace-write" permission). This is
+        a plain web console.
+
+  SINGLE SOURCE OF TRUTH
+
+  The service does NOT carry its own copy of the startup logic. It runs
+  cmd.exe with start-backend.cmd, which is exactly what a person
+  double-clicking that file runs. Change the launcher, and the manual
+  start and the service change together.
+-->
+<service>
+  <id>CowAgentBackend</id>
+  <name>CowAgent Backend (live-memory)</name>
+  <description>New CowAgent web backend on port 9902. Reads the externalised memory store (content_path / content_state) so the full history is visible. Runs alongside the old desktop app on 9876.</description>
+
+  <!--
+    Run the batch launcher through cmd.exe, not python directly.
+
+    cmd.exe is the executable: WinSW monitors THAT process, and cmd.exe
+    stays in the foreground for as long as the server runs. Launching
+    python directly would work too, but then the service and the manual
+    start are two different code paths again, and they drift.
+
+    The launcher runs the backend in the foreground (it does not detach),
+    so WinSW's child IS the server.
+  -->
+  <executable>C:\\Windows\\System32\\cmd.exe</executable>
+  <arguments>/c "C:\\Workspace\\AI-Agent\\CowAgent\\deploy\\start-backend-service.cmd"</arguments>
+  <workingdirectory>C:\\Workspace\\AI-Agent\\CowAgent\\deploy</workingdirectory>
+
+  <!--
+    Run as LocalSystem, like the existing CowReranker service.
+
+    WHY NOT THE INTERACTIVE USER
+    A service running as "vm-win11\\user" needs that account's PASSWORD at
+    install time. The XML previously carried the literal placeholder
+    "will be supplied at install time" - installing it as-is would set that
+    string AS the password, and the service would fail to start with a
+    logon error nobody could act on.
+
+    A password must not travel through a chat transcript: that is the
+    exact leak pattern the F-5 review closed
+    (knowledge/engineering/public-key-ssh-eliminates-password-passing.md).
+
+    WHY LocalSystem IS SAFE HERE
+    Every path the backend touches is an ABSOLUTE path set in the <env>
+    blocks below - nothing resolves through "~" or %USERPROFILE%. And
+    LocalSystem CAN read/write the memory store; verified with icacls:
+        C:\\Users\\User\\cow      SYSTEM:(I)(OI)(CI)(F)
+        C:\\Users\\User\\.cow     SYSTEM:(I)(OI)(CI)(F)
+    (F) = full control, inherited.
+
+    The one thing LocalSystem gets wrong by default is %USERPROFILE%
+    (it points at C:\\Windows\\System32\\config\\systemprofile), which would
+    make expanduser("~") resolve to the systemprofile and the backend
+    would come up against an EMPTY workspace: healthy, serving, and
+    remembering nothing. The <env> block pins USERPROFILE to the real
+    profile, so "~" resolves exactly as it does interactively.
+  -->
+  <env name="USERPROFILE" value="C:\\Users\\User" />
+  <env name="HOME" value="C:\\Users\\User" />
+  <!--
+    APPDATA / LOCALAPPDATA ARE NOT REDUNDANT WITH USERPROFILE.
+
+    Python derives the USER site-packages directory from %APPDATA%, not from
+    %USERPROFILE%:
+
+        site.getusersitepackages()
+          -> %APPDATA%\\Python\\PythonXY\\site-packages
+
+    Under LocalSystem, %APPDATA% is
+    C:\\Windows\\System32\\config\\systemprofile\\AppData\\Roaming - so Python
+    looked for the third-party packages in the systemprofile and found
+    NOTHING. yaml / requests / web were all missing, the web channel
+    failed to construct, and the service came up RUNNING with no socket
+    bound at all: no LISTENING on 9902, and the browser saw a blank page.
+
+    Pinning USERPROFILE alone is not enough - that was the bug in the
+    previous revision of this file. The three packages the backend needs
+    are installed in the USER's site-packages
+    (C:\\Users\\User\\AppData\\Roaming\\Python\\Python315\\site-packages), so
+    APPDATA has to be pinned too. Measured: with APPDATA + LOCALAPPDATA
+    pinned, site.getusersitepackages() returns the real path and
+    yaml/requests/web all import.
+  -->
+  <env name="APPDATA" value="C:\\Users\\User\\AppData\\Roaming" />
+  <env name="LOCALAPPDATA" value="C:\\Users\\User\\AppData\\Local" />
+  <env name="AGENT_WORKSPACE" value="C:\\Users\\User\\cow" />
+  <env name="COW_WEB_PORT" value="9902" />
+  <env name="COW_DATA_DIR" value="C:\\Users\\User\\.cow" />
+
+  <serviceaccount>
+    <user>LocalSystem</user>
+    <allowinteractive>true</allowinteractive>
+  </serviceaccount>
+
+  <!--
+    Start mode: Automatic, delayed. Delayed start means this service
+    starts AFTER the network stack and other auto-start services, which
+    keeps the backend's cold start (it loads 15 agent profiles and the
+    scheduler) from competing with the user logon.
+
+    The old desktop app is NOT a dependency: the two must be able to run
+    independently, and one being down must not take the other with it.
+  -->
+  <startmode>Automatic</startmode>
+  <delayedAutoStart />
+
+  <!--
+    Restart on failure.
+
+    The backend exits non-zero on an unrecoverable startup error. WinSW
+    reports SERVICE_STOPPED on exit code 0, and the SCM treats that as
+    a clean stop and never applies the failure actions - so the service
+    would stay down until someone noticed. The launcher's foreground
+    mode normalises a zero exit code to 1 for that reason.
+
+    A deliberate "sc stop" is unaffected: DoStop() sets the
+    orderlyShutdown flag, and that branch never looks at the exit code.
+  -->
+  <onfailure action="restart" delay="10 sec" />
+  <onfailure action="restart" delay="30 sec" />
+  <onfailure action="restart" delay="60 sec" />
+  <resetfailure>1 hour</resetfailure>
+
+  <!--
+    Graceful shutdown: the backend drains in-flight requests on SIGTERM.
+    WinSW sends Ctrl+C first, then escalates to TerminateProcess after
+    stoptimeout. 15s is enough for the scheduler to checkpoint.
+  -->
+  <stoptimeout>15 sec</stoptimeout>
+  <stopparentprocessfirst>true</stopparentprocessfirst>
+
+  <priority>Normal</priority>
+
+  <!--
+    Logs: roll-by-size so the service cannot fill the disk over months.
+    keepFiles=5 at 10MB each = 50MB ceiling per log stream.
+  -->
+  <logpath>C:\\Users\\User\\cow\\backend-logs</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>5</keepFiles>
+  </log>
+</service>

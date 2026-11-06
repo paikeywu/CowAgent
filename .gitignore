@@ -135,3 +135,21 @@ docker/agent-mail-data/
 /BOOTSTRAP.md
 /knowledge/
 
+# --- 部署产物：源码入库，产物不入库 ---------------------------------
+#
+# 2026-11-06 的事故：`deploy\` 整个是未跟踪目录，于是
+# `start-backend-service.cmd` / `release-pid-switch.cmd` /
+# `launch_backend.py` / `winsw\CowAgentBackend.xml` 四个**源码文件**
+# 一次被清空，只剩 exe 和 __pycache__。服务下次重启时 WinSW 找不到
+# 同名 XML、cmd 找不到被调用的 .cmd，服务直接起不来 —— 而 git 里
+# 根本没有它们，git 也救不回来。
+#
+# 现在：**启动链的源码入库**（deploy/*.cmd, deploy/*.py,
+# deploy/winsw/*.xml），**二进制产物不入库**。
+# WinSW 的 exe 是 18MB 的官方发行物，按 sha256 记录，需要时重新下载。
+deploy/winsw/*.exe
+docker/reranker/winsw/*.exe
+deploy/__pycache__/
+docker/reranker/__pycache__/
+
+
