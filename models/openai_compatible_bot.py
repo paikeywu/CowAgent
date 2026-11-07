@@ -52,18 +52,26 @@ class OpenAICompatibleBot:
         """Whether the model is a Kimi reasoning model that only accepts
         temperature=1 (or omits the parameter entirely).
 
-        Covers kimi-k3 and kimi-k2.7-code series when accessed via the
-        Kimi Coding Plan endpoint (api.kimi.com/coding). These models
-        reject any temperature other than 1.
+        Covers the K3 family (``kimi-k3``, bare ``k3``, ``k3.1-pro`` ...),
+        the K2 / K1.5 families and the Coding Plan aliases. The provider
+        answers any temperature other than 1 with HTTP 400 "invalid
+        temperature: only 1 is allowed for this model". ``k3`` is matched
+        on a word boundary so a future ``k30-something`` is not caught by
+        accident. This mirrors ``moonshot_bot._model_forbids_sampling_params``
+        — custom providers route through this class, so a ``k3`` model on a
+        ``custom:<id>`` provider must hit the same rule as the built-in
+        moonshot bot.
         """
         if not model_name or not isinstance(model_name, str):
             return False
-        name = model_name.lower()
-        if name.startswith("kimi-k3"):
+        name = model_name.strip().lower()
+        if not name:
+            return False
+        if name.startswith(("kimi-k3", "kimi-k2", "kimi-k1.5")):
             return True
-        if name.startswith("kimi-k2.7-code"):
+        if name == "kimi-for-coding" or name.startswith("kimi-for-coding-"):
             return True
-        if name == "kimi-for-coding":
+        if name == "k3" or name.startswith("k3.") or name.startswith("k3-"):
             return True
         return False
 
