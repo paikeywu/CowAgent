@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  WinSW configuration for the BGE Reranker v2-m3 HTTP service.
+
+  Naming rule (WinSW requirement): the XML file name MUST match the
+  executable base name. The exe is "CowReranker.exe", so the config is
+  "CowReranker.xml" — WinSW discovers it by convention, not by argument.
+
+  SINGLE SOURCE OF TRUTH
+  The service does NOT carry its own copy of the startup parameters.
+  It runs cmd.exe with start-reranker.bat in foreground mode, which is
+  exactly what a person double-clicking that file runs. The model
+  directory, port and thread count live in reranker.conf and are read by
+  serve.py.
+
+  Why this matters: the model directory used to be written down here AND
+  in the batch launcher AND in serve.py's defaults. Changing one left the
+  others pointing at the old path. The symptom was a service that
+  started, reported "healthy", and then failed every request with a
+  model load error. One place to change = that failure mode is gone.
+
+  Note: XML comments may not contain a double hyphen, so the foreground
+  switch is referenced by name only in the comments below.
+-->
+<service>
+  <id>CowReranker</id>
+  <name>CowAgent BGE Reranker</name>
+  <description>BGE-reranker-v2-m3 HTTP service (port 9898) for CowAgent memory retrieval reranking.</description>
+
+  <!--
+    Run the batch launcher through cmd.exe, not python directly.
+
+    cmd.exe is the executable: WinSW monitors THAT process, and cmd.exe
+    stays in the foreground for as long as the server runs. Launching
+    python directly would work too, but then the service and the manual
+    start are two different code paths again, and they drift.
+
+    The batch file is invoked with the foreground switch so that it runs
+    the server IN THIS PROCESS instead of detaching it. The detached form
+    returns immediately, which would make the service report "stopped"
+    while the server is still alive and holding port 9898.
+
+    Paths are absolute on purpose. A Windows service runs under
+    LocalSystem with a minimal environment: no user PATH, no USERPROFILE
+    pointing at the interactive account, and a different working
+    directory. Relative paths and PATH lookups both fail there.
+  -->
+  <executable>C:\Windows\System32\cmd.exe</executable>
+  <arguments>/c "C:\Workspace\AI-Agent\CowAgent\docker\reranker\start-reranker.bat" --foreground</arguments>
+  <workingdirectory>C:\Workspace\AI-Agent\CowAgent\docker\reranker</workingdirectory>
+
+  <!--
+    The batch launcher locates itself via %~dp0 and reads its parameters
+    from reranker.conf, so no parameter is duplicated here. The only
+    thing this config still owns is the SERVICE environment, which is
+    about the service account rather than the application.
+
+    A service runs under LocalSystem: USERPROFILE points at
+    C:\Windows\System32\config\systemprofile, and HOME is not set at all.
+    Without these, transformers may try to reach huggingface.co at
+    startup (a hang on a machine with no outbound access) or fail
+    writing a cache into a directory it does not own.
+
+    Offline mode: the model is a local directory, so the hub is never
+    needed.
+  -->
+  <env name="HF_HUB_OFFLINE" value="1" />
+  <env name="TRANSFORMERS_OFFLINE" value="1" />
+  <env name="HF_HOME" value="C:\Users\User\cow\reranker-cache\hf" />
+  <env name="TORCH_HOME" value="C:\Users\User\cow\reranker-cache\torch" />
+  <env name="TEMP" value="C:\Users\User\cow\reranker-cache\tmp" />
+  <env name="TMP" value="C:\Users\User\cow\reranker-cache\tmp" />
+
+  <!--
+    Start mode: Automatic + delayedAutoStart. Delayed start means this
+    service starts AFTER the network stack and other auto-start services,
+    which keeps a 2.27GB model load from competing with the user logon.
+  -->
+  <startmode>Automatic</startmode>
+  <delayedAutoStart />
+
+  <!--
+    Restart on failure. uvicorn exits non-zero on an unrecoverable error;
+    without this the service would stay dead until someone noticed, and
+    CowAgent would silently degrade to un-reranked results.
+
+    IMPORTANT: this only works if the batch launcher reports a NON-ZERO
+    exit code when the server dies. WinSW 2.12.0's WrapperService.cs
+    does this with the child's exit code:
+
+        if (this.orderlyShutdown) { ...log only... }
+        else {
+            // by not reporting unclean shutdown, we let Windows SCM to
+            // decide if it wants to restart the service automatically
+            if (proc.ExitCode == 0) { this.SignalStopped(); }
+            Environment.Exit(proc.ExitCode);
+        }
+
+    Exit code 0 -> WinSW explicitly reports SERVICE_STOPPED -> the SCM
+    treats it as a clean stop and never applies the failure actions, so
+    the service stays down. The launcher therefore normalises a zero
+    exit code to 1 in foreground mode.
+
+    A deliberate "sc stop" is unaffected: DoStop() sets the
+    orderlyShutdown flag, and that branch never looks at the exit code.
+  -->
+  <onfailure action="restart" delay="10 sec" />
+  <onfailure action="restart" delay="30 sec" />
+  <onfailure action="restart" delay="60 sec" />
+  <resetfailure>1 hour</resetfailure>
+
+  <!--
+    Graceful shutdown: uvicorn handles SIGTERM and drains in-flight
+    requests. WinSW sends Ctrl+C first, then escalates to TerminateProcess
+    after stoptimeout. 15s is enough for a single CPU-only inference.
+  -->
+  <stoptimeout>15 sec</stoptimeout>
+  <stopparentprocessfirst>true</stopparentprocessfirst>
+
+  <!-- LocalSystem by default; explicit for clarity and for auditing. -->
+  <serviceaccount>
+    <user>LocalSystem</user>
+  </serviceaccount>
+
+  <priority>Normal</priority>
+
+  <!--
+    Logs: roll-by-size so the service cannot fill the disk over months.
+    keepFiles=5 at 10MB each = 50MB ceiling per log stream.
+  -->
+  <logpath>C:\Users\User\cow\reranker-logs</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>5</keepFiles>
+  </log>
+</service>
