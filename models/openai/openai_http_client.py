@@ -194,8 +194,15 @@ class OpenAIHTTPClient:
         self.api_key = api_key
         self.api_base = (api_base or DEFAULT_API_BASE).rstrip("/")
         self.timeout = timeout if timeout is not None else DEFAULT_TIMEOUT
+        # Unconfigured proxy must mean "direct", not "inherit the OS proxy":
+        # requests treats proxies=None as "read the system settings", which
+        # silently hands the route to whatever proxy the OS happens to have
+        # (see 2026-11-06/07: the OS proxy resets TLS to api.kimi.com).
+        # An explicit {"http": None, "https": None} disables proxy use.
         self.proxies = (
-            {"http": proxy, "https": proxy} if proxy else None
+            {"http": proxy, "https": proxy}
+            if proxy
+            else {"http": None, "https": None}
         )
         self.extra_headers = dict(extra_headers) if extra_headers else {}
 
